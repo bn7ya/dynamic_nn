@@ -1,0 +1,204 @@
+cmake_minimum_required(VERSION 3.16)
+project(DynamicNN VERSION 1.0.0 LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# Options
+option(DNN_BUILD_TESTS "Build tests" ON)
+option(DNN_BUILD_PYTHON "Build Python bindings" ON)
+option(DNN_BUILD_EXAMPLES "Build examples" ON)
+option(DNN_ENABLE_AVX "Enable AVX optimizations" ON)
+option(DNN_ENABLE_AVX2 "Enable AVX2 optimizations" ON)
+option(DNN_ENABLE_AVX512 "Enable AVX512 optimizations" OFF)
+
+# Detect architecture
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(DNN_ARCH "x64")
+else()
+    set(DNN_ARCH "x86")
+endif()
+
+message(STATUS "Building for architecture: ${DNN_ARCH}")
+
+# Compiler flags
+if(MSVC)
+    add_compile_options(/W4 /permissive-)
+    if(DNN_ENABLE_AVX2)
+        add_compile_options(/arch:AVX2)
+    elseif(DNN_ENABLE_AVX)
+        add_compile_options(/arch:AVX)
+    endif()
+    # Optimization flags for Release
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /O2 /Ob2 /Oi /Ot /GL")
+    set(CMAKE_EXE_LINKER_FLAGS_RELEASE "${CMAKE_EXE_LINKER_FLAGS_RELEASE} /LTCG")
+else()
+    add_compile_options(-Wall -Wextra -Wpedantic)
+    if(DNN_ENABLE_AVX512)
+        add_compile_options(-mavx512f -mavx512dq -mavx512vl)
+    elseif(DNN_ENABLE_AVX2)
+        add_compile_options(-mavx2 -mfma)
+    elseif(DNN_ENABLE_AVX)
+        add_compile_options(-mavx)
+    endif()
+    # Optimization flags for Release
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -march=native -flto")
+endif()
+
+# Source files
+set(DNN_CORE_SOURCES
+    src/core/tensor.cpp
+    src/core/random.cpp
+    src/core/initializers.cpp
+    src/core/activations.cpp
+    src/core/node.cpp
+    src/core/layer.cpp
+    src/core/network.cpp
+)
+
+set(DNN_MEMORY_SOURCES
+    src/memory/pool_allocator.cpp
+    src/memory/resource_monitor.cpp
+)
+
+set(DNN_SIMD_SOURCES
+    src/simd/simd_detect.cpp
+    src/simd/simd_ops.cpp
+)
+
+set(DNN_TRAINING_SOURCES
+    src/training/cost_functions.cpp
+    src/training/batch_manager.cpp
+    src/training/early_stopping.cpp
+    src/training/optimizer.cpp
+    src/training/trainer.cpp
+)
+
+set(DNN_DYNAMICS_SOURCES
+    src/dynamics/node_efficiency.cpp
+    src/dynamics/layer_efficiency.cpp
+    src/dynamics/layer_manager.cpp
+    src/dynamics/health_monitor.cpp
+    src/dynamics/trainable_scheduler.cpp
+)
+
+set(DNN_CQRS_SOURCES
+    src/cqrs/command_bus.cpp
+    src/cqrs/query_bus.cpp
+)
+
+set(DNN_IO_SOURCES
+    src/io/input_adapter.cpp
+    src/io/model_serializer.cpp
+)
+
+# Core library
+add_library(dnn_core STATIC
+    ${DNN_CORE_SOURCES}
+    ${DNN_MEMORY_SOURCES}
+    ${DNN_SIMD_SOURCES}
+    ${DNN_TRAINING_SOURCES}
+    ${DNN_DYNAMICS_SOURCES}
+    ${DNN_CQRS_SOURCES}
+    ${DNN_IO_SOURCES}
+)
+
+target_include_directories(dnn_core PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+)
+
+# Add compile definitions for SIMD detection
+target_compile_definitions(dnn_core PRIVATE
+    $<$<BOOL:${DNN_ENABLE_AVX}>:DNN_ENABLE_AVX>
+    $<$<BOOL:${DNN_ENABLE_AVX2}>:DNN_ENABLE_AVX2>
+    $<$<BOOL:${DNN_ENABLE_AVX512}>:DNN_ENABLE_AVX512>
+)
+
+# Thread support
+find_package(Threads REQUIRED)
+target_link_libraries(dnn_core PUBLIC Threads::Threads)
+
+# Python bindings
+if(DNN_BUILD_PYTHON)
+    find_package(Python3 COMPONENTS Interpreter Development)
+    if(Python3_FOUND)
+        # Try to find pybind11
+        find_package(pybind11 CONFIG QUIET)
+        if(pybind11_FOUND)
+            pybind11_add_module(_dnn_core python/pydnn/_bindings.cpp)
+            target_link_libraries(_dnn_core PRIVATE dnn_core)
+
+            # Install Python module
+            install(TARGETS _dnn_core
+                LIBRARY DESTINATION python/pydnn
+            )
+        else()
+            message(STATUS "pybind11 not found, Python bindings disabled")
+        endif()
+    else()
+        message(STATUS "Python not found, Python bindings disabled")
+    endif()
+endif()
+
+# Tests
+if(DNN_BUILD_TESTS)
+    enable_testing()
+    find_package(GTest QUIET)
+    if(GTest_FOUND)
+        add_executable(dnn_tests
+            tests/cpp/test_tensor.cpp
+            tests/cpp/test_network.cpp
+            tests/cpp/test_simd.cpp
+        )
+        target_link_libraries(dnn_tests PRIVATE dnn_core GTest::gtest_main)
+
+        include(GoogleTest)
+        gtest_discover_tests(dnn_tests)
+    else()
+        message(STATUS "Google Test not found, tests disabled")
+    endif()
+endif()
+
+# Examples
+if(DNN_BUILD_EXAMPLES)
+    add_executable(basic_example examples/cpp/basic_network.cpp)
+    target_link_libraries(basic_example PRIVATE dnn_core)
+endif()
+
+# Installation
+install(TARGETS dnn_core
+    EXPORT DynamicNNTargets
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
+    RUNTIME DESTINATION bin
+)
+
+install(DIRECTORY include/ DESTINATION include)
+
+install(EXPORT DynamicNNTargets
+    FILE DynamicNNTargets.cmake
+    NAMESPACE DNN::
+    DESTINATION lib/cmake/DynamicNN
+)
+
+# Package configuration
+include(CMakePackageConfigHelpers)
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/DynamicNNConfigVersion.cmake"
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY AnyNewerVersion
+)
+
+configure_package_config_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/DynamicNNConfig.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/DynamicNNConfig.cmake"
+    INSTALL_DESTINATION lib/cmake/DynamicNN
+)
+
+install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/DynamicNNConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/DynamicNNConfigVersion.cmake"
+    DESTINATION lib/cmake/DynamicNN
+)

@@ -1,0 +1,19 @@
+# Core dependencies
+numpy>=1.21.0
+
+# Visualization (optional but recommended)
+matplotlib>=3.5.0
+plotly>=5.0.0
+
+# Input adapters (optional)
+pillow>=9.0.0          # Image support
+opencv-python>=4.5.0   # Video support
+librosa>=0.9.0         # Audio support
+
+# Development dependencies
+pytest>=7.0.0
+pytest-cov>=4.0.0
+
+# Build dependencies
+pybind11>=2.10.0
+cmake>=3.20.0
