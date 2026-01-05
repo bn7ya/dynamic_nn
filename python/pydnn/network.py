@@ -223,81 +223,160 @@ class DynamicNetwork:
         )
 
     def _fit_python(self, X, y, callback, verbose) -> TrainingResult:
-        """Train using pure Python fallback."""
-        # Simplified Python implementation
+        """Train using pure Python fallback with backpropagation."""
+        import time
+        start_time = time.time()
+
         np.random.seed(self.seed)
 
         # Compute initial hidden layer size (geometric mean)
         input_size = int(np.prod(self.input_shape))
         hidden_size = int(np.sqrt(input_size * self.output_size))
+        hidden_size = max(hidden_size, 16)  # Minimum hidden size
 
-        # Initialize weights
+        # Initialize weights with He initialization
+        W1 = np.random.randn(hidden_size, input_size).astype(np.float32) * np.sqrt(2.0 / input_size)
+        b1 = np.zeros(hidden_size, dtype=np.float32)
+        W2 = np.random.randn(self.output_size, hidden_size).astype(np.float32) * np.sqrt(2.0 / hidden_size)
+        b2 = np.zeros(self.output_size, dtype=np.float32)
+
+        # Store layers with gradient storage
         self._layers = [
-            {
-                "W": np.random.randn(hidden_size, input_size).astype(np.float32) * np.sqrt(2.0 / input_size),
-                "b": np.zeros(hidden_size, dtype=np.float32)
-            },
-            {
-                "W": np.random.randn(self.output_size, hidden_size).astype(np.float32) * np.sqrt(2.0 / hidden_size),
-                "b": np.zeros(self.output_size, dtype=np.float32)
-            }
+            {"W": W1, "b": b1, "dW": np.zeros_like(W1), "db": np.zeros_like(b1)},
+            {"W": W2, "b": b2, "dW": np.zeros_like(W2), "db": np.zeros_like(b2)}
         ]
 
         cost_history = []
         efficiency_history = []
-        learning_rate = 0.01
-        batch_size = 8
+        learning_rate = 0.1
+        batch_size = 32
         max_epochs = 100
+        best_cost = float('inf')
+
+        # Shuffle data
+        indices = np.random.permutation(len(X))
+        X = X[indices]
+        y = y[indices]
 
         for epoch in range(max_epochs):
             epoch_cost = 0.0
-            n_batches = len(X) // batch_size
+            n_batches = max(1, len(X) // batch_size)
 
-            for i in range(0, len(X), batch_size):
-                batch_X = X[i:i+batch_size]
-                batch_y = y[i:i+batch_size]
+            # Shuffle each epoch
+            perm = np.random.permutation(len(X))
 
-                # Forward pass
-                a = batch_X.reshape(len(batch_X), -1)
-                for layer in self._layers[:-1]:
-                    z = a @ layer["W"].T + layer["b"]
-                    a = np.maximum(0, z)  # ReLU
+            for batch_idx in range(n_batches):
+                start_idx = batch_idx * batch_size
+                end_idx = min(start_idx + batch_size, len(X))
+                batch_indices = perm[start_idx:end_idx]
 
-                # Output layer (softmax for classification)
-                z = a @ self._layers[-1]["W"].T + self._layers[-1]["b"]
-                exp_z = np.exp(z - np.max(z, axis=1, keepdims=True))
-                output = exp_z / np.sum(exp_z, axis=1, keepdims=True)
+                batch_X = X[batch_indices]
+                batch_y = y[batch_indices]
+                m = len(batch_X)
 
-                # Compute cost
-                batch_cost = -np.mean(np.sum(batch_y * np.log(output + 1e-7), axis=1))
+                # ============ FORWARD PASS ============
+                # Input layer
+                a0 = batch_X.reshape(m, -1)
+
+                # Hidden layer (ReLU)
+                z1 = a0 @ self._layers[0]["W"].T + self._layers[0]["b"]
+                a1 = np.maximum(0, z1)  # ReLU activation
+
+                # Output layer (Softmax)
+                z2 = a1 @ self._layers[1]["W"].T + self._layers[1]["b"]
+                # Stable softmax
+                z2_max = np.max(z2, axis=1, keepdims=True)
+                exp_z2 = np.exp(z2 - z2_max)
+                a2 = exp_z2 / (np.sum(exp_z2, axis=1, keepdims=True) + 1e-8)
+
+                # ============ COMPUTE COST ============
+                # Cross-entropy loss
+                log_probs = np.log(a2 + 1e-8)
+                batch_cost = -np.mean(np.sum(batch_y * log_probs, axis=1))
                 epoch_cost += batch_cost
 
+                # ============ BACKWARD PASS ============
+                # Output layer gradient (softmax + cross-entropy)
+                dz2 = (a2 - batch_y) / m  # Shape: (m, output_size)
+
+                # Gradients for layer 2 (output layer)
+                dW2 = dz2.T @ a1  # Shape: (output_size, hidden_size)
+                db2 = np.sum(dz2, axis=0)  # Shape: (output_size,)
+
+                # Backpropagate to hidden layer
+                da1 = dz2 @ self._layers[1]["W"]  # Shape: (m, hidden_size)
+
+                # ReLU gradient
+                dz1 = da1 * (z1 > 0).astype(np.float32)  # Shape: (m, hidden_size)
+
+                # Gradients for layer 1 (hidden layer)
+                dW1 = dz1.T @ a0  # Shape: (hidden_size, input_size)
+                db1 = np.sum(dz1, axis=0)  # Shape: (hidden_size,)
+
+                # ============ UPDATE WEIGHTS ============
+                # Gradient descent with gradient clipping
+                clip_value = 5.0
+                dW1 = np.clip(dW1, -clip_value, clip_value)
+                dW2 = np.clip(dW2, -clip_value, clip_value)
+                db1 = np.clip(db1, -clip_value, clip_value)
+                db2 = np.clip(db2, -clip_value, clip_value)
+
+                self._layers[0]["W"] -= learning_rate * dW1
+                self._layers[0]["b"] -= learning_rate * db1
+                self._layers[1]["W"] -= learning_rate * dW2
+                self._layers[1]["b"] -= learning_rate * db2
+
+            # Average epoch cost
             epoch_cost /= n_batches
             cost_history.append(epoch_cost)
-            efficiency_history.append(0.5)  # Placeholder
 
-            # Grow batch size
-            if epoch % 10 == 9:
-                batch_size = min(batch_size * 2, 128)
-                learning_rate *= 0.95
+            # Track best cost
+            if epoch_cost < best_cost:
+                best_cost = epoch_cost
+
+            # Compute efficiency metric (based on cost reduction)
+            if len(cost_history) > 1:
+                improvement = (cost_history[-2] - cost_history[-1]) / (cost_history[-2] + 1e-8)
+                efficiency = min(1.0, max(0.0, 0.5 + improvement * 10))
+            else:
+                efficiency = 0.5
+            efficiency_history.append(efficiency)
+
+            # Adaptive learning rate decay
+            if epoch > 0 and epoch % 20 == 0:
+                learning_rate *= 0.8
+
+            # Adaptive batch size growth
+            if epoch > 0 and epoch % 25 == 0:
+                batch_size = min(batch_size * 2, 256)
+
+            # Early stopping check
+            if len(cost_history) > 10:
+                recent_improvement = cost_history[-10] - cost_history[-1]
+                if recent_improvement < 1e-6:
+                    if verbose:
+                        print(f"  Early stopping at epoch {epoch} (no improvement)")
+                    break
 
             if callback:
-                callback(epoch, epoch_cost, 0.5)
+                callback(epoch, epoch_cost, efficiency)
 
             if verbose and epoch % 10 == 0:
-                print(f"  Epoch {epoch}: cost={epoch_cost:.6f}")
+                print(f"  Epoch {epoch}: cost={epoch_cost:.6f}, lr={learning_rate:.6f}")
+
+        training_time_ms = int((time.time() - start_time) * 1000)
 
         return TrainingResult(
             success=True,
-            epochs_completed=max_epochs,
-            final_cost=cost_history[-1],
-            final_efficiency=0.5,
-            best_cost=min(cost_history),
-            best_efficiency=0.5,
-            stopping_reason="Reached maximum epochs",
+            epochs_completed=len(cost_history),
+            final_cost=cost_history[-1] if cost_history else 0.0,
+            final_efficiency=efficiency_history[-1] if efficiency_history else 0.5,
+            best_cost=best_cost,
+            best_efficiency=max(efficiency_history) if efficiency_history else 0.5,
+            stopping_reason="Training completed" if len(cost_history) == max_epochs else "Early stopping",
             cost_history=cost_history,
             efficiency_history=efficiency_history,
-            training_time_ms=0
+            training_time_ms=training_time_ms
         )
 
     def predict(self, X: np.ndarray) -> np.ndarray:
