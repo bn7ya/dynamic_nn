@@ -48,13 +48,58 @@ public:
         , max_nodes_per_layer_(10000)
         , efficiency_threshold_(0.5)
         , saturation_threshold_(0.7)
-        , redundancy_threshold_(0.01) {}
+        , redundancy_threshold_(0.01)
+        , adaptive_threshold_enabled_(true)
+        , sigmoid_k_(5.0)
+        , sigmoid_base_(0.3)
+        , sigmoid_range_(0.5) {}
+
+    /**
+     * Compute adaptive saturation threshold using sigmoid function.
+     * Low efficiency -> lower threshold -> more aggressive changes
+     * High efficiency -> higher threshold -> preserve architecture
+     */
+    double compute_adaptive_saturation_threshold(double efficiency) const {
+        if (!adaptive_threshold_enabled_) {
+            return saturation_threshold_;
+        }
+        // Sigmoid-based threshold: base + range * sigmoid(k * (efficiency - 0.5))
+        double sigmoid = 1.0 / (1.0 + std::exp(-sigmoid_k_ * (efficiency - 0.5)));
+        return sigmoid_base_ + sigmoid_range_ * sigmoid;
+    }
+
+    /**
+     * Enable/disable adaptive saturation threshold.
+     */
+    void set_adaptive_threshold_enabled(bool enabled) {
+        adaptive_threshold_enabled_ = enabled;
+    }
+
+    /**
+     * Configure sigmoid parameters for adaptive threshold.
+     */
+    void set_sigmoid_params(double k, double base, double range) {
+        sigmoid_k_ = k;
+        sigmoid_base_ = base;
+        sigmoid_range_ = range;
+    }
 
     /**
      * Analyze network and recommend structural changes.
+     * Uses default saturation threshold.
      */
     LayerDecision analyze() const {
+        return analyze_with_efficiency(0.5);  // Default efficiency
+    }
+
+    /**
+     * Analyze network with adaptive threshold based on current efficiency.
+     */
+    LayerDecision analyze_with_efficiency(double current_efficiency) const {
         LayerDecision decision;
+
+        // Compute adaptive saturation threshold
+        double adaptive_sat_threshold = compute_adaptive_saturation_threshold(current_efficiency);
 
         // Check health first
         auto health = health_monitor_.diagnose();
@@ -64,8 +109,8 @@ public:
             return decision;
         }
 
-        // Check if we should add a layer
-        if (should_add_layer()) {
+        // Check if we should add a layer (use adaptive threshold)
+        if (should_add_layer_adaptive(adaptive_sat_threshold)) {
             decision.action = LayerDecision::Action::AddLayer;
             decision.layer_index = find_best_insertion_point();
             decision.node_count = compute_new_layer_size(decision.layer_index);
@@ -87,8 +132,8 @@ public:
         for (size_t i = 0; i < network_.num_layers(); ++i) {
             auto layer_metrics = network_.layer(i).compute_metrics();
 
-            // Add nodes if layer is saturated
-            if (layer_metrics.avg_node_efficiency > saturation_threshold_ &&
+            // Add nodes if layer is saturated (use adaptive threshold)
+            if (layer_metrics.avg_node_efficiency > adaptive_sat_threshold &&
                 network_.layer(i).num_nodes() < max_nodes_per_layer_) {
                 decision.action = LayerDecision::Action::AddNodes;
                 decision.layer_index = i;
@@ -246,6 +291,10 @@ public:
 
 private:
     bool should_add_layer() const {
+        return should_add_layer_adaptive(saturation_threshold_);
+    }
+
+    bool should_add_layer_adaptive(double threshold) const {
         if (!health_monitor_.allow_layer_addition()) {
             return false;
         }
@@ -253,11 +302,11 @@ private:
             return false;
         }
 
-        // Count saturated layers
+        // Count saturated layers using adaptive threshold
         size_t saturated_count = 0;
         for (size_t i = 0; i < network_.num_layers(); ++i) {
             auto metrics = network_.layer(i).compute_metrics();
-            if (metrics.avg_node_efficiency > saturation_threshold_) {
+            if (metrics.avg_node_efficiency > threshold) {
                 saturated_count++;
             }
         }
@@ -373,6 +422,10 @@ private:
     double efficiency_threshold_;
     double saturation_threshold_;
     double redundancy_threshold_;
+    bool adaptive_threshold_enabled_;
+    double sigmoid_k_;
+    double sigmoid_base_;
+    double sigmoid_range_;
 };
 
 } // namespace dynamics

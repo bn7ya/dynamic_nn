@@ -3,13 +3,20 @@ High-level Python interface for Dynamic Neural Network.
 """
 
 from typing import Tuple, List, Optional, Callable, Dict, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import numpy as np
+
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+    print("Note: tqdm not installed. Install with 'pip install tqdm' for progress bars.")
 
 
 @dataclass
 class TrainingResult:
-    """Result of training."""
+    """Result of training with comprehensive diagnostics."""
     success: bool
     epochs_completed: int
     final_cost: float
@@ -20,6 +27,16 @@ class TrainingResult:
     cost_history: List[float]
     efficiency_history: List[float]
     training_time_ms: int
+    # New diagnostic fields
+    nodes_added: int = 0
+    nodes_removed: int = 0
+    layers_added: int = 0
+    layers_removed: int = 0
+    cancer_score_history: List[float] = field(default_factory=list)
+    alzheimer_score_history: List[float] = field(default_factory=list)
+    architecture_history: List[Tuple[int, int]] = field(default_factory=list)
+    perturbations_applied: int = 0
+    phase_metrics: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -223,124 +240,188 @@ class DynamicNetwork:
         )
 
     def _fit_python(self, X, y, callback, verbose) -> TrainingResult:
-        """Train using pure Python fallback with backpropagation."""
+        """Train using pure Python fallback with 3-phase training."""
         import time
         start_time = time.time()
 
         np.random.seed(self.seed)
 
-        # Compute initial hidden layer size (geometric mean)
-        input_size = int(np.prod(self.input_shape))
-        hidden_size = int(np.sqrt(input_size * self.output_size))
-        hidden_size = max(hidden_size, 16)  # Minimum hidden size
+        # Initialize network architecture
+        self._init_architecture(X.shape[1])
 
-        # Initialize weights with He initialization
-        W1 = np.random.randn(hidden_size, input_size).astype(np.float32) * np.sqrt(2.0 / input_size)
-        b1 = np.zeros(hidden_size, dtype=np.float32)
-        W2 = np.random.randn(self.output_size, hidden_size).astype(np.float32) * np.sqrt(2.0 / hidden_size)
-        b2 = np.zeros(self.output_size, dtype=np.float32)
-
-        # Store layers with gradient storage
-        self._layers = [
-            {"W": W1, "b": b1, "dW": np.zeros_like(W1), "db": np.zeros_like(b1)},
-            {"W": W2, "b": b2, "dW": np.zeros_like(W2), "db": np.zeros_like(b2)}
-        ]
-
+        # Tracking variables
         cost_history = []
         efficiency_history = []
-        learning_rate = 0.1
-        batch_size = 32
-        max_epochs = 100
+        cancer_score_history = []
+        alzheimer_score_history = []
+        architecture_history = []
+        nodes_added = 0
+        nodes_removed = 0
+        layers_added = 0
+        layers_removed = 0
+        perturbations_applied = 0
         best_cost = float('inf')
+        best_architecture = None
 
         # Shuffle data
         indices = np.random.permutation(len(X))
         X = X[indices]
         y = y[indices]
 
-        for epoch in range(max_epochs):
-            epoch_cost = 0.0
-            n_batches = max(1, len(X) // batch_size)
+        # ============ PHASE 1: EXPLORATION (10 epochs) ============
+        phase1_start = time.time()
+        if verbose:
+            print("\n" + "=" * 60)
+            print("PHASE 1: EXPLORATION (10 epochs)")
+            print("=" * 60)
 
-            # Shuffle each epoch
-            perm = np.random.permutation(len(X))
+        exploration_costs = []
+        learning_rate = 0.5  # High LR for wide exploration
+        batch_size = 64
 
-            for batch_idx in range(n_batches):
-                start_idx = batch_idx * batch_size
-                end_idx = min(start_idx + batch_size, len(X))
-                batch_indices = perm[start_idx:end_idx]
+        phase1_iter = range(10)
+        if verbose and TQDM_AVAILABLE:
+            phase1_iter = tqdm(phase1_iter, desc="Phase 1: Exploration", unit="epoch")
 
-                batch_X = X[batch_indices]
-                batch_y = y[batch_indices]
-                m = len(batch_X)
+        for epoch in phase1_iter:
+            epoch_cost = self._train_epoch(X, y, learning_rate, batch_size)
+            exploration_costs.append(epoch_cost)
+            cost_history.append(epoch_cost)
 
-                # ============ FORWARD PASS ============
-                # Input layer
-                a0 = batch_X.reshape(m, -1)
+            # Aggressive architecture exploration
+            added, removed, layer_change = self._aggressive_layer_adjustment(
+                saturation_threshold=0.3,
+                efficiency_threshold=0.3
+            )
+            nodes_added += added
+            nodes_removed += removed
+            if layer_change > 0:
+                layers_added += layer_change
+            elif layer_change < 0:
+                layers_removed += abs(layer_change)
 
-                # Hidden layer (ReLU)
-                z1 = a0 @ self._layers[0]["W"].T + self._layers[0]["b"]
-                a1 = np.maximum(0, z1)  # ReLU activation
+            # Track best architecture
+            if epoch_cost < best_cost:
+                best_cost = epoch_cost
+                best_architecture = self._save_architecture()
 
-                # Output layer (Softmax)
-                z2 = a1 @ self._layers[1]["W"].T + self._layers[1]["b"]
-                # Stable softmax
-                z2_max = np.max(z2, axis=1, keepdims=True)
-                exp_z2 = np.exp(z2 - z2_max)
-                a2 = exp_z2 / (np.sum(exp_z2, axis=1, keepdims=True) + 1e-8)
+            # Compute metrics
+            efficiency = self._compute_efficiency(cost_history)
+            efficiency_history.append(efficiency)
+            cancer, alzheimer = self._compute_health_scores(nodes_added, nodes_removed, layers_added, layers_removed, epoch + 1)
+            cancer_score_history.append(cancer)
+            alzheimer_score_history.append(alzheimer)
+            architecture_history.append((len(self._layers), self._count_nodes()))
 
-                # ============ COMPUTE COST ============
-                # Cross-entropy loss
-                log_probs = np.log(a2 + 1e-8)
-                batch_cost = -np.mean(np.sum(batch_y * log_probs, axis=1))
-                epoch_cost += batch_cost
+            if verbose and TQDM_AVAILABLE:
+                phase1_iter.set_postfix({
+                    'cost': f'{epoch_cost:.4f}',
+                    'layers': len(self._layers),
+                    'nodes': self._count_nodes(),
+                    'lr': f'{learning_rate:.4f}'
+                })
+            elif verbose and epoch % 2 == 0:
+                print(f"  Epoch {epoch}: cost={epoch_cost:.4f}, layers={len(self._layers)}, nodes={self._count_nodes()}")
 
-                # ============ BACKWARD PASS ============
-                # Output layer gradient (softmax + cross-entropy)
-                dz2 = (a2 - batch_y) / m  # Shape: (m, output_size)
+            if callback:
+                callback(epoch, epoch_cost, efficiency)
 
-                # Gradients for layer 2 (output layer)
-                dW2 = dz2.T @ a1  # Shape: (output_size, hidden_size)
-                db2 = np.sum(dz2, axis=0)  # Shape: (output_size,)
+        phase1_time = time.time() - phase1_start
 
-                # Backpropagate to hidden layer
-                da1 = dz2 @ self._layers[1]["W"]  # Shape: (m, hidden_size)
+        # ============ PHASE 2: ESTIMATION (10 epochs) ============
+        phase2_start = time.time()
+        if verbose:
+            print("\n" + "=" * 60)
+            print("PHASE 2: ESTIMATION (10 epochs)")
+            print("=" * 60)
 
-                # ReLU gradient
-                dz1 = da1 * (z1 > 0).astype(np.float32)  # Shape: (m, hidden_size)
+        estimation_costs = []
+        learning_rate = 0.1  # Medium LR
 
-                # Gradients for layer 1 (hidden layer)
-                dW1 = dz1.T @ a0  # Shape: (hidden_size, input_size)
-                db1 = np.sum(dz1, axis=0)  # Shape: (hidden_size,)
+        phase2_iter = range(10)
+        if verbose and TQDM_AVAILABLE:
+            phase2_iter = tqdm(phase2_iter, desc="Phase 2: Estimation", unit="epoch")
 
-                # ============ UPDATE WEIGHTS ============
-                # Gradient descent with gradient clipping
-                clip_value = 5.0
-                dW1 = np.clip(dW1, -clip_value, clip_value)
-                dW2 = np.clip(dW2, -clip_value, clip_value)
-                db1 = np.clip(db1, -clip_value, clip_value)
-                db2 = np.clip(db2, -clip_value, clip_value)
+        for epoch in phase2_iter:
+            epoch_cost = self._train_epoch(X, y, learning_rate, batch_size)
+            estimation_costs.append(epoch_cost)
+            cost_history.append(epoch_cost)
 
-                self._layers[0]["W"] -= learning_rate * dW1
-                self._layers[0]["b"] -= learning_rate * db1
-                self._layers[1]["W"] -= learning_rate * dW2
-                self._layers[1]["b"] -= learning_rate * db2
+            efficiency = self._compute_efficiency(cost_history)
+            efficiency_history.append(efficiency)
+            cancer, alzheimer = self._compute_health_scores(nodes_added, nodes_removed, layers_added, layers_removed, len(cost_history))
+            cancer_score_history.append(cancer)
+            alzheimer_score_history.append(alzheimer)
+            architecture_history.append((len(self._layers), self._count_nodes()))
 
-            # Average epoch cost
-            epoch_cost /= n_batches
+            if callback:
+                callback(10 + epoch, epoch_cost, efficiency)
+
+        # Estimate epochs needed to reach 90% efficiency
+        avg_improvement = (estimation_costs[0] - estimation_costs[-1]) / 10 if estimation_costs else 0.001
+        current_efficiency = efficiency_history[-1] if efficiency_history else 0.5
+        efficiency_gap = 0.9 - current_efficiency
+        estimated_epochs = int(efficiency_gap / (avg_improvement * 0.1 + 1e-8))
+        estimated_epochs = max(10, min(500, estimated_epochs))
+
+        phase2_time = time.time() - phase2_start
+        if verbose:
+            print(f"  Estimated epochs for 90% efficiency: {estimated_epochs}")
+
+        # ============ PHASE 3: MAIN TRAINING ============
+        phase3_start = time.time()
+        if verbose:
+            print("\n" + "=" * 60)
+            print(f"PHASE 3: MAIN TRAINING ({estimated_epochs} epochs)")
+            print("=" * 60)
+
+        perturbation_cutoff = int(estimated_epochs * 0.2)  # First 20%
+        learning_rate = 0.1
+        batch_size = 32
+
+        phase3_iter = range(estimated_epochs)
+        if verbose and TQDM_AVAILABLE:
+            phase3_iter = tqdm(phase3_iter, desc="Phase 3: Training", unit="epoch")
+
+        for epoch in phase3_iter:
+            total_epoch = 20 + epoch  # Account for phases 1 and 2
+
+            # Apply random perturbation in first 20% to avoid overfitting
+            if epoch < perturbation_cutoff:
+                self._apply_random_perturbation(fraction=0.005)
+                perturbations_applied += 1
+
+            # Compute adaptive saturation threshold
+            efficiency = self._compute_efficiency(cost_history)
+            saturation_threshold = self._sigmoid_threshold(efficiency)
+
+            # Train one epoch
+            epoch_cost = self._train_epoch(X, y, learning_rate, batch_size)
             cost_history.append(epoch_cost)
 
             # Track best cost
             if epoch_cost < best_cost:
                 best_cost = epoch_cost
 
-            # Compute efficiency metric (based on cost reduction)
-            if len(cost_history) > 1:
-                improvement = (cost_history[-2] - cost_history[-1]) / (cost_history[-2] + 1e-8)
-                efficiency = min(1.0, max(0.0, 0.5 + improvement * 10))
-            else:
-                efficiency = 0.5
+            # Layer adjustment with adaptive threshold
+            added, removed, layer_change = self._layer_adjustment(
+                saturation_threshold=saturation_threshold,
+                efficiency_threshold=0.5
+            )
+            nodes_added += added
+            nodes_removed += removed
+            if layer_change > 0:
+                layers_added += layer_change
+            elif layer_change < 0:
+                layers_removed += abs(layer_change)
+
+            # Compute metrics
+            efficiency = self._compute_efficiency(cost_history)
             efficiency_history.append(efficiency)
+            cancer, alzheimer = self._compute_health_scores(nodes_added, nodes_removed, layers_added, layers_removed, len(cost_history))
+            cancer_score_history.append(cancer)
+            alzheimer_score_history.append(alzheimer)
+            architecture_history.append((len(self._layers), self._count_nodes()))
 
             # Adaptive learning rate decay
             if epoch > 0 and epoch % 20 == 0:
@@ -350,21 +431,49 @@ class DynamicNetwork:
             if epoch > 0 and epoch % 25 == 0:
                 batch_size = min(batch_size * 2, 256)
 
+            # Update progress bar
+            if verbose and TQDM_AVAILABLE:
+                phase3_iter.set_postfix({
+                    'cost': f'{epoch_cost:.4f}',
+                    'eff': f'{efficiency:.2%}',
+                    'cancer': f'{cancer:.2%}',
+                    'alzh': f'{alzheimer:.2%}',
+                    'nodes': f'+{nodes_added}/-{nodes_removed}',
+                    'sat_th': f'{saturation_threshold:.2f}'
+                })
+            elif verbose and epoch % 10 == 0:
+                print(f"  Epoch {epoch}: cost={epoch_cost:.4f}, eff={efficiency:.2%}, sat_th={saturation_threshold:.2f}")
+
+            if callback:
+                callback(total_epoch, epoch_cost, efficiency)
+
             # Early stopping check
-            if len(cost_history) > 10:
-                recent_improvement = cost_history[-10] - cost_history[-1]
+            if len(cost_history) > 20:
+                recent_improvement = cost_history[-20] - cost_history[-1]
                 if recent_improvement < 1e-6:
                     if verbose:
                         print(f"  Early stopping at epoch {epoch} (no improvement)")
                     break
 
-            if callback:
-                callback(epoch, epoch_cost, efficiency)
+        phase3_time = time.time() - phase3_start
 
-            if verbose and epoch % 10 == 0:
-                print(f"  Epoch {epoch}: cost={epoch_cost:.6f}, lr={learning_rate:.6f}")
-
+        # ============ TRAINING SUMMARY ============
         training_time_ms = int((time.time() - start_time) * 1000)
+
+        if verbose:
+            print("\n" + "=" * 60)
+            print("TRAINING SUMMARY")
+            print("=" * 60)
+            print(f"  Total Time: {training_time_ms / 1000:.2f}s")
+            print(f"  Phases: Exploration({phase1_time:.1f}s) → Estimation({phase2_time:.1f}s) → Training({phase3_time:.1f}s)")
+            initial_arch = architecture_history[0] if architecture_history else (2, 0)
+            final_arch = architecture_history[-1] if architecture_history else (len(self._layers), self._count_nodes())
+            print(f"  Architecture: {initial_arch[0]} layers → {final_arch[0]} layers, {initial_arch[1]} nodes → {final_arch[1]} nodes")
+            print(f"  Nodes: +{nodes_added} added, -{nodes_removed} removed")
+            print(f"  Layers: +{layers_added} added, -{layers_removed} removed")
+            print(f"  Perturbations: {perturbations_applied}")
+            print(f"  Health: Cancer={cancer_score_history[-1]:.1%}, Alzheimer={alzheimer_score_history[-1]:.1%}")
+            print("=" * 60)
 
         return TrainingResult(
             success=True,
@@ -373,11 +482,304 @@ class DynamicNetwork:
             final_efficiency=efficiency_history[-1] if efficiency_history else 0.5,
             best_cost=best_cost,
             best_efficiency=max(efficiency_history) if efficiency_history else 0.5,
-            stopping_reason="Training completed" if len(cost_history) == max_epochs else "Early stopping",
+            stopping_reason="Training completed",
             cost_history=cost_history,
             efficiency_history=efficiency_history,
-            training_time_ms=training_time_ms
+            training_time_ms=training_time_ms,
+            nodes_added=nodes_added,
+            nodes_removed=nodes_removed,
+            layers_added=layers_added,
+            layers_removed=layers_removed,
+            cancer_score_history=cancer_score_history,
+            alzheimer_score_history=alzheimer_score_history,
+            architecture_history=architecture_history,
+            perturbations_applied=perturbations_applied,
+            phase_metrics={
+                'phase1_time': phase1_time,
+                'phase2_time': phase2_time,
+                'phase3_time': phase3_time,
+                'estimated_epochs': estimated_epochs,
+                'exploration_best_cost': min(exploration_costs) if exploration_costs else 0.0
+            }
         )
+
+    def _init_architecture(self, input_size: int) -> None:
+        """Initialize network architecture."""
+        # Compute initial hidden layer size (geometric mean)
+        hidden_size = int(np.sqrt(input_size * self.output_size))
+        hidden_size = max(hidden_size, 16)  # Minimum hidden size
+
+        # Initialize weights with He initialization
+        W1 = np.random.randn(hidden_size, input_size).astype(np.float32) * np.sqrt(2.0 / input_size)
+        b1 = np.zeros(hidden_size, dtype=np.float32)
+        W2 = np.random.randn(self.output_size, hidden_size).astype(np.float32) * np.sqrt(2.0 / hidden_size)
+        b2 = np.zeros(self.output_size, dtype=np.float32)
+
+        # Store layers
+        self._layers = [
+            {"W": W1, "b": b1, "efficiency": np.ones(hidden_size) * 0.5},
+            {"W": W2, "b": b2, "efficiency": np.ones(self.output_size) * 0.5}
+        ]
+
+    def _count_nodes(self) -> int:
+        """Count total nodes in network."""
+        return sum(layer["W"].shape[0] for layer in self._layers)
+
+    def _train_epoch(self, X: np.ndarray, y: np.ndarray, learning_rate: float, batch_size: int) -> float:
+        """Train for one epoch and return average cost."""
+        epoch_cost = 0.0
+        n_batches = max(1, len(X) // batch_size)
+        perm = np.random.permutation(len(X))
+
+        for batch_idx in range(n_batches):
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size, len(X))
+            batch_indices = perm[start_idx:end_idx]
+
+            batch_X = X[batch_indices]
+            batch_y = y[batch_indices]
+            m = len(batch_X)
+
+            # Forward pass through all layers
+            activations = [batch_X.reshape(m, -1)]
+            z_values = []
+
+            for i, layer in enumerate(self._layers):
+                z = activations[-1] @ layer["W"].T + layer["b"]
+                z_values.append(z)
+
+                if i < len(self._layers) - 1:
+                    # ReLU for hidden layers
+                    a = np.maximum(0, z)
+                else:
+                    # Softmax for output layer
+                    z_max = np.max(z, axis=1, keepdims=True)
+                    exp_z = np.exp(z - z_max)
+                    a = exp_z / (np.sum(exp_z, axis=1, keepdims=True) + 1e-8)
+                activations.append(a)
+
+            # Compute cost
+            log_probs = np.log(activations[-1] + 1e-8)
+            batch_cost = -np.mean(np.sum(batch_y * log_probs, axis=1))
+            epoch_cost += batch_cost
+
+            # Backward pass
+            dz = (activations[-1] - batch_y) / m
+
+            for i in range(len(self._layers) - 1, -1, -1):
+                dW = dz.T @ activations[i]
+                db = np.sum(dz, axis=0)
+
+                # Gradient clipping
+                clip_value = 5.0
+                dW = np.clip(dW, -clip_value, clip_value)
+                db = np.clip(db, -clip_value, clip_value)
+
+                # Update weights
+                self._layers[i]["W"] -= learning_rate * dW
+                self._layers[i]["b"] -= learning_rate * db
+
+                # Update efficiency based on gradient magnitude
+                grad_magnitude = np.mean(np.abs(dW), axis=1)
+                self._layers[i]["efficiency"] = 0.9 * self._layers[i]["efficiency"] + 0.1 * np.clip(grad_magnitude * 10, 0, 1)
+
+                if i > 0:
+                    da = dz @ self._layers[i]["W"]
+                    dz = da * (z_values[i - 1] > 0).astype(np.float32)
+
+        return epoch_cost / n_batches
+
+    def _compute_efficiency(self, cost_history: List[float]) -> float:
+        """Compute efficiency metric based on cost reduction."""
+        if len(cost_history) < 2:
+            return 0.5
+        improvement = (cost_history[-2] - cost_history[-1]) / (cost_history[-2] + 1e-8)
+        return min(1.0, max(0.0, 0.5 + improvement * 10))
+
+    def _compute_health_scores(self, nodes_added: int, nodes_removed: int,
+                               layers_added: int, layers_removed: int, epoch: int) -> Tuple[float, float]:
+        """Compute cancer and alzheimer scores."""
+        # Cancer score: excessive growth
+        growth_rate = (nodes_added + layers_added * 10) / (epoch + 1)
+        cancer = min(1.0, growth_rate / 5.0)
+
+        # Alzheimer score: excessive removal
+        removal_rate = (nodes_removed + layers_removed * 10) / (epoch + 1)
+        alzheimer = min(1.0, removal_rate / 5.0)
+
+        return cancer, alzheimer
+
+    def _sigmoid_threshold(self, efficiency: float, k: float = 5.0,
+                          base: float = 0.3, range_val: float = 0.5) -> float:
+        """Compute adaptive saturation threshold using sigmoid function."""
+        sigmoid = 1.0 / (1.0 + np.exp(-k * (efficiency - 0.5)))
+        return base + range_val * sigmoid
+
+    def _apply_random_perturbation(self, fraction: float = 0.005) -> None:
+        """Apply random perturbation to fraction of nodes to avoid overfitting."""
+        total_nodes = self._count_nodes()
+        num_to_perturb = max(1, int(total_nodes * fraction))
+
+        for _ in range(num_to_perturb):
+            layer_idx = np.random.randint(len(self._layers))
+            node_idx = np.random.randint(self._layers[layer_idx]["W"].shape[0])
+
+            # Add small random perturbation (1% of weight magnitude)
+            perturbation_scale = 0.01
+            self._layers[layer_idx]["W"][node_idx] *= (1 + np.random.randn() * perturbation_scale)
+            self._layers[layer_idx]["b"][node_idx] *= (1 + np.random.randn() * perturbation_scale)
+
+    def _aggressive_layer_adjustment(self, saturation_threshold: float = 0.3,
+                                     efficiency_threshold: float = 0.3) -> Tuple[int, int, int]:
+        """Aggressive layer/node adjustment for exploration phase."""
+        nodes_added = 0
+        nodes_removed = 0
+        layer_change = 0
+
+        for i in range(len(self._layers) - 1):  # Don't modify output layer
+            layer = self._layers[i]
+            avg_efficiency = np.mean(layer["efficiency"])
+
+            # Add nodes if layer is saturated
+            if avg_efficiency > saturation_threshold and layer["W"].shape[0] < 2000:
+                num_new = max(1, layer["W"].shape[0] // 4)
+                self._add_nodes_to_layer(i, num_new)
+                nodes_added += num_new
+
+            # Remove inefficient nodes
+            inefficient_mask = layer["efficiency"] < efficiency_threshold * 0.5
+            if np.sum(inefficient_mask) > 0 and layer["W"].shape[0] > 8:
+                num_to_remove = min(np.sum(inefficient_mask), layer["W"].shape[0] - 8)
+                if num_to_remove > 0:
+                    self._remove_nodes_from_layer(i, int(num_to_remove))
+                    nodes_removed += int(num_to_remove)
+
+        # Consider adding a layer if all hidden layers are saturated
+        if len(self._layers) < 10:
+            all_saturated = all(
+                np.mean(self._layers[i]["efficiency"]) > saturation_threshold
+                for i in range(len(self._layers) - 1)
+            )
+            if all_saturated:
+                self._add_layer()
+                layer_change = 1
+
+        return nodes_added, nodes_removed, layer_change
+
+    def _layer_adjustment(self, saturation_threshold: float,
+                         efficiency_threshold: float) -> Tuple[int, int, int]:
+        """Standard layer/node adjustment for main training phase."""
+        nodes_added = 0
+        nodes_removed = 0
+        layer_change = 0
+
+        for i in range(len(self._layers) - 1):
+            layer = self._layers[i]
+            avg_efficiency = np.mean(layer["efficiency"])
+
+            # Add nodes if layer is saturated
+            if avg_efficiency > saturation_threshold and layer["W"].shape[0] < 2000:
+                num_new = max(1, layer["W"].shape[0] // 8)  # 12.5% growth (less aggressive)
+                self._add_nodes_to_layer(i, num_new)
+                nodes_added += num_new
+
+        return nodes_added, nodes_removed, layer_change
+
+    def _add_nodes_to_layer(self, layer_idx: int, num_nodes: int) -> None:
+        """Add nodes to a layer."""
+        layer = self._layers[layer_idx]
+        input_size = layer["W"].shape[1]
+        output_size = layer["W"].shape[0]
+
+        # Initialize new weights
+        new_W = np.random.randn(num_nodes, input_size).astype(np.float32) * np.sqrt(2.0 / input_size)
+        new_b = np.zeros(num_nodes, dtype=np.float32)
+        new_eff = np.ones(num_nodes) * 0.5
+
+        # Append to layer
+        layer["W"] = np.vstack([layer["W"], new_W])
+        layer["b"] = np.concatenate([layer["b"], new_b])
+        layer["efficiency"] = np.concatenate([layer["efficiency"], new_eff])
+
+        # Update next layer's input size
+        if layer_idx < len(self._layers) - 1:
+            next_layer = self._layers[layer_idx + 1]
+            new_cols = np.random.randn(next_layer["W"].shape[0], num_nodes).astype(np.float32) * np.sqrt(2.0 / (output_size + num_nodes))
+            next_layer["W"] = np.hstack([next_layer["W"], new_cols])
+
+    def _remove_nodes_from_layer(self, layer_idx: int, num_nodes: int) -> None:
+        """Remove least efficient nodes from a layer."""
+        layer = self._layers[layer_idx]
+
+        # Find indices of least efficient nodes
+        indices_to_remove = np.argsort(layer["efficiency"])[:num_nodes]
+        indices_to_keep = np.setdiff1d(np.arange(layer["W"].shape[0]), indices_to_remove)
+
+        if len(indices_to_keep) < 4:
+            return  # Keep minimum nodes
+
+        # Remove from current layer
+        layer["W"] = layer["W"][indices_to_keep]
+        layer["b"] = layer["b"][indices_to_keep]
+        layer["efficiency"] = layer["efficiency"][indices_to_keep]
+
+        # Update next layer's input
+        if layer_idx < len(self._layers) - 1:
+            next_layer = self._layers[layer_idx + 1]
+            next_layer["W"] = next_layer["W"][:, indices_to_keep]
+
+    def _add_layer(self) -> None:
+        """Add a new hidden layer."""
+        if len(self._layers) >= 10:
+            return
+
+        # Insert before output layer
+        insert_idx = len(self._layers) - 1
+        prev_layer = self._layers[insert_idx - 1] if insert_idx > 0 else self._layers[0]
+        next_layer = self._layers[insert_idx]
+
+        # New layer size is geometric mean
+        prev_size = prev_layer["W"].shape[0]
+        next_input = next_layer["W"].shape[1]
+        new_size = int(np.sqrt(prev_size * next_input))
+        new_size = max(16, new_size)
+
+        # Create new layer
+        new_W = np.random.randn(new_size, prev_size).astype(np.float32) * np.sqrt(2.0 / prev_size)
+        new_b = np.zeros(new_size, dtype=np.float32)
+        new_eff = np.ones(new_size) * 0.5
+
+        new_layer = {"W": new_W, "b": new_b, "efficiency": new_eff}
+
+        # Update next layer's input
+        next_layer["W"] = np.random.randn(next_layer["W"].shape[0], new_size).astype(np.float32) * np.sqrt(2.0 / new_size)
+
+        # Insert new layer
+        self._layers.insert(insert_idx, new_layer)
+
+    def _save_architecture(self) -> Dict:
+        """Save current architecture for restoration."""
+        return {
+            'layers': [
+                {
+                    'W': layer['W'].copy(),
+                    'b': layer['b'].copy(),
+                    'efficiency': layer['efficiency'].copy()
+                }
+                for layer in self._layers
+            ]
+        }
+
+    def _restore_architecture(self, saved: Dict) -> None:
+        """Restore architecture from saved state."""
+        self._layers = [
+            {
+                'W': layer['W'].copy(),
+                'b': layer['b'].copy(),
+                'efficiency': layer['efficiency'].copy()
+            }
+            for layer in saved['layers']
+        ]
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         """
@@ -400,14 +802,18 @@ class DynamicNetwork:
                 outputs.append(output.numpy())
             return np.array(outputs)
         else:
-            # Python fallback
+            # Python fallback - works with multi-layer dynamic architecture
             a = X.reshape(len(X), -1)
-            for layer in self._layers[:-1]:
+            for i, layer in enumerate(self._layers):
                 z = a @ layer["W"].T + layer["b"]
-                a = np.maximum(0, z)
-            z = a @ self._layers[-1]["W"].T + self._layers[-1]["b"]
-            exp_z = np.exp(z - np.max(z, axis=1, keepdims=True))
-            return exp_z / np.sum(exp_z, axis=1, keepdims=True)
+                if i < len(self._layers) - 1:
+                    # ReLU for hidden layers
+                    a = np.maximum(0, z)
+                else:
+                    # Softmax for output layer
+                    exp_z = np.exp(z - np.max(z, axis=1, keepdims=True))
+                    a = exp_z / (np.sum(exp_z, axis=1, keepdims=True) + 1e-8)
+            return a
 
     def health_status(self) -> HealthReport:
         """Get health status (cancer/alzheimer detection)."""

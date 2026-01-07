@@ -7,8 +7,8 @@ import sys
 import os
 import numpy as np
 import time
-from typing import Dict, List, Tuple, Optional
-from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional, Any
+from dataclasses import dataclass, field
 
 # Add the pydnn package to path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', 'python')))
@@ -20,7 +20,7 @@ from .tokenizer import GenerativeTokenizer, normalize_features, one_hot_encode
 
 @dataclass
 class GenerationMetrics:
-    """Metrics from training."""
+    """Metrics from training with comprehensive diagnostics."""
     epochs_completed: int
     final_cost: float
     best_cost: float
@@ -28,6 +28,16 @@ class GenerationMetrics:
     samples_per_second: float
     cost_history: List[float]
     efficiency_history: List[float]
+    # New diagnostic fields
+    nodes_added: int = 0
+    nodes_removed: int = 0
+    layers_added: int = 0
+    layers_removed: int = 0
+    cancer_score_history: List[float] = None
+    alzheimer_score_history: List[float] = None
+    architecture_history: List[Tuple[int, int]] = None
+    perturbations_applied: int = 0
+    phase_metrics: Dict = None
 
 
 class GenerativeTrainer:
@@ -126,7 +136,17 @@ class GenerativeTrainer:
             training_time_ms=elapsed_ms,
             samples_per_second=samples_per_sec,
             cost_history=result.cost_history,
-            efficiency_history=result.efficiency_history
+            efficiency_history=result.efficiency_history,
+            # New diagnostic fields from enhanced training
+            nodes_added=getattr(result, 'nodes_added', 0),
+            nodes_removed=getattr(result, 'nodes_removed', 0),
+            layers_added=getattr(result, 'layers_added', 0),
+            layers_removed=getattr(result, 'layers_removed', 0),
+            cancer_score_history=getattr(result, 'cancer_score_history', []),
+            alzheimer_score_history=getattr(result, 'alzheimer_score_history', []),
+            architecture_history=getattr(result, 'architecture_history', []),
+            perturbations_applied=getattr(result, 'perturbations_applied', 0),
+            phase_metrics=getattr(result, 'phase_metrics', {})
         )
 
     def predict(self, X: np.ndarray) -> np.ndarray:

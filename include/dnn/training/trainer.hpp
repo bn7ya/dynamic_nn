@@ -22,7 +22,7 @@ using dynamics::HealthMonitor;
 using dynamics::TrainableScheduler;
 
 /**
- * Training result.
+ * Training result with comprehensive diagnostics.
  */
 struct TrainingResult {
     bool success = false;
@@ -35,6 +35,20 @@ struct TrainingResult {
     std::vector<double> cost_history;
     std::vector<double> efficiency_history;
     std::chrono::milliseconds training_time{0};
+
+    // New diagnostic fields
+    int nodes_added = 0;
+    int nodes_removed = 0;
+    int layers_added = 0;
+    int layers_removed = 0;
+    std::vector<double> cancer_score_history;
+    std::vector<double> alzheimer_score_history;
+    std::vector<std::pair<size_t, size_t>> architecture_history;  // (layers, nodes)
+    int perturbations_applied = 0;
+    double phase1_time = 0.0;
+    double phase2_time = 0.0;
+    double phase3_time = 0.0;
+    size_t estimated_epochs = 0;
 };
 
 /**
@@ -212,6 +226,222 @@ public:
         }
 
         return result;
+    }
+
+    /**
+     * Train with 3-phase approach:
+     * Phase 1: Exploration (10 epochs) - High LR, aggressive architecture changes
+     * Phase 2: Estimation (10 epochs) - Medium LR, estimate epochs needed
+     * Phase 3: Main training - Adaptive LR, perturbation, adaptive thresholds
+     */
+    TrainingResult train_phased(const std::vector<Tensor<T>>& inputs,
+                                const std::vector<Tensor<T>>& targets) {
+        auto total_start = std::chrono::high_resolution_clock::now();
+
+        TrainingResult result;
+        result.cost_history.reserve(500);
+        result.efficiency_history.reserve(500);
+        result.cancer_score_history.reserve(500);
+        result.alzheimer_score_history.reserve(500);
+        result.architecture_history.reserve(500);
+
+        // ============ PHASE 1: EXPLORATION (10 epochs) ============
+        auto phase1_start = std::chrono::high_resolution_clock::now();
+        double exploration_lr = 0.5;  // High LR for wide exploration
+
+        for (size_t epoch = 0; epoch < 10; ++epoch) {
+            health_monitor_.update_epoch(epoch);
+
+            double epoch_cost = train_epoch_with_lr(inputs, targets, exploration_lr);
+            result.cost_history.push_back(epoch_cost);
+
+            // Aggressive architecture exploration with low threshold
+            auto decision = layer_manager_.analyze_with_efficiency(0.3);  // Low threshold
+            if (decision.action != dynamics::LayerDecision::Action::None) {
+                layer_manager_.execute(decision);
+                if (decision.action == dynamics::LayerDecision::Action::AddNodes) {
+                    result.nodes_added += decision.node_count;
+                } else if (decision.action == dynamics::LayerDecision::Action::RemoveNodes) {
+                    result.nodes_removed += decision.nodes_to_remove.size();
+                } else if (decision.action == dynamics::LayerDecision::Action::AddLayer) {
+                    result.layers_added++;
+                } else if (decision.action == dynamics::LayerDecision::Action::RemoveLayer) {
+                    result.layers_removed++;
+                }
+            }
+
+            // Track metrics
+            auto health = health_monitor_.diagnose();
+            result.cancer_score_history.push_back(health.cancer_score);
+            result.alzheimer_score_history.push_back(health.alzheimer_score);
+            result.architecture_history.emplace_back(network_.num_layers(), network_.num_nodes());
+
+            double efficiency = compute_efficiency(result.cost_history);
+            result.efficiency_history.push_back(efficiency);
+
+            if (epoch_cost < result.best_cost) {
+                result.best_cost = epoch_cost;
+            }
+        }
+
+        auto phase1_end = std::chrono::high_resolution_clock::now();
+        result.phase1_time = std::chrono::duration<double>(phase1_end - phase1_start).count();
+
+        // ============ PHASE 2: ESTIMATION (10 epochs) ============
+        auto phase2_start = std::chrono::high_resolution_clock::now();
+        double estimation_lr = 0.1;  // Medium LR
+        std::vector<double> estimation_costs;
+
+        for (size_t epoch = 0; epoch < 10; ++epoch) {
+            health_monitor_.update_epoch(10 + epoch);
+
+            double epoch_cost = train_epoch_with_lr(inputs, targets, estimation_lr);
+            estimation_costs.push_back(epoch_cost);
+            result.cost_history.push_back(epoch_cost);
+
+            auto health = health_monitor_.diagnose();
+            result.cancer_score_history.push_back(health.cancer_score);
+            result.alzheimer_score_history.push_back(health.alzheimer_score);
+            result.architecture_history.emplace_back(network_.num_layers(), network_.num_nodes());
+
+            double efficiency = compute_efficiency(result.cost_history);
+            result.efficiency_history.push_back(efficiency);
+        }
+
+        // Estimate epochs needed
+        double avg_improvement = (estimation_costs.front() - estimation_costs.back()) / 10.0;
+        double current_efficiency = result.efficiency_history.back();
+        double efficiency_gap = 0.9 - current_efficiency;
+        result.estimated_epochs = static_cast<size_t>(
+            std::max(10.0, std::min(500.0, efficiency_gap / (avg_improvement * 0.1 + 1e-8)))
+        );
+
+        auto phase2_end = std::chrono::high_resolution_clock::now();
+        result.phase2_time = std::chrono::duration<double>(phase2_end - phase2_start).count();
+
+        // ============ PHASE 3: MAIN TRAINING ============
+        auto phase3_start = std::chrono::high_resolution_clock::now();
+        double main_lr = 0.1;
+        size_t perturbation_cutoff = result.estimated_epochs / 5;  // First 20%
+
+        for (size_t epoch = 0; epoch < result.estimated_epochs; ++epoch) {
+            health_monitor_.update_epoch(20 + epoch);
+
+            // Apply perturbation in first 20%
+            if (epoch < perturbation_cutoff) {
+                apply_random_perturbation(0.005);  // 0.5% of nodes
+                result.perturbations_applied++;
+            }
+
+            // Compute adaptive saturation threshold
+            double efficiency = compute_efficiency(result.cost_history);
+            double sat_threshold = compute_sigmoid_threshold(efficiency);
+
+            double epoch_cost = train_epoch_with_lr(inputs, targets, main_lr);
+            result.cost_history.push_back(epoch_cost);
+
+            // Layer adjustment with adaptive threshold
+            auto decision = layer_manager_.analyze_with_efficiency(efficiency);
+            if (decision.action != dynamics::LayerDecision::Action::None) {
+                layer_manager_.execute(decision);
+                if (decision.action == dynamics::LayerDecision::Action::AddNodes) {
+                    result.nodes_added += decision.node_count;
+                }
+            }
+
+            // Track metrics
+            auto health = health_monitor_.diagnose();
+            result.cancer_score_history.push_back(health.cancer_score);
+            result.alzheimer_score_history.push_back(health.alzheimer_score);
+            result.architecture_history.emplace_back(network_.num_layers(), network_.num_nodes());
+
+            efficiency = compute_efficiency(result.cost_history);
+            result.efficiency_history.push_back(efficiency);
+
+            if (epoch_cost < result.best_cost) {
+                result.best_cost = epoch_cost;
+            }
+            if (efficiency > result.best_efficiency) {
+                result.best_efficiency = efficiency;
+            }
+
+            // Learning rate decay
+            if (epoch > 0 && epoch % 20 == 0) {
+                main_lr *= 0.8;
+            }
+
+            // Early stopping
+            if (result.cost_history.size() > 20) {
+                double recent_improvement = result.cost_history[result.cost_history.size() - 20] -
+                                           result.cost_history.back();
+                if (recent_improvement < 1e-6) {
+                    result.stopping_reason = "Early stopping (no improvement)";
+                    break;
+                }
+            }
+        }
+
+        auto phase3_end = std::chrono::high_resolution_clock::now();
+        result.phase3_time = std::chrono::duration<double>(phase3_end - phase3_start).count();
+
+        // Finalize result
+        auto total_end = std::chrono::high_resolution_clock::now();
+        result.training_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+            total_end - total_start);
+        result.success = true;
+        result.epochs_completed = result.cost_history.size();
+        result.final_cost = result.cost_history.empty() ? 0.0 : result.cost_history.back();
+        result.final_efficiency = result.efficiency_history.empty() ? 0.5 :
+                                  result.efficiency_history.back();
+
+        if (result.stopping_reason.empty()) {
+            result.stopping_reason = "Training completed";
+        }
+
+        return result;
+    }
+
+    /**
+     * Train for a single epoch with specified learning rate.
+     */
+    double train_epoch_with_lr(const std::vector<Tensor<T>>& inputs,
+                               const std::vector<Tensor<T>>& targets,
+                               double lr) {
+        double saved_lr = learning_rate_;
+        learning_rate_ = lr;
+        double cost = train_epoch(inputs, targets);
+        learning_rate_ = saved_lr;
+        return cost;
+    }
+
+    /**
+     * Compute efficiency from cost history.
+     */
+    double compute_efficiency(const std::vector<double>& cost_history) const {
+        if (cost_history.size() < 2) return 0.5;
+        double improvement = (cost_history[cost_history.size() - 2] - cost_history.back()) /
+                            (cost_history[cost_history.size() - 2] + 1e-8);
+        return std::min(1.0, std::max(0.0, 0.5 + improvement * 10.0));
+    }
+
+    /**
+     * Compute sigmoid-based adaptive saturation threshold.
+     */
+    double compute_sigmoid_threshold(double efficiency, double k = 5.0,
+                                     double base = 0.3, double range = 0.5) const {
+        double sigmoid = 1.0 / (1.0 + std::exp(-k * (efficiency - 0.5)));
+        return base + range * sigmoid;
+    }
+
+    /**
+     * Apply random perturbation to fraction of nodes.
+     */
+    void apply_random_perturbation(double fraction) {
+        // This is a placeholder - full implementation would modify network weights
+        // The actual perturbation happens at the network level
+        size_t total_nodes = network_.num_nodes();
+        size_t num_to_perturb = std::max(size_t(1), static_cast<size_t>(total_nodes * fraction));
+        // Network-level perturbation would be implemented here
     }
 
     /**

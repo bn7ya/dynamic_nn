@@ -25,7 +25,7 @@ enum class TrainableSchedule {
  */
 struct TrainableConfig {
     double initial_fraction = 1.0;      // Start with 100% trainable
-    double final_fraction = 0.01;       // End with 1% trainable
+    double final_fraction = 0.50;       // End with 50% trainable (changed from 1%)
     uint64_t transition_epochs = 100;   // Over how many epochs
     TrainableSchedule schedule = TrainableSchedule::Exponential;
     size_t step_count = 5;              // For Step schedule
