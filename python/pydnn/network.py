@@ -4,7 +4,105 @@ High-level Python interface for Dynamic Neural Network.
 
 from typing import Tuple, List, Optional, Callable, Dict, Any
 from dataclasses import dataclass, field
+import warnings
+import sys
+import os
+import platform
+import glob
 import numpy as np
+
+
+class CppLoadError:
+    """Diagnostic error types for C++ extension loading failures."""
+    MISSING_BINARY = "missing_binary"
+    ARCH_MISMATCH = "architecture_mismatch"
+    PYTHON_VERSION_MISMATCH = "python_version_mismatch"
+    PERMISSION_DENIED = "permission_denied"
+    MISSING_DEPENDENCIES = "missing_dependencies"
+    CORRUPTED_BINARY = "corrupted_binary"
+    UNKNOWN = "unknown"
+
+
+def _detect_cpp_status() -> Tuple[bool, Optional[str], Optional[str]]:
+    """
+    Detect C++ extension status with detailed diagnostics.
+
+    Returns:
+        Tuple of (success, error_type, error_message)
+        - success: True if C++ extension loaded successfully
+        - error_type: One of CppLoadError constants if failed, None if success
+        - error_message: Detailed error message if failed, None if success
+    """
+    # Determine expected binary extension
+    package_dir = os.path.dirname(__file__)
+    if sys.platform == "win32":
+        ext = ".pyd"
+    else:
+        ext = ".so"
+
+    # Find potential binary files with various naming patterns
+    binary_patterns = [
+        f"_dnn_core{ext}",
+        f"_dnn_core.cpython-{sys.version_info.major}{sys.version_info.minor}*{ext}",
+        f"_dnn_core.cp{sys.version_info.major}{sys.version_info.minor}*{ext}",
+    ]
+
+    binary_found = False
+    binary_path = None
+    for pattern in binary_patterns:
+        matches = glob.glob(os.path.join(package_dir, pattern))
+        if matches:
+            binary_found = True
+            binary_path = matches[0]
+            break
+
+    if not binary_found:
+        return False, CppLoadError.MISSING_BINARY, (
+            f"C++ binary not found in {package_dir}.\n"
+            f"Expected: _dnn_core{ext}"
+        )
+
+    # Check file permissions
+    if not os.access(binary_path, os.R_OK):
+        return False, CppLoadError.PERMISSION_DENIED, (
+            f"Cannot read C++ binary: {binary_path}\n"
+            "Check file permissions."
+        )
+
+    # Get architecture info for diagnostics
+    python_arch = platform.architecture()[0]  # '64bit' or '32bit'
+
+    # Try to import and catch specific errors
+    try:
+        from . import _dnn_core
+        return True, None, None
+    except ImportError as e:
+        error_msg = str(e).lower()
+
+        if "dll load failed" in error_msg or "cannot open shared object" in error_msg:
+            return False, CppLoadError.MISSING_DEPENDENCIES, (
+                f"Missing runtime dependencies: {e}\n"
+                "On Windows: Install Visual C++ Redistributable\n"
+                "On Linux: Check ldd output for missing libraries"
+            )
+        elif "incompatible" in error_msg or "version" in error_msg:
+            return False, CppLoadError.PYTHON_VERSION_MISMATCH, (
+                f"Python version mismatch: {e}\n"
+                f"Binary may be for different Python version.\n"
+                f"Current: Python {sys.version_info.major}.{sys.version_info.minor}"
+            )
+        elif "32-bit" in error_msg or "64-bit" in error_msg or "x86" in error_msg:
+            return False, CppLoadError.ARCH_MISMATCH, (
+                f"Architecture mismatch: {e}\n"
+                f"Python is {python_arch}, binary may be different."
+            )
+        else:
+            return False, CppLoadError.UNKNOWN, f"Import failed: {e}"
+    except OSError as e:
+        return False, CppLoadError.CORRUPTED_BINARY, (
+            f"Binary may be corrupted: {e}\n"
+            "Try reinstalling the package."
+        )
 
 try:
     from tqdm import tqdm
@@ -107,6 +205,120 @@ class RewardPenaltyConfig:
     window_size: int = 10                # Window for trend analysis
 
 
+@dataclass
+class TrainingPhaseConfig:
+    """Configuration for the 3-phase training approach."""
+    # Phase 1: Exploration
+    exploration_epochs: int = 10
+    exploration_learning_rate: float = 0.5
+    exploration_batch_size: int = 64
+    exploration_saturation_threshold: float = 0.3
+    exploration_efficiency_threshold: float = 0.3
+
+    # Phase 2: Estimation
+    estimation_epochs: int = 10
+    estimation_learning_rate: float = 0.1
+
+    # Phase 3: Main Training
+    main_learning_rate: float = 0.1
+    main_initial_batch_size: int = 32
+    main_max_batch_size: int = 256
+    batch_size_growth_interval: int = 25
+    perturbation_cutoff_ratio: float = 0.2  # First 20% of epochs
+
+    # Epoch estimation
+    target_efficiency: float = 0.9
+    min_estimated_epochs: int = 10
+    max_estimated_epochs: int = 500
+
+
+@dataclass
+class ArchitectureConfig:
+    """Configuration for dynamic architecture constraints."""
+    # Node limits
+    min_nodes_per_layer: int = 16
+    max_nodes_per_layer: int = 2000
+    min_nodes_to_keep: int = 8
+
+    # Layer limits
+    max_layers: int = 10
+    min_layers: int = 1
+
+    # Growth rates
+    exploration_growth_rate: float = 0.25    # 25% (1/4)
+    main_growth_rate: float = 0.125          # 12.5% (1/8)
+
+    # Initial sizing
+    min_initial_hidden_size: int = 16
+
+
+@dataclass
+class EfficiencyConfig:
+    """Configuration for efficiency computation and thresholds."""
+    # Saturation thresholds
+    default_saturation_threshold: float = 0.7
+    exploration_saturation_threshold: float = 0.3
+
+    # Efficiency thresholds
+    default_efficiency_threshold: float = 0.5
+    exploration_efficiency_threshold: float = 0.3
+    removal_efficiency_multiplier: float = 0.5  # threshold * 0.5 for removal
+
+    # Initial values
+    initial_efficiency: float = 0.5
+
+    # Efficiency update
+    efficiency_decay: float = 0.9
+    efficiency_update_scale: float = 0.1
+    efficiency_gradient_multiplier: float = 10.0
+
+
+@dataclass
+class SigmoidThresholdConfig:
+    """Configuration for adaptive sigmoid threshold computation."""
+    k: float = 5.0
+    base: float = 0.3
+    range_val: float = 0.5
+    center: float = 0.5  # Efficiency center point
+
+
+@dataclass
+class HealthScoreConfig:
+    """Configuration for cancer/alzheimer health score computation."""
+    # Denominators for normalization
+    cancer_denominator: float = 5.0
+    alzheimer_denominator: float = 5.0
+
+    # Layer weight in scoring
+    layer_weight: int = 10
+
+    # Health state thresholds
+    healthy_threshold: float = 0.3
+    at_risk_threshold: float = 0.7
+
+
+@dataclass
+class GradientConfig:
+    """Configuration for gradient handling and optimization."""
+    gradient_clip_value: float = 5.0
+    momentum: float = 0.9
+
+
+@dataclass
+class PerturbationConfig:
+    """Configuration for random perturbation."""
+    perturbation_fraction: float = 0.005
+    perturbation_scale: float = 0.01
+
+
+@dataclass
+class EarlyStoppingConfig:
+    """Configuration for early stopping criteria."""
+    window_size: int = 20
+    improvement_threshold: float = 1e-6
+    max_consecutive_increases: int = 5
+
+
 class DynamicNetwork:
     """
     Dynamic Neural Network with automatic architecture adaptation.
@@ -151,15 +363,34 @@ class DynamicNetwork:
                  input_shape: Tuple[int, ...],
                  output_size: int,
                  seed: int,
-                 cost_function: str = "MSE"):
+                 cost_function: str = "MSE",
+                 # Optional configuration objects
+                 training_phase: Optional[TrainingPhaseConfig] = None,
+                 architecture: Optional[ArchitectureConfig] = None,
+                 efficiency: Optional[EfficiencyConfig] = None,
+                 sigmoid_threshold: Optional[SigmoidThresholdConfig] = None,
+                 health_score: Optional[HealthScoreConfig] = None,
+                 gradient: Optional[GradientConfig] = None,
+                 perturbation: Optional[PerturbationConfig] = None,
+                 early_stopping: Optional[EarlyStoppingConfig] = None,
+                 reward_penalty: Optional[RewardPenaltyConfig] = None):
         """
         Initialize a Dynamic Neural Network.
 
         Args:
             input_shape: Shape of input data (excluding batch dimension)
             output_size: Number of output neurons
-            seed: Random seed - the ONLY required hyperparameter
+            seed: Random seed for reproducibility
             cost_function: One of the available cost functions
+            training_phase: Configuration for training phases (exploration, estimation, main)
+            architecture: Configuration for dynamic architecture constraints
+            efficiency: Configuration for efficiency computation and thresholds
+            sigmoid_threshold: Configuration for adaptive sigmoid threshold
+            health_score: Configuration for cancer/alzheimer health scores
+            gradient: Configuration for gradient handling
+            perturbation: Configuration for random perturbation
+            early_stopping: Configuration for early stopping criteria
+            reward_penalty: Configuration for the reward/penalty system
         """
         if cost_function not in self.COST_FUNCTIONS:
             raise ValueError(f"Unknown cost function: {cost_function}. "
@@ -170,19 +401,48 @@ class DynamicNetwork:
         self.seed = seed
         self.cost_function = cost_function
 
+        # Store configurations (use defaults if not provided)
+        self.training_phase = training_phase or TrainingPhaseConfig()
+        self.architecture = architecture or ArchitectureConfig()
+        self.efficiency = efficiency or EfficiencyConfig()
+        self.sigmoid_threshold = sigmoid_threshold or SigmoidThresholdConfig()
+        self.health_score = health_score or HealthScoreConfig()
+        self.gradient = gradient or GradientConfig()
+        self.perturbation = perturbation or PerturbationConfig()
+        self.early_stopping = early_stopping or EarlyStoppingConfig()
+        self.reward_penalty = reward_penalty or RewardPenaltyConfig()
+
         # Internal state
         self._trained = False
         self._training_result: Optional[TrainingResult] = None
         self._layers: List[Dict] = []
+        self._sigmoid_cache: Dict[float, float] = {}  # Cache for sigmoid threshold computation
+        self._cpp_error_type: Optional[str] = None
+        self._cpp_error_msg: Optional[str] = None
 
-        # Try to use C++ backend
-        try:
-            from . import _dnn_core
+        # Try to use C++ backend with detailed diagnostics
+        success, error_type, error_msg = _detect_cpp_status()
+
+        if success:
             self._use_cpp = True
             self._init_cpp_network()
-        except ImportError:
-            self._use_cpp = False
-            self._init_python_network()
+        else:
+            self._cpp_error_type = error_type
+            self._cpp_error_msg = error_msg
+
+            # Attempt auto-recovery for missing binary in dev environment
+            if error_type == CppLoadError.MISSING_BINARY:
+                if self._attempt_cpp_recovery():
+                    self._use_cpp = True
+                    self._cpp_error_type = None
+                    self._cpp_error_msg = None
+                    self._init_cpp_network()
+                else:
+                    self._use_cpp = False
+                    self._init_python_network(error_type, error_msg)
+            else:
+                self._use_cpp = False
+                self._init_python_network(error_type, error_msg)
 
     def _init_cpp_network(self):
         """Initialize using C++ backend."""
@@ -196,11 +456,129 @@ class DynamicNetwork:
 
         self._network = _dnn_core.Network(config)
 
-    def _init_python_network(self):
-        """Initialize using pure Python fallback."""
+    def _attempt_cpp_recovery(self) -> bool:
+        """
+        Attempt to recover from C++ loading failure by auto-building.
+
+        This is only attempted for MISSING_BINARY errors in development environments
+        where setup.py is available.
+
+        Returns:
+            True if recovery successful and C++ extension now works, False otherwise
+        """
+        import subprocess
+
+        # Look for setup.py in parent directory (dev environment)
+        setup_py = os.path.join(os.path.dirname(__file__), "..", "setup.py")
+
+        if not os.path.exists(setup_py):
+            return False
+
+        try:
+            # Attempt to build C++ extension
+            result = subprocess.run(
+                [sys.executable, "setup.py", "build_ext", "--inplace"],
+                cwd=os.path.dirname(setup_py),
+                capture_output=True,
+                timeout=120
+            )
+
+            if result.returncode == 0:
+                # Retry import after successful build
+                try:
+                    from . import _dnn_core
+                    return True
+                except ImportError:
+                    return False
+            else:
+                return False
+
+        except subprocess.TimeoutExpired:
+            warnings.warn(
+                "C++ extension build timed out after 120 seconds.",
+                RuntimeWarning
+            )
+            return False
+        except Exception:
+            return False
+
+    def _init_python_network(self, error_type: str = None, error_msg: str = None):
+        """
+        Initialize using pure Python fallback with detailed guidance.
+
+        Args:
+            error_type: The CppLoadError type that caused fallback
+            error_msg: Detailed error message from C++ loading attempt
+        """
         # Pure Python implementation for when C++ is not available
         self._network = None
-        print("Note: Using pure Python fallback. For best performance, build C++ extensions.")
+
+        # Build comprehensive help message based on failure type
+        help_sections = []
+
+        if error_type == CppLoadError.MISSING_BINARY:
+            help_sections.append(
+                "BUILD FROM SOURCE:\n"
+                "  pip install pybind11 numpy\n"
+                "  python setup.py build_ext --inplace"
+            )
+
+        elif error_type == CppLoadError.MISSING_DEPENDENCIES:
+            if sys.platform == "win32":
+                help_sections.append(
+                    "INSTALL RUNTIME:\n"
+                    "  Download Visual C++ Redistributable from:\n"
+                    "  https://aka.ms/vs/17/release/vc_redist.x64.exe"
+                )
+            else:
+                help_sections.append(
+                    "CHECK DEPENDENCIES:\n"
+                    "  Run: ldd python/pydnn/_dnn_core*.so\n"
+                    "  Install any missing shared libraries"
+                )
+
+        elif error_type == CppLoadError.PYTHON_VERSION_MISMATCH:
+            help_sections.append(
+                f"REBUILD FOR PYTHON {sys.version_info.major}.{sys.version_info.minor}:\n"
+                "  python setup.py build_ext --inplace --force"
+            )
+
+        elif error_type == CppLoadError.ARCH_MISMATCH:
+            python_arch = platform.architecture()[0]
+            help_sections.append(
+                f"ARCHITECTURE MISMATCH:\n"
+                f"  Python is {python_arch}.\n"
+                "  Rebuild with matching architecture:\n"
+                "  python setup.py build_ext --inplace --force"
+            )
+
+        elif error_type == CppLoadError.PERMISSION_DENIED:
+            help_sections.append(
+                "FIX PERMISSIONS:\n"
+                "  Check file permissions on the C++ binary.\n"
+                "  On Linux/Mac: chmod +r python/pydnn/_dnn_core*.so"
+            )
+
+        elif error_type == CppLoadError.CORRUPTED_BINARY:
+            help_sections.append(
+                "REINSTALL OR REBUILD:\n"
+                "  pip install --force-reinstall pydnn\n"
+                "  Or rebuild: python setup.py build_ext --inplace --force"
+            )
+
+        # Always include generic install option
+        help_sections.append(
+            "INSTALL PRE-BUILT (if available):\n"
+            "  pip install --upgrade pydnn"
+        )
+
+        full_message = (
+            f"C++ extensions unavailable. Using Python fallback (10-100x slower).\n"
+            f"Reason: {error_msg or 'Unknown'}\n\n"
+            + "\n\n".join(help_sections)
+        )
+
+        warnings.warn(full_message, UserWarning, stacklevel=3)
 
     def fit(self,
             X: np.ndarray,
@@ -320,7 +698,7 @@ class DynamicNetwork:
 
         # Emotional state tracking (for Phase 3 reward/penalty system)
         emotional_state = EmotionalState()
-        rp_config = RewardPenaltyConfig()
+        rp_config = self.reward_penalty
         learning_rate_history = []
         emotional_state_actions = []
 
@@ -329,18 +707,19 @@ class DynamicNetwork:
         X = X[indices]
         y = y[indices]
 
-        # ============ PHASE 1: EXPLORATION (10 epochs) ============
+        # ============ PHASE 1: EXPLORATION ============
         phase1_start = time.time()
+        exploration_epochs = self.training_phase.exploration_epochs
         if verbose:
             print("\n" + "=" * 60)
-            print("PHASE 1: EXPLORATION (10 epochs)")
+            print(f"PHASE 1: EXPLORATION ({exploration_epochs} epochs)")
             print("=" * 60)
 
         exploration_costs = []
-        learning_rate = 0.5  # High LR for wide exploration
-        batch_size = 64
+        learning_rate = self.training_phase.exploration_learning_rate
+        batch_size = self.training_phase.exploration_batch_size
 
-        phase1_iter = range(10)
+        phase1_iter = range(exploration_epochs)
         if verbose and TQDM_AVAILABLE:
             phase1_iter = tqdm(phase1_iter, desc="Phase 1: Exploration", unit="epoch")
 
@@ -351,8 +730,8 @@ class DynamicNetwork:
 
             # Aggressive architecture exploration
             added, removed, layer_change = self._aggressive_layer_adjustment(
-                saturation_threshold=0.3,
-                efficiency_threshold=0.3
+                saturation_threshold=self.training_phase.exploration_saturation_threshold,
+                efficiency_threshold=self.training_phase.exploration_efficiency_threshold
             )
             nodes_added += added
             nodes_removed += removed
@@ -384,22 +763,22 @@ class DynamicNetwork:
             elif verbose and epoch % 2 == 0:
                 print(f"  Epoch {epoch}: cost={epoch_cost:.4f}, layers={len(self._layers)}, nodes={self._count_nodes()}")
 
-            if callback:
-                callback(epoch, epoch_cost, efficiency)
+            self._safe_callback(callback, epoch, epoch_cost, efficiency)
 
         phase1_time = time.time() - phase1_start
 
-        # ============ PHASE 2: ESTIMATION (10 epochs) ============
+        # ============ PHASE 2: ESTIMATION ============
         phase2_start = time.time()
+        estimation_epochs = self.training_phase.estimation_epochs
         if verbose:
             print("\n" + "=" * 60)
-            print("PHASE 2: ESTIMATION (10 epochs)")
+            print(f"PHASE 2: ESTIMATION ({estimation_epochs} epochs)")
             print("=" * 60)
 
         estimation_costs = []
-        learning_rate = 0.1  # Medium LR
+        learning_rate = self.training_phase.estimation_learning_rate
 
-        phase2_iter = range(10)
+        phase2_iter = range(estimation_epochs)
         if verbose and TQDM_AVAILABLE:
             phase2_iter = tqdm(phase2_iter, desc="Phase 2: Estimation", unit="epoch")
 
@@ -415,19 +794,18 @@ class DynamicNetwork:
             alzheimer_score_history.append(alzheimer)
             architecture_history.append((len(self._layers), self._count_nodes()))
 
-            if callback:
-                callback(10 + epoch, epoch_cost, efficiency)
+            self._safe_callback(callback, exploration_epochs + epoch, epoch_cost, efficiency)
 
-        # Estimate epochs needed to reach 90% efficiency
-        avg_improvement = (estimation_costs[0] - estimation_costs[-1]) / 10 if estimation_costs else 0.001
+        # Estimate epochs needed to reach target efficiency
+        avg_improvement = (estimation_costs[0] - estimation_costs[-1]) / estimation_epochs if estimation_costs else 0.001
         current_efficiency = efficiency_history[-1] if efficiency_history else 0.5
-        efficiency_gap = 0.9 - current_efficiency
+        efficiency_gap = self.training_phase.target_efficiency - current_efficiency
         estimated_epochs = int(efficiency_gap / (avg_improvement * 0.1 + 1e-8))
-        estimated_epochs = max(10, min(500, estimated_epochs))
+        estimated_epochs = max(self.training_phase.min_estimated_epochs, min(self.training_phase.max_estimated_epochs, estimated_epochs))
 
         phase2_time = time.time() - phase2_start
         if verbose:
-            print(f"  Estimated epochs for 90% efficiency: {estimated_epochs}")
+            print(f"  Estimated epochs for {self.training_phase.target_efficiency:.0%} efficiency: {estimated_epochs}")
 
         # ============ PHASE 3: MAIN TRAINING ============
         phase3_start = time.time()
@@ -436,20 +814,20 @@ class DynamicNetwork:
             print(f"PHASE 3: MAIN TRAINING ({estimated_epochs} epochs)")
             print("=" * 60)
 
-        perturbation_cutoff = int(estimated_epochs * 0.2)  # First 20%
-        learning_rate = 0.1
-        batch_size = 32
+        perturbation_cutoff = int(estimated_epochs * self.training_phase.perturbation_cutoff_ratio)
+        learning_rate = self.training_phase.main_learning_rate
+        batch_size = self.training_phase.main_initial_batch_size
 
         phase3_iter = range(estimated_epochs)
         if verbose and TQDM_AVAILABLE:
             phase3_iter = tqdm(phase3_iter, desc="Phase 3: Training", unit="epoch")
 
         for epoch in phase3_iter:
-            total_epoch = 20 + epoch  # Account for phases 1 and 2
+            total_epoch = exploration_epochs + estimation_epochs + epoch  # Account for phases 1 and 2
 
-            # Apply random perturbation in first 20% to avoid overfitting
+            # Apply random perturbation in first portion to avoid overfitting
             if epoch < perturbation_cutoff:
-                self._apply_random_perturbation(fraction=0.005)
+                self._apply_random_perturbation(fraction=self.perturbation.perturbation_fraction)
                 perturbations_applied += 1
 
             # Compute adaptive saturation threshold
@@ -467,7 +845,7 @@ class DynamicNetwork:
             # Layer adjustment with adaptive threshold
             added, removed, layer_change = self._layer_adjustment(
                 saturation_threshold=saturation_threshold,
-                efficiency_threshold=0.5
+                efficiency_threshold=self.efficiency.default_efficiency_threshold
             )
             nodes_added += added
             nodes_removed += removed
@@ -492,8 +870,8 @@ class DynamicNetwork:
             emotional_state_actions.append(action)
 
             # Adaptive batch size growth
-            if epoch > 0 and epoch % 25 == 0:
-                batch_size = min(batch_size * 2, 256)
+            if epoch > 0 and epoch % self.training_phase.batch_size_growth_interval == 0:
+                batch_size = min(batch_size * 2, self.training_phase.main_max_batch_size)
 
             # Update progress bar
             if verbose and TQDM_AVAILABLE:
@@ -508,13 +886,12 @@ class DynamicNetwork:
             elif verbose and epoch % 10 == 0:
                 print(f"  Epoch {epoch}: cost={epoch_cost:.4f}, eff={efficiency:.2%}, lr={learning_rate:.4f}, R/P={emotional_state.total_rewards}/{emotional_state.total_penalties}")
 
-            if callback:
-                callback(total_epoch, epoch_cost, efficiency)
+            self._safe_callback(callback, total_epoch, epoch_cost, efficiency)
 
             # Early stopping check
-            if len(cost_history) > 20:
-                recent_improvement = cost_history[-20] - cost_history[-1]
-                if recent_improvement < 1e-6:
+            if len(cost_history) > self.early_stopping.window_size:
+                recent_improvement = cost_history[-self.early_stopping.window_size] - cost_history[-1]
+                if recent_improvement < self.early_stopping.improvement_threshold:
                     if verbose:
                         print(f"  Early stopping at epoch {epoch} (no improvement)")
                     break
@@ -584,7 +961,7 @@ class DynamicNetwork:
         """Initialize network architecture."""
         # Compute initial hidden layer size (geometric mean)
         hidden_size = int(np.sqrt(input_size * self.output_size))
-        hidden_size = max(hidden_size, 16)  # Minimum hidden size
+        hidden_size = max(hidden_size, self.architecture.min_initial_hidden_size)
 
         # Initialize weights with He initialization
         W1 = np.random.randn(hidden_size, input_size).astype(np.float32) * np.sqrt(2.0 / input_size)
@@ -593,9 +970,10 @@ class DynamicNetwork:
         b2 = np.zeros(self.output_size, dtype=np.float32)
 
         # Store layers
+        initial_eff = self.efficiency.initial_efficiency
         self._layers = [
-            {"W": W1, "b": b1, "efficiency": np.ones(hidden_size) * 0.5},
-            {"W": W2, "b": b2, "efficiency": np.ones(self.output_size) * 0.5}
+            {"W": W1, "b": b1, "efficiency": np.ones(hidden_size) * initial_eff},
+            {"W": W2, "b": b2, "efficiency": np.ones(self.output_size) * initial_eff}
         ]
 
     def _count_nodes(self) -> int:
@@ -605,16 +983,25 @@ class DynamicNetwork:
     def _train_epoch(self, X: np.ndarray, y: np.ndarray, learning_rate: float, batch_size: int) -> float:
         """Train for one epoch and return average cost."""
         epoch_cost = 0.0
-        n_batches = max(1, len(X) // batch_size)
-        perm = np.random.permutation(len(X))
+        n_samples = len(X)
+        n_batches = max(1, n_samples // batch_size)
+
+        # Pre-allocate or reuse permutation array for in-place shuffle
+        if not hasattr(self, '_perm') or len(self._perm) != n_samples:
+            self._perm = np.arange(n_samples, dtype=np.int32)
+        np.random.shuffle(self._perm)  # In-place shuffle - no allocation
+
+        # Pre-shuffle data once per epoch (one copy instead of per-batch copies)
+        X_shuffled = X[self._perm]
+        y_shuffled = y[self._perm]
 
         for batch_idx in range(n_batches):
             start_idx = batch_idx * batch_size
-            end_idx = min(start_idx + batch_size, len(X))
-            batch_indices = perm[start_idx:end_idx]
+            end_idx = min(start_idx + batch_size, n_samples)
 
-            batch_X = X[batch_indices]
-            batch_y = y[batch_indices]
+            # Use contiguous slices (views, not copies)
+            batch_X = X_shuffled[start_idx:end_idx]
+            batch_y = y_shuffled[start_idx:end_idx]
             m = len(batch_X)
 
             # Forward pass through all layers
@@ -647,8 +1034,19 @@ class DynamicNetwork:
                 dW = dz.T @ activations[i]
                 db = np.sum(dz, axis=0)
 
+                # NaN/Inf detection - skip update if gradients are invalid
+                if not np.isfinite(dW).all() or not np.isfinite(db).all():
+                    warnings.warn(
+                        f"NaN/Inf detected in gradients at layer {i}, batch {batch_idx}. Skipping update.",
+                        RuntimeWarning
+                    )
+                    if i > 0:
+                        da = dz @ self._layers[i]["W"]
+                        dz = da * (z_values[i - 1] > 0).astype(np.float32)
+                    continue
+
                 # Gradient clipping
-                clip_value = 5.0
+                clip_value = self.gradient.gradient_clip_value
                 dW = np.clip(dW, -clip_value, clip_value)
                 db = np.clip(db, -clip_value, clip_value)
 
@@ -658,39 +1056,61 @@ class DynamicNetwork:
 
                 # Update efficiency based on gradient magnitude
                 grad_magnitude = np.mean(np.abs(dW), axis=1)
-                self._layers[i]["efficiency"] = 0.9 * self._layers[i]["efficiency"] + 0.1 * np.clip(grad_magnitude * 10, 0, 1)
+                eff_decay = self.efficiency.efficiency_decay
+                eff_scale = self.efficiency.efficiency_update_scale
+                eff_grad_mult = self.efficiency.efficiency_gradient_multiplier
+                self._layers[i]["efficiency"] = eff_decay * self._layers[i]["efficiency"] + eff_scale * np.clip(grad_magnitude * eff_grad_mult, 0, 1)
 
                 if i > 0:
                     da = dz @ self._layers[i]["W"]
                     dz = da * (z_values[i - 1] > 0).astype(np.float32)
 
-        return epoch_cost / n_batches
+        avg_cost = epoch_cost / n_batches
+
+        # Check for diverged training
+        if not np.isfinite(avg_cost):
+            raise RuntimeError(
+                f"Training diverged: epoch cost is {avg_cost}. "
+                "Try reducing learning rate or checking input data for NaN/Inf values."
+            )
+
+        return avg_cost
 
     def _compute_efficiency(self, cost_history: List[float]) -> float:
         """Compute efficiency metric based on cost reduction."""
         if len(cost_history) < 2:
-            return 0.5
+            return self.efficiency.initial_efficiency
         improvement = (cost_history[-2] - cost_history[-1]) / (cost_history[-2] + 1e-8)
-        return min(1.0, max(0.0, 0.5 + improvement * 10))
+        return min(1.0, max(0.0, self.sigmoid_threshold.center + improvement * self.efficiency.efficiency_gradient_multiplier))
 
     def _compute_health_scores(self, nodes_added: int, nodes_removed: int,
                                layers_added: int, layers_removed: int, epoch: int) -> Tuple[float, float]:
         """Compute cancer and alzheimer scores."""
+        layer_weight = self.health_score.layer_weight
         # Cancer score: excessive growth
-        growth_rate = (nodes_added + layers_added * 10) / (epoch + 1)
-        cancer = min(1.0, growth_rate / 5.0)
+        growth_rate = (nodes_added + layers_added * layer_weight) / (epoch + 1)
+        cancer = min(1.0, growth_rate / self.health_score.cancer_denominator)
 
         # Alzheimer score: excessive removal
-        removal_rate = (nodes_removed + layers_removed * 10) / (epoch + 1)
-        alzheimer = min(1.0, removal_rate / 5.0)
+        removal_rate = (nodes_removed + layers_removed * layer_weight) / (epoch + 1)
+        alzheimer = min(1.0, removal_rate / self.health_score.alzheimer_denominator)
 
         return cancer, alzheimer
 
-    def _sigmoid_threshold(self, efficiency: float, k: float = 5.0,
-                          base: float = 0.3, range_val: float = 0.5) -> float:
-        """Compute adaptive saturation threshold using sigmoid function."""
-        sigmoid = 1.0 / (1.0 + np.exp(-k * (efficiency - 0.5)))
-        return base + range_val * sigmoid
+    def _sigmoid_threshold(self, efficiency: float) -> float:
+        """Compute adaptive saturation threshold using sigmoid function with caching."""
+        # Quantize efficiency to 2 decimal places for cache lookup
+        cache_key = round(efficiency, 2)
+
+        if cache_key not in self._sigmoid_cache:
+            k = self.sigmoid_threshold.k
+            base = self.sigmoid_threshold.base
+            range_val = self.sigmoid_threshold.range_val
+            center = self.sigmoid_threshold.center
+            sigmoid = 1.0 / (1.0 + np.exp(-k * (cache_key - center)))
+            self._sigmoid_cache[cache_key] = base + range_val * sigmoid
+
+        return self._sigmoid_cache[cache_key]
 
     # ============ REWARD/PENALTY SYSTEM METHODS ============
 
@@ -828,7 +1248,15 @@ class DynamicNetwork:
         decrease_factor = 1.0 - magnitude * (1.0 - config.min_adjustment_factor)
 
         new_lr = learning_rate * decrease_factor
-        new_lr = max(new_lr, config.min_learning_rate)
+
+        # Enforce both bounds and validate
+        new_lr = np.clip(new_lr, config.min_learning_rate, config.max_learning_rate)
+        if not np.isfinite(new_lr) or new_lr <= 0:
+            warnings.warn(
+                f"Invalid learning rate {new_lr} after reward. Resetting to baseline.",
+                RuntimeWarning
+            )
+            new_lr = config.baseline_learning_rate
 
         # Update emotional state
         emotional_state.total_rewards += 1
@@ -858,7 +1286,15 @@ class DynamicNetwork:
         increase_factor = 1.0 + magnitude * (config.max_adjustment_factor - 1.0)
 
         new_lr = learning_rate * increase_factor
-        new_lr = min(new_lr, config.max_learning_rate)
+
+        # Enforce both bounds and validate
+        new_lr = np.clip(new_lr, config.min_learning_rate, config.max_learning_rate)
+        if not np.isfinite(new_lr) or new_lr <= 0:
+            warnings.warn(
+                f"Invalid learning rate {new_lr} after penalty. Resetting to baseline.",
+                RuntimeWarning
+            )
+            new_lr = config.baseline_learning_rate
 
         # Update emotional state
         emotional_state.total_penalties += 1
@@ -947,8 +1383,28 @@ class DynamicNetwork:
 
     # ============ END REWARD/PENALTY SYSTEM METHODS ============
 
-    def _apply_random_perturbation(self, fraction: float = 0.005) -> None:
+    def _safe_callback(
+        self,
+        callback: Optional[Callable],
+        epoch: int,
+        cost: float,
+        efficiency: float
+    ) -> None:
+        """Safely invoke callback, catching exceptions to prevent training crashes."""
+        if callback is None:
+            return
+        try:
+            callback(epoch, cost, efficiency)
+        except Exception as e:
+            warnings.warn(
+                f"Callback raised exception at epoch {epoch}: {e}. Training will continue.",
+                RuntimeWarning
+            )
+
+    def _apply_random_perturbation(self, fraction: float = None) -> None:
         """Apply random perturbation to fraction of nodes to avoid overfitting."""
+        if fraction is None:
+            fraction = self.perturbation.perturbation_fraction
         total_nodes = self._count_nodes()
         num_to_perturb = max(1, int(total_nodes * fraction))
 
@@ -956,38 +1412,47 @@ class DynamicNetwork:
             layer_idx = np.random.randint(len(self._layers))
             node_idx = np.random.randint(self._layers[layer_idx]["W"].shape[0])
 
-            # Add small random perturbation (1% of weight magnitude)
-            perturbation_scale = 0.01
+            # Add small random perturbation
+            perturbation_scale = self.perturbation.perturbation_scale
             self._layers[layer_idx]["W"][node_idx] *= (1 + np.random.randn() * perturbation_scale)
             self._layers[layer_idx]["b"][node_idx] *= (1 + np.random.randn() * perturbation_scale)
 
-    def _aggressive_layer_adjustment(self, saturation_threshold: float = 0.3,
-                                     efficiency_threshold: float = 0.3) -> Tuple[int, int, int]:
+    def _aggressive_layer_adjustment(self, saturation_threshold: float = None,
+                                     efficiency_threshold: float = None) -> Tuple[int, int, int]:
         """Aggressive layer/node adjustment for exploration phase."""
+        if saturation_threshold is None:
+            saturation_threshold = self.efficiency.exploration_saturation_threshold
+        if efficiency_threshold is None:
+            efficiency_threshold = self.efficiency.exploration_efficiency_threshold
+
         nodes_added = 0
         nodes_removed = 0
         layer_change = 0
+        max_nodes = self.architecture.max_nodes_per_layer
+        min_nodes = self.architecture.min_nodes_to_keep
+        growth_rate = self.architecture.exploration_growth_rate
+        removal_mult = self.efficiency.removal_efficiency_multiplier
 
         for i in range(len(self._layers) - 1):  # Don't modify output layer
             layer = self._layers[i]
             avg_efficiency = np.mean(layer["efficiency"])
 
             # Add nodes if layer is saturated
-            if avg_efficiency > saturation_threshold and layer["W"].shape[0] < 2000:
-                num_new = max(1, layer["W"].shape[0] // 4)
+            if avg_efficiency > saturation_threshold and layer["W"].shape[0] < max_nodes:
+                num_new = max(1, int(layer["W"].shape[0] * growth_rate))
                 self._add_nodes_to_layer(i, num_new)
                 nodes_added += num_new
 
             # Remove inefficient nodes
-            inefficient_mask = layer["efficiency"] < efficiency_threshold * 0.5
-            if np.sum(inefficient_mask) > 0 and layer["W"].shape[0] > 8:
-                num_to_remove = min(np.sum(inefficient_mask), layer["W"].shape[0] - 8)
+            inefficient_mask = layer["efficiency"] < efficiency_threshold * removal_mult
+            if np.sum(inefficient_mask) > 0 and layer["W"].shape[0] > min_nodes:
+                num_to_remove = min(np.sum(inefficient_mask), layer["W"].shape[0] - min_nodes)
                 if num_to_remove > 0:
                     self._remove_nodes_from_layer(i, int(num_to_remove))
                     nodes_removed += int(num_to_remove)
 
         # Consider adding a layer if all hidden layers are saturated
-        if len(self._layers) < 10:
+        if len(self._layers) < self.architecture.max_layers:
             all_saturated = all(
                 np.mean(self._layers[i]["efficiency"]) > saturation_threshold
                 for i in range(len(self._layers) - 1)
@@ -1004,14 +1469,16 @@ class DynamicNetwork:
         nodes_added = 0
         nodes_removed = 0
         layer_change = 0
+        max_nodes = self.architecture.max_nodes_per_layer
+        growth_rate = self.architecture.main_growth_rate
 
         for i in range(len(self._layers) - 1):
             layer = self._layers[i]
             avg_efficiency = np.mean(layer["efficiency"])
 
             # Add nodes if layer is saturated
-            if avg_efficiency > saturation_threshold and layer["W"].shape[0] < 2000:
-                num_new = max(1, layer["W"].shape[0] // 8)  # 12.5% growth (less aggressive)
+            if avg_efficiency > saturation_threshold and layer["W"].shape[0] < max_nodes:
+                num_new = max(1, int(layer["W"].shape[0] * growth_rate))
                 self._add_nodes_to_layer(i, num_new)
                 nodes_added += num_new
 
@@ -1026,7 +1493,7 @@ class DynamicNetwork:
         # Initialize new weights
         new_W = np.random.randn(num_nodes, input_size).astype(np.float32) * np.sqrt(2.0 / input_size)
         new_b = np.zeros(num_nodes, dtype=np.float32)
-        new_eff = np.ones(num_nodes) * 0.5
+        new_eff = np.ones(num_nodes) * self.efficiency.initial_efficiency
 
         # Append to layer
         layer["W"] = np.vstack([layer["W"], new_W])
@@ -1042,13 +1509,16 @@ class DynamicNetwork:
     def _remove_nodes_from_layer(self, layer_idx: int, num_nodes: int) -> None:
         """Remove least efficient nodes from a layer."""
         layer = self._layers[layer_idx]
+        n = layer["W"].shape[0]
+        num_to_keep = n - num_nodes
 
-        # Find indices of least efficient nodes
-        indices_to_remove = np.argsort(layer["efficiency"])[:num_nodes]
-        indices_to_keep = np.setdiff1d(np.arange(layer["W"].shape[0]), indices_to_remove)
-
-        if len(indices_to_keep) < 4:
+        if num_to_keep < 4:
             return  # Keep minimum nodes
+
+        # Use argpartition for O(n) partial sort instead of O(n log n) argsort
+        # argpartition places the smallest num_nodes elements at the front (unsorted)
+        partition_indices = np.argpartition(layer["efficiency"], num_nodes)
+        indices_to_keep = partition_indices[num_nodes:]  # Keep the larger efficiency nodes
 
         # Remove from current layer
         layer["W"] = layer["W"][indices_to_keep]
@@ -1062,7 +1532,7 @@ class DynamicNetwork:
 
     def _add_layer(self) -> None:
         """Add a new hidden layer."""
-        if len(self._layers) >= 10:
+        if len(self._layers) >= self.architecture.max_layers:
             return
 
         # Insert before output layer
@@ -1074,12 +1544,12 @@ class DynamicNetwork:
         prev_size = prev_layer["W"].shape[0]
         next_input = next_layer["W"].shape[1]
         new_size = int(np.sqrt(prev_size * next_input))
-        new_size = max(16, new_size)
+        new_size = max(self.architecture.min_initial_hidden_size, new_size)
 
         # Create new layer
         new_W = np.random.randn(new_size, prev_size).astype(np.float32) * np.sqrt(2.0 / prev_size)
         new_b = np.zeros(new_size, dtype=np.float32)
-        new_eff = np.ones(new_size) * 0.5
+        new_eff = np.ones(new_size) * self.efficiency.initial_efficiency
 
         new_layer = {"W": new_W, "b": new_b, "efficiency": new_eff}
 
@@ -1232,16 +1702,29 @@ class DynamicNetwork:
         Save model to files.
 
         Creates:
-        - {name}.txt: Model architecture and metadata
-        - code.py: Python code to load and use the model
-        - requirements.txt: Required packages
+        - {name}.json: Model architecture and metadata
+        - {name}_layer{i}_W.npy: Weight files for each layer
+        - {name}_layer{i}_b.npy: Bias files for each layer
 
         Args:
             path: Directory to save to
             name: Model name
+
+        Raises:
+            IOError: If files cannot be written
+            PermissionError: If directory is not writable
         """
         import os
-        os.makedirs(path, exist_ok=True)
+
+        # Validate and create directory
+        try:
+            os.makedirs(path, exist_ok=True)
+        except OSError as e:
+            raise IOError(f"Cannot create directory {path}: {e}")
+
+        # Check write permissions
+        if not os.access(path, os.W_OK):
+            raise PermissionError(f"Directory {path} is not writable")
 
         if self._use_cpp:
             from . import _dnn_core
@@ -1259,12 +1742,30 @@ class DynamicNetwork:
                 "num_layers": len(self._layers)
             }
 
-            with open(os.path.join(path, f"{name}.json"), "w") as f:
-                json.dump(metadata, f, indent=2)
+            json_path = os.path.join(path, f"{name}.json")
+            saved_files = []
 
-            for i, layer in enumerate(self._layers):
-                np.save(os.path.join(path, f"{name}_layer{i}_W.npy"), layer["W"])
-                np.save(os.path.join(path, f"{name}_layer{i}_b.npy"), layer["b"])
+            try:
+                with open(json_path, "w") as f:
+                    json.dump(metadata, f, indent=2)
+                saved_files.append(json_path)
+
+                for i, layer in enumerate(self._layers):
+                    w_path = os.path.join(path, f"{name}_layer{i}_W.npy")
+                    b_path = os.path.join(path, f"{name}_layer{i}_b.npy")
+                    np.save(w_path, layer["W"])
+                    saved_files.append(w_path)
+                    np.save(b_path, layer["b"])
+                    saved_files.append(b_path)
+
+            except (IOError, OSError) as e:
+                # Clean up partial save on failure
+                for file_path in saved_files:
+                    try:
+                        os.remove(file_path)
+                    except OSError:
+                        pass
+                raise IOError(f"Failed to save model: {e}")
 
     @classmethod
     def load(cls, path: str) -> "DynamicNetwork":
@@ -1272,10 +1773,15 @@ class DynamicNetwork:
         Load a saved model.
 
         Args:
-            path: Path to model file
+            path: Path to model file or directory containing model files
 
         Returns:
             Loaded DynamicNetwork
+
+        Raises:
+            FileNotFoundError: If model file not found
+            IOError: If files cannot be read
+            ValueError: If model format is invalid or corrupted
         """
         import os
         import json
@@ -1283,28 +1789,58 @@ class DynamicNetwork:
         # Try to load JSON metadata
         json_path = path if path.endswith(".json") else path.replace(".txt", ".json")
 
-        if os.path.exists(json_path):
+        if not os.path.exists(json_path):
+            raise FileNotFoundError(f"Model file not found: {json_path}")
+
+        try:
             with open(json_path) as f:
                 metadata = json.load(f)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON in model file {json_path}: {e}")
+        except IOError as e:
+            raise IOError(f"Cannot read model file {json_path}: {e}")
 
+        # Validate metadata
+        required_keys = ["input_shape", "output_size", "seed", "cost_function", "num_layers"]
+        missing = [k for k in required_keys if k not in metadata]
+        if missing:
+            raise ValueError(f"Model file missing required keys: {missing}")
+
+        try:
             network = cls(
                 input_shape=tuple(metadata["input_shape"]),
                 output_size=metadata["output_size"],
                 seed=metadata["seed"],
                 cost_function=metadata["cost_function"]
             )
+        except (KeyError, TypeError) as e:
+            raise ValueError(f"Invalid model metadata: {e}")
 
-            # Load weights
-            base_path = os.path.dirname(json_path)
-            name = os.path.basename(json_path).replace(".json", "")
+        # Load weights
+        base_path = os.path.dirname(json_path) or "."
+        name = os.path.basename(json_path).replace(".json", "")
 
-            network._layers = []
-            for i in range(metadata["num_layers"]):
-                W = np.load(os.path.join(base_path, f"{name}_layer{i}_W.npy"))
-                b = np.load(os.path.join(base_path, f"{name}_layer{i}_b.npy"))
-                network._layers.append({"W": W, "b": b})
+        network._layers = []
+        for i in range(metadata["num_layers"]):
+            w_path = os.path.join(base_path, f"{name}_layer{i}_W.npy")
+            b_path = os.path.join(base_path, f"{name}_layer{i}_b.npy")
 
-            network._trained = True
-            return network
+            if not os.path.exists(w_path):
+                raise FileNotFoundError(f"Weight file not found: {w_path}")
+            if not os.path.exists(b_path):
+                raise FileNotFoundError(f"Bias file not found: {b_path}")
 
-        raise FileNotFoundError(f"Model file not found: {path}")
+            try:
+                W = np.load(w_path)
+                b = np.load(b_path)
+            except Exception as e:
+                raise IOError(f"Failed to load layer {i} weights: {e}")
+
+            network._layers.append({
+                "W": W,
+                "b": b,
+                "efficiency": np.ones(W.shape[0]) * 0.5  # Initialize efficiency
+            })
+
+        network._trained = True
+        return network

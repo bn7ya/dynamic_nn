@@ -45,6 +45,12 @@ Three-Model Generation:
 __version__ = "1.0.0"
 __author__ = "DNN Team"
 
+import sys
+import platform
+
+# Store C++ loading error for diagnostics
+_CPP_ERROR = None
+
 # Import core components when C++ bindings are available
 try:
     from ._dnn_core import (
@@ -62,8 +68,9 @@ try:
         load_model,
     )
     _CPP_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     _CPP_AVAILABLE = False
+    _CPP_ERROR = str(e)
 
 # Pure Python components (always available)
 from .network import DynamicNetwork, TrainingResult, HealthReport
@@ -143,3 +150,73 @@ if _CPP_AVAILABLE:
         "save_model",
         "load_model",
     ])
+
+
+def validate_environment():
+    """
+    Validate environment for C++ extension compatibility.
+
+    Use this function to debug C++ extension loading issues.
+    It returns detailed information about the Python environment
+    and C++ extension status.
+
+    Returns:
+        Dict with environment info:
+        - python_version: Python version string
+        - platform: Operating system platform
+        - architecture: 32bit or 64bit
+        - numpy_version: NumPy version (if available)
+        - cpp_available: Whether C++ extensions loaded
+        - cpp_error: Error message if C++ failed to load
+        - expected_binary: Expected binary file name
+        - binary_path: Path where binary should be located
+
+    Example:
+        >>> from pydnn import validate_environment
+        >>> env = validate_environment()
+        >>> if not env['cpp_available']:
+        ...     print(f"C++ unavailable: {env['cpp_error']}")
+        ...     print(f"Expected: {env['expected_binary']}")
+    """
+    import os
+
+    # Determine expected binary extension
+    if sys.platform == "win32":
+        ext = ".pyd"
+    else:
+        ext = ".so"
+
+    package_dir = os.path.dirname(__file__)
+    expected_binary = f"_dnn_core{ext}"
+
+    # Check for numpy
+    try:
+        import numpy as np
+        numpy_version = np.__version__
+    except ImportError:
+        numpy_version = "NOT INSTALLED"
+
+    # Check for pybind11
+    try:
+        import pybind11
+        pybind11_version = pybind11.__version__
+    except ImportError:
+        pybind11_version = "NOT INSTALLED"
+
+    return {
+        "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        "platform": sys.platform,
+        "architecture": platform.architecture()[0],
+        "machine": platform.machine(),
+        "numpy_version": numpy_version,
+        "pybind11_version": pybind11_version,
+        "cpp_available": _CPP_AVAILABLE,
+        "cpp_error": _CPP_ERROR if not _CPP_AVAILABLE else None,
+        "expected_binary": expected_binary,
+        "binary_path": package_dir,
+        "visualization_available": _VIZ_AVAILABLE,
+    }
+
+
+# Add validate_environment to exports
+__all__.append("validate_environment")

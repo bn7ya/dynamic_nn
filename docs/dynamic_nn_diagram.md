@@ -23,13 +23,14 @@
 │         │            │  • Adaptive Thresholds         │          │                   │
 │         │            └────────────────────────────────┘          │                   │
 │         │                         │                              │                   │
-│         │                         ▼                              │                   │
-│         │            ┌────────────────────────┐                  │                   │
-│         │            │    HEALTH MONITOR      │                  │                   │
-│         │            │  • Cancer Score        │                  │                   │
-│         │            │  • Alzheimer Score     │                  │                   │
-│         │            │  • Overall Health      │                  │                   │
-│         │            └────────────────────────┘                  │                   │
+│         │            ┌────────────┴────────────┐                 │                   │
+│         │            ▼                         ▼                 │                   │
+│         │   ┌────────────────────┐   ┌────────────────────┐      │                   │
+│         │   │   HEALTH MONITOR   │   │  EMOTIONAL STATE   │      │                   │
+│         │   │  • Cancer Score    │   │  • Depression Ratio│      │                   │
+│         │   │  • Alzheimer Score │   │  • Excitement Ratio│      │                   │
+│         │   │  • Overall Health  │   │  • Reward/Penalty  │      │                   │
+│         │   └────────────────────┘   └────────────────────┘      │                   │
 │         │                                                        │                   │
 │         └────────────────────────────────────────────────────────┘                   │
 │                                                                                      │
@@ -51,13 +52,15 @@
 │           │                        │                          │                    │
 │           ▼                        ▼                          ▼                    │
 │  ┌─────────────────┐     ┌─────────────────┐      ┌─────────────────────────┐     │
-│  │ • LR = 0.5      │     │ • LR = 0.1      │      │ • LR = 0.1 → decay 0.8x │     │
+│  │ • LR = 0.5      │     │ • LR = 0.1      │      │ • LR = Adaptive (R/P)   │     │
 │  │ • Batch = 64    │     │ • Batch = 64    │      │ • Batch = 32 → 256      │     │
 │  │ • Aggressive    │     │ • Measure       │      │ • Adaptive saturation   │     │
 │  │   growth (25%)  │     │   improvement   │      │   threshold (sigmoid)   │     │
 │  │ • Find viable   │     │ • Estimate      │      │ • Conservative growth   │     │
 │  │   architectures │     │   epochs needed │      │   (12.5%)               │     │
 │  │ • Sat.th = 0.3  │     │   for 90% eff.  │      │ • Perturbations (20%)   │     │
+│  │ • Track best    │     │                 │      │ • Reward/Penalty System │     │
+│  │   architecture  │     │                 │      │ • Emotional State Track │     │
 │  └─────────────────┘     └─────────────────┘      └─────────────────────────┘     │
 │                                                                                     │
 └────────────────────────────────────────────────────────────────────────────────────┘
@@ -182,6 +185,118 @@
 └────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
+## Emotional State & Reward/Penalty System (NEW)
+
+```
+┌────────────────────────────────────────────────────────────────────────────────────┐
+│                       EMOTIONAL STATE TRACKING                                      │
+├────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│   The network maintains an "emotional state" based on training progress:           │
+│                                                                                     │
+│   ┌─────────────────────────────────────────────────────────────────────────┐      │
+│   │                      IMPROVEMENT METRICS                                 │      │
+│   │                                                                          │      │
+│   │   cost_improvement = (cost_old - cost_new) / cost_old                   │      │
+│   │   efficiency_improvement = efficiency_new - efficiency_old               │      │
+│   │   cost_trend = avg change over sliding window (5 epochs)                │      │
+│   │   efficiency_trend = avg change over sliding window                      │      │
+│   │                                                                          │      │
+│   └────────────────────────────────┬────────────────────────────────────────┘      │
+│                                    │                                                │
+│              ┌─────────────────────┼─────────────────────┐                         │
+│              ▼                                           ▼                         │
+│   ┌─────────────────────────┐               ┌─────────────────────────┐            │
+│   │        REWARD           │               │        PENALTY          │            │
+│   │  (Good Progress)        │               │  (Poor Progress)        │            │
+│   ├─────────────────────────┤               ├─────────────────────────┤            │
+│   │ Conditions:             │               │ Conditions:             │            │
+│   │ • Cost decreasing       │               │ • Cost increasing       │            │
+│   │ • Efficiency improving  │               │ • Efficiency declining  │            │
+│   │ • Positive trend        │               │ • Negative trend        │            │
+│   │                         │               │                         │            │
+│   │ Action:                 │               │ Action:                 │            │
+│   │ • Decrease LR           │               │ • Increase LR           │            │
+│   │ • Factor: 0.5 - 1.0     │               │ • Factor: 1.0 - 2.0     │            │
+│   │ • "Fine-tune carefully" │               │ • "Escape local minima" │            │
+│   └────────────┬────────────┘               └────────────┬────────────┘            │
+│                │                                         │                         │
+│                └──────────────────┬──────────────────────┘                         │
+│                                   ▼                                                │
+│   ┌─────────────────────────────────────────────────────────────────────────┐      │
+│   │                      EMOTIONAL STATE                                     │      │
+│   │                                                                          │      │
+│   │   depression_ratio = total_penalties / (rewards + penalties)            │      │
+│   │   excitement_ratio = total_rewards / (rewards + penalties)              │      │
+│   │                                                                          │      │
+│   │   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌─────────────┐ │      │
+│   │   │   NEUTRAL    │  │   EXCITED    │  │  DEPRESSED   │  │  EXTREME    │ │      │
+│   │   │              │  │              │  │              │  │             │ │      │
+│   │   │ Both ratios  │  │ excitement   │  │ depression   │  │ Either >0.8 │ │      │
+│   │   │ balanced     │  │ > 0.5        │  │ > 0.5        │  │ Reset LR to │ │      │
+│   │   │ (<0.5)       │  │              │  │              │  │ baseline!   │ │      │
+│   │   └──────────────┘  └──────────────┘  └──────────────┘  └─────────────┘ │      │
+│   │                                                                          │      │
+│   └─────────────────────────────────────────────────────────────────────────┘      │
+│                                                                                     │
+└────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Reward/Penalty System Flow
+
+```
+┌────────────────────────────────────────────────────────────────────────────────────┐
+│                       REWARD/PENALTY SYSTEM FLOW                                    │
+├────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│                         ┌────────────────────┐                                     │
+│                         │  Compute Metrics   │                                     │
+│                         │  (cost, efficiency │                                     │
+│                         │   trends)          │                                     │
+│                         └─────────┬──────────┘                                     │
+│                                   │                                                │
+│                                   ▼                                                │
+│                    ┌──────────────────────────────┐                                │
+│                    │   Cost improving AND         │                                │
+│               YES  │   Efficiency good AND        │  NO                            │
+│            ┌───────│   Trend positive?            │───────┐                        │
+│            │       └──────────────────────────────┘       │                        │
+│            ▼                                              ▼                        │
+│   ┌─────────────────┐                        ┌──────────────────────────┐          │
+│   │  APPLY REWARD   │                        │  Cost degrading OR       │          │
+│   │                 │                        │  (Efficiency bad AND     │          │
+│   │  LR = LR × (1   │                   YES  │   Trend negative)?       │  NO      │
+│   │  - mag × 0.5)   │                  ┌─────│                          │─────┐    │
+│   │                 │                  │     └──────────────────────────┘     │    │
+│   │  total_rewards++│                  ▼                                      │    │
+│   └────────┬────────┘         ┌─────────────────┐                             │    │
+│            │                  │  APPLY PENALTY  │                             │    │
+│            │                  │                 │                             │    │
+│            │                  │  LR = LR × (1   │                             │    │
+│            │                  │  + mag × 1.0)   │                             │    │
+│            │                  │                 │              ┌──────────┐   │    │
+│            │                  │  total_penalty++│              │ NEUTRAL  │   │    │
+│            │                  └────────┬────────┘              │ No change│   │    │
+│            │                           │                       └────┬─────┘   │    │
+│            └───────────────────────────┼────────────────────────────┘         │    │
+│                                        │                                      │    │
+│                                        ▼                                      │    │
+│                          ┌──────────────────────────────┐                     │    │
+│                          │   CHECK EXTREME STATES       │◄────────────────────┘    │
+│                          │                              │                          │
+│                          │  IF depression > 0.8:        │                          │
+│                          │     LR = baseline (0.1)      │                          │
+│                          │     state = "extreme_dep"    │                          │
+│                          │                              │                          │
+│                          │  IF excitement > 0.8:        │                          │
+│                          │     LR = baseline (0.1)      │                          │
+│                          │     state = "extreme_exc"    │                          │
+│                          │                              │                          │
+│                          └──────────────────────────────┘                          │
+│                                                                                     │
+└────────────────────────────────────────────────────────────────────────────────────┘
+```
+
 ## Complete Data Flow
 
 ```
@@ -244,6 +359,17 @@
 │   │                                                                           │    │
 │   │   ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐      │    │
 │   │   │ Check Saturation│───▶│ Add/Remove Nodes│───▶│ Add/Remove Layer│      │    │
+│   │   └─────────────────┘    └─────────────────┘    └─────────────────┘      │    │
+│   │                                                                           │    │
+│   └───────────────────────────────────────────────────────────────────────────┘    │
+│                  │                                                                  │
+│                  ▼                                                                  │
+│   ┌───────────────────────────────────────────────────────────────────────────┐    │
+│   │                    REWARD/PENALTY ADJUSTMENT (Phase 3)                    │    │
+│   │                                                                           │    │
+│   │   ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐      │    │
+│   │   │ Compute Metrics │───▶│ Reward/Penalty  │───▶│ Update Emotional│      │    │
+│   │   │ (cost, eff)     │    │ Decision        │    │ State & LR      │      │    │
 │   │   └─────────────────┘    └─────────────────┘    └─────────────────┘      │    │
 │   │                                                                           │    │
 │   └───────────────────────────────────────────────────────────────────────────┘    │
@@ -324,6 +450,126 @@
 └────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
+## Configuration System
+
+```
+┌────────────────────────────────────────────────────────────────────────────────────┐
+│                         CONFIGURATION DATACLASSES                                   │
+├────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│   ┌─────────────────────────┐    ┌─────────────────────────┐                       │
+│   │  TrainingPhaseConfig    │    │  ArchitectureConfig     │                       │
+│   ├─────────────────────────┤    ├─────────────────────────┤                       │
+│   │ • exploration_epochs=10 │    │ • min_nodes_per_layer=16│                       │
+│   │ • exploration_lr=0.5    │    │ • max_nodes_per_layer=  │                       │
+│   │ • estimation_epochs=10  │    │   2000                  │                       │
+│   │ • main_lr=0.1           │    │ • max_layers=10         │                       │
+│   │ • target_efficiency=0.9 │    │ • exploration_growth=   │                       │
+│   │ • perturbation_cutoff=  │    │   0.25 (25%)            │                       │
+│   │   0.2 (first 20%)       │    │ • main_growth=0.125     │                       │
+│   └─────────────────────────┘    └─────────────────────────┘                       │
+│                                                                                     │
+│   ┌─────────────────────────┐    ┌─────────────────────────┐                       │
+│   │  EfficiencyConfig       │    │  SigmoidThresholdConfig │                       │
+│   ├─────────────────────────┤    ├─────────────────────────┤                       │
+│   │ • default_sat_th=0.7    │    │ • k=5.0                 │                       │
+│   │ • exploration_sat_th=0.3│    │ • base=0.3              │                       │
+│   │ • efficiency_decay=0.9  │    │ • range_val=0.5         │                       │
+│   │ • eff_update_scale=0.1  │    │ • center=0.5            │                       │
+│   │ • eff_grad_mult=10.0    │    │                         │                       │
+│   └─────────────────────────┘    └─────────────────────────┘                       │
+│                                                                                     │
+│   ┌─────────────────────────┐    ┌─────────────────────────┐                       │
+│   │  HealthScoreConfig      │    │  RewardPenaltyConfig    │  ◄── NEW              │
+│   ├─────────────────────────┤    ├─────────────────────────┤                       │
+│   │ • cancer_denominator=5  │    │ • cost_improve_th=0.001 │                       │
+│   │ • alzheimer_denom=5     │    │ • eff_improve_th=0.01   │                       │
+│   │ • layer_weight=10       │    │ • min_lr=1e-6           │                       │
+│   │ • healthy_threshold=0.3 │    │ • max_lr=1.0            │                       │
+│   │ • at_risk_threshold=0.7 │    │ • baseline_lr=0.1       │                       │
+│   └─────────────────────────┘    │ • max_adjust_factor=2.0 │                       │
+│                                  │ • min_adjust_factor=0.5 │                       │
+│   ┌─────────────────────────┐    │ • extreme_threshold=0.8 │                       │
+│   │  GradientConfig         │    │ • window_size=10        │                       │
+│   ├─────────────────────────┤    └─────────────────────────┘                       │
+│   │ • gradient_clip=5.0     │                                                      │
+│   │ • momentum=0.9          │    ┌─────────────────────────┐                       │
+│   └─────────────────────────┘    │  EarlyStoppingConfig    │                       │
+│                                  ├─────────────────────────┤                       │
+│   ┌─────────────────────────┐    │ • window_size=20        │                       │
+│   │  PerturbationConfig     │    │ • improvement_th=1e-6   │                       │
+│   ├─────────────────────────┤    │ • max_consec_increase=5 │                       │
+│   │ • fraction=0.005        │    └─────────────────────────┘                       │
+│   │ • scale=0.01            │                                                      │
+│   └─────────────────────────┘                                                      │
+│                                                                                     │
+└────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Training Result & Reports
+
+```
+┌────────────────────────────────────────────────────────────────────────────────────┐
+│                         TRAINING RESULT DATACLASS                                   │
+├────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│   TrainingResult                                                                    │
+│   ├── success: bool                                                                │
+│   ├── epochs_completed: int                                                        │
+│   ├── final_cost: float                                                            │
+│   ├── final_efficiency: float                                                      │
+│   ├── best_cost: float                                                             │
+│   ├── best_efficiency: float                                                       │
+│   ├── stopping_reason: str                                                         │
+│   ├── cost_history: List[float]                                                    │
+│   ├── efficiency_history: List[float]                                              │
+│   ├── training_time_ms: int                                                        │
+│   │                                                                                │
+│   │   Architecture Tracking                                                        │
+│   ├── nodes_added: int                                                             │
+│   ├── nodes_removed: int                                                           │
+│   ├── layers_added: int                                                            │
+│   ├── layers_removed: int                                                          │
+│   ├── architecture_history: List[Tuple[layers, nodes]]                             │
+│   ├── perturbations_applied: int                                                   │
+│   │                                                                                │
+│   │   Health Tracking                                                              │
+│   ├── cancer_score_history: List[float]                                            │
+│   ├── alzheimer_score_history: List[float]                                         │
+│   │                                                                                │
+│   │   Emotional State Tracking  ◄── NEW                                            │
+│   ├── total_rewards: int                                                           │
+│   ├── total_penalties: int                                                         │
+│   ├── depression_history: List[float]                                              │
+│   ├── excitement_history: List[float]                                              │
+│   ├── lr_reset_count: int                                                          │
+│   ├── learning_rate_history: List[float]                                           │
+│   └── emotional_state_history: List[str]                                           │
+│                                                                                     │
+└────────────────────────────────────────────────────────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────────────────────┐
+│                           HEALTH REPORT                                             │
+├────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│   HealthReport                                                                      │
+│   ├── state: str ("Healthy", "CancerRisk", "Cancer", etc.)                         │
+│   ├── cancer_score: float (0.0 - 1.0)                                              │
+│   ├── alzheimer_score: float (0.0 - 1.0)                                           │
+│   ├── overall_health: float (0.0 - 1.0)                                            │
+│   ├── diagnosis: str                                                               │
+│   ├── recommendations: List[str]                                                   │
+│   ├── current_layers: int                                                          │
+│   ├── current_nodes: int                                                           │
+│   │                                                                                │
+│   │   Emotional State  ◄── NEW                                                     │
+│   ├── depression_ratio: float (0.0 - 1.0)                                          │
+│   ├── excitement_ratio: float (0.0 - 1.0)                                          │
+│   └── emotional_state: str ("neutral", "excited", "depressed", "extreme_*")        │
+│                                                                                     │
+└────────────────────────────────────────────────────────────────────────────────────┘
+```
+
 ## Key Formulas Summary
 
 ```
@@ -350,16 +596,63 @@
 │   6. ALZHEIMER SCORE                                                                │
 │      alzheimer = min(1, (nodes_removed + layers_removed × 10) / (5 × epoch))       │
 │                                                                                     │
-│   7. LEARNING RATE DECAY                                                            │
-│      LR = LR × 0.8    (every 20 epochs in Phase 3)                                 │
+│   7. LEARNING RATE ADJUSTMENT (Reward/Penalty)  ◄── NEW (replaces fixed decay)     │
+│      Reward:  LR = LR × (1 - magnitude × 0.5)    [0.5 - 1.0 factor]               │
+│      Penalty: LR = LR × (1 + magnitude × 1.0)    [1.0 - 2.0 factor]               │
 │                                                                                     │
-│   8. BATCH SIZE GROWTH                                                              │
+│   8. EMOTIONAL STATE RATIOS  ◄── NEW                                                │
+│      depression_ratio = total_penalties / (total_rewards + total_penalties)        │
+│      excitement_ratio = total_rewards / (total_rewards + total_penalties)          │
+│                                                                                     │
+│   9. BATCH SIZE GROWTH                                                              │
 │      batch = min(batch × 2, 256)    (every 25 epochs in Phase 3)                   │
 │                                                                                     │
-│   9. EPOCHS ESTIMATION (Phase 2)                                                    │
+│  10. EPOCHS ESTIMATION (Phase 2)                                                    │
 │      avg_improvement = (cost_start - cost_end) / 10                                │
 │      efficiency_gap = 0.9 - current_efficiency                                     │
 │      estimated_epochs = clamp(gap / (improvement × 0.1), 10, 500)                  │
 │                                                                                     │
+│  11. IMPROVEMENT METRICS (for Reward/Penalty)  ◄── NEW                              │
+│      cost_improvement = (cost_old - cost_new) / cost_old                           │
+│      efficiency_improvement = efficiency_new - efficiency_old                       │
+│      Reward if: cost_improving AND efficiency_good AND trend_positive              │
+│      Penalty if: cost_degrading OR (efficiency_bad AND trend_negative)             │
+│                                                                                     │
 └────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Usage Example
+
+```python
+from pydnn import DynamicNetwork
+
+# Minimal configuration - everything else is auto-determined
+network = DynamicNetwork(
+    input_shape=(784,),
+    output_size=10,
+    seed=42,
+    cost_function="CrossEntropy"
+)
+
+# Train with automatic 3-phase process
+result = network.fit(X_train, y_train, verbose=True)
+
+# Check health including emotional state
+health = network.health_status()
+print(f"Cancer: {health.cancer_score:.1%}")
+print(f"Alzheimer: {health.alzheimer_score:.1%}")
+print(f"Emotional: {health.emotional_state}")
+print(f"Depression: {health.depression_ratio:.1%}")
+print(f"Excitement: {health.excitement_ratio:.1%}")
+
+# View training emotional history
+print(f"Total Rewards: {result.total_rewards}")
+print(f"Total Penalties: {result.total_penalties}")
+print(f"LR Resets: {result.lr_reset_count}")
+
+# Make predictions
+predictions = network.predict(X_test)
+
+# Save model
+network.save("./models/", "my_model")
 ```

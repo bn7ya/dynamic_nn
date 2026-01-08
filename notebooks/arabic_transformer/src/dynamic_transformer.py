@@ -13,7 +13,7 @@ Integrates patterns from the existing DynamicNetwork implementation.
 
 import numpy as np
 from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import time
 
 from .transformer_components import (
@@ -23,6 +23,105 @@ from .transformer_components import (
     MultiHeadAttention,
     FeedForward,
 )
+
+
+@dataclass
+class RewardPenaltyConfig:
+    """Configuration for the reward/penalty system."""
+    cost_improvement_threshold: float = 0.001
+    efficiency_improvement_threshold: float = 0.01
+    min_learning_rate: float = 1e-6
+    max_learning_rate: float = 1.0
+    baseline_learning_rate: float = 0.005
+    max_adjustment_factor: float = 2.0
+    min_adjustment_factor: float = 0.5
+    extreme_threshold: float = 0.8
+    window_size: int = 10
+
+
+@dataclass
+class TrainingPhaseConfig:
+    """Configuration for the training phases."""
+    # Phase 1: Exploration
+    exploration_epochs: int = 10
+    exploration_learning_rate: float = 0.01
+
+    # Phase 2: Estimation
+    estimation_epochs: int = 10
+    estimation_learning_rate: float = 0.005
+
+    # Phase 3: Main Training
+    main_learning_rate: float = 0.005
+    perturbation_cutoff_ratio: float = 0.2
+    perturbation_frequency: int = 3
+    architecture_adjustment_frequency: int = 5
+
+    # Epoch estimation
+    target_efficiency: float = 0.9
+    min_estimated_epochs: int = 10
+    max_estimated_epochs: int = 150
+
+
+@dataclass
+class EfficiencyConfig:
+    """Configuration for efficiency computation and thresholds."""
+    # Thresholds
+    default_saturation_threshold: float = 0.7
+    exploration_saturation_threshold: float = 0.3
+    default_efficiency_threshold: float = 0.5
+    exploration_efficiency_threshold: float = 0.3
+    removal_efficiency_multiplier: float = 0.5
+
+    # Sigmoid threshold params
+    sigmoid_k: float = 5.0
+    sigmoid_base: float = 0.3
+    sigmoid_range: float = 0.5
+    sigmoid_center: float = 0.5
+
+    # Initial values
+    initial_efficiency: float = 0.5
+
+
+@dataclass
+class HealthScoreConfig:
+    """Configuration for health score computation."""
+    layer_weight: int = 10
+    cancer_denominator: float = 10.0
+    alzheimer_denominator: float = 10.0
+    healthy_threshold: float = 0.3
+    at_risk_threshold: float = 0.7
+
+
+@dataclass
+class GradientConfig:
+    """Configuration for gradient handling."""
+    gradient_clip_value: float = 1.0
+
+
+@dataclass
+class PerturbationConfig:
+    """Configuration for random perturbation."""
+    perturbation_fraction: float = 0.005
+    perturbation_scale: float = 0.01
+
+
+@dataclass
+class EarlyStoppingConfig:
+    """Configuration for early stopping."""
+    window_size: int = 30
+    improvement_threshold: float = 1e-5
+
+
+@dataclass
+class ArchitectureConfig:
+    """Configuration for dynamic architecture adjustments."""
+    # FFN growth
+    ffn_growth_rate: float = 0.125  # 12.5% (1/8)
+    ffn_max_removal_rate: float = 0.1  # 10%
+
+    # Initial efficiency for new nodes/heads
+    initial_head_efficiency: float = 0.5
+    initial_node_efficiency: float = 0.5
 
 
 @dataclass
@@ -43,6 +142,16 @@ class DynamicTransformerConfig:
     dropout: float = 0.1
     num_classes: int = 100
     seed: int = 42
+
+    # Sub-configurations
+    training_phase: TrainingPhaseConfig = field(default_factory=TrainingPhaseConfig)
+    efficiency: EfficiencyConfig = field(default_factory=EfficiencyConfig)
+    health_score: HealthScoreConfig = field(default_factory=HealthScoreConfig)
+    gradient: GradientConfig = field(default_factory=GradientConfig)
+    perturbation: PerturbationConfig = field(default_factory=PerturbationConfig)
+    early_stopping: EarlyStoppingConfig = field(default_factory=EarlyStoppingConfig)
+    architecture: ArchitectureConfig = field(default_factory=ArchitectureConfig)
+    reward_penalty: RewardPenaltyConfig = field(default_factory=RewardPenaltyConfig)
 
 
 # =============================================================================
@@ -470,6 +579,25 @@ class DynamicTransformer:
         self.total_nodes_removed = 0
         self.perturbations_applied = 0
 
+        # Emotional state tracking (reward/penalty system)
+        self.total_rewards = 0
+        self.total_penalties = 0
+        self.reward_history: List[float] = []
+        self.penalty_history: List[float] = []
+        self.depression_history: List[float] = []
+        self.excitement_history: List[float] = []
+        self.lr_reset_count = 0
+        self.learning_rate_history: List[float] = []
+        self.emotional_state_actions: List[str] = []
+
+        # Reward/Penalty config
+        self.rp_cost_threshold = 0.001
+        self.rp_efficiency_threshold = 0.01
+        self.rp_min_lr = 1e-6
+        self.rp_max_lr = 1.0
+        self.rp_baseline_lr = 0.005
+        self.rp_extreme_threshold = 0.8
+
         self.trained = False
         self.training_history: Dict = {}
 
@@ -552,29 +680,200 @@ class DynamicTransformer:
 
     def _compute_efficiency(self, cost_history: List[float]) -> float:
         """Compute efficiency metric (matching DynamicNetwork)"""
+        eff_config = self.config.efficiency
         if len(cost_history) < 2:
-            return 0.5
+            return eff_config.initial_efficiency
         improvement = (cost_history[-2] - cost_history[-1]) / (cost_history[-2] + 1e-8)
-        return min(1.0, max(0.0, 0.5 + improvement * 10))
+        center = eff_config.sigmoid_center
+        multiplier = 10.0  # efficiency multiplier
+        return min(1.0, max(0.0, center + improvement * multiplier))
 
     def _sigmoid_threshold(self, efficiency: float) -> float:
         """Adaptive saturation threshold using sigmoid (matching DynamicNetwork)"""
-        k, base, range_val = 5.0, 0.3, 0.5
-        sigmoid = 1.0 / (1.0 + np.exp(-k * (efficiency - 0.5)))
+        eff_config = self.config.efficiency
+        k = eff_config.sigmoid_k
+        base = eff_config.sigmoid_base
+        range_val = eff_config.sigmoid_range
+        center = eff_config.sigmoid_center
+        sigmoid = 1.0 / (1.0 + np.exp(-k * (efficiency - center)))
         return base + range_val * sigmoid
+
+    # ============ REWARD/PENALTY SYSTEM METHODS ============
+
+    def _compute_improvement_metrics(
+        self,
+        cost_history: List[float],
+        efficiency_history: List[float],
+        window: int = 5
+    ) -> Dict[str, float]:
+        """Compute improvement metrics over a sliding window."""
+        if len(cost_history) < 2:
+            return {
+                "cost_improvement": 0.0,
+                "efficiency_improvement": 0.0,
+                "cost_trend": 0.0,
+                "efficiency_trend": 0.0
+            }
+
+        recent_costs = cost_history[-min(window, len(cost_history)):]
+        recent_efficiency = efficiency_history[-min(window, len(efficiency_history)):]
+
+        cost_improvement = (cost_history[-2] - cost_history[-1]) / (cost_history[-2] + 1e-8)
+        efficiency_improvement = efficiency_history[-1] - efficiency_history[-2] if len(efficiency_history) >= 2 else 0.0
+
+        if len(recent_costs) >= 2:
+            cost_trend = (recent_costs[-1] - recent_costs[0]) / (len(recent_costs) * (recent_costs[0] + 1e-8))
+        else:
+            cost_trend = 0.0
+
+        if len(recent_efficiency) >= 2:
+            efficiency_trend = (recent_efficiency[-1] - recent_efficiency[0]) / len(recent_efficiency)
+        else:
+            efficiency_trend = 0.0
+
+        return {
+            "cost_improvement": cost_improvement,
+            "efficiency_improvement": efficiency_improvement,
+            "cost_trend": cost_trend,
+            "efficiency_trend": efficiency_trend
+        }
+
+    def _should_reward(self, metrics: Dict[str, float]) -> Tuple[bool, float]:
+        """Determine if current epoch deserves a reward."""
+        cost_improving = metrics["cost_improvement"] > self.rp_cost_threshold
+        efficiency_good = metrics["efficiency_improvement"] >= 0 or metrics["efficiency_trend"] > 0
+        trend_positive = metrics["cost_trend"] < 0
+
+        should_reward = cost_improving and efficiency_good and trend_positive
+
+        if should_reward:
+            magnitude = abs(metrics["cost_improvement"]) + abs(metrics["efficiency_improvement"]) * 0.5
+            magnitude = min(magnitude, 1.0)
+        else:
+            magnitude = 0.0
+
+        return should_reward, magnitude
+
+    def _should_penalize(self, metrics: Dict[str, float]) -> Tuple[bool, float]:
+        """Determine if current epoch deserves a penalty."""
+        cost_degrading = metrics["cost_improvement"] < -self.rp_cost_threshold
+        efficiency_bad = metrics["efficiency_improvement"] < -self.rp_efficiency_threshold
+        trend_negative = metrics["cost_trend"] > 0
+
+        should_penalize = cost_degrading or (efficiency_bad and trend_negative)
+
+        if should_penalize:
+            magnitude = abs(metrics["cost_improvement"]) + abs(metrics["efficiency_improvement"]) * 0.5
+            magnitude = min(magnitude, 1.0)
+        else:
+            magnitude = 0.0
+
+        return should_penalize, magnitude
+
+    def _apply_reward(self, learning_rate: float, magnitude: float) -> float:
+        """Apply reward by decreasing learning rate."""
+        decrease_factor = 1.0 - magnitude * 0.5
+        new_lr = learning_rate * decrease_factor
+        new_lr = max(new_lr, self.rp_min_lr)
+
+        self.total_rewards += 1
+        self.reward_history.append(magnitude)
+
+        return new_lr
+
+    def _apply_penalty(self, learning_rate: float, magnitude: float) -> float:
+        """Apply penalty by increasing learning rate."""
+        increase_factor = 1.0 + magnitude * 1.0
+        new_lr = learning_rate * increase_factor
+        new_lr = min(new_lr, self.rp_max_lr)
+
+        self.total_penalties += 1
+        self.penalty_history.append(magnitude)
+
+        return new_lr
+
+    @property
+    def depression_ratio(self) -> float:
+        """Ratio of penalties to total adjustments."""
+        total = self.total_rewards + self.total_penalties
+        return self.total_penalties / total if total > 0 else 0.0
+
+    @property
+    def excitement_ratio(self) -> float:
+        """Ratio of rewards to total adjustments."""
+        total = self.total_rewards + self.total_penalties
+        return self.total_rewards / total if total > 0 else 0.0
+
+    def _check_extreme_states(self, learning_rate: float) -> Tuple[float, str]:
+        """Check for extreme emotional states and reset LR if detected."""
+        depression = self.depression_ratio
+        excitement = self.excitement_ratio
+
+        state = "neutral"
+
+        if depression > self.rp_extreme_threshold:
+            learning_rate = self.rp_baseline_lr
+            self.lr_reset_count += 1
+            state = "extreme_depression"
+        elif excitement > self.rp_extreme_threshold:
+            learning_rate = self.rp_baseline_lr
+            self.lr_reset_count += 1
+            state = "extreme_excitement"
+        elif depression > 0.5:
+            state = "depressed"
+        elif excitement > 0.5:
+            state = "excited"
+
+        self.depression_history.append(depression)
+        self.excitement_history.append(excitement)
+
+        return learning_rate, state
+
+    def _apply_reward_penalty_system(
+        self,
+        learning_rate: float,
+        cost_history: List[float],
+        efficiency_history: List[float]
+    ) -> Tuple[float, str]:
+        """Apply the complete reward/penalty system for one epoch."""
+        metrics = self._compute_improvement_metrics(cost_history, efficiency_history, window=10)
+
+        action = "neutral"
+
+        should_reward, reward_mag = self._should_reward(metrics)
+        if should_reward:
+            learning_rate = self._apply_reward(learning_rate, reward_mag)
+            action = "reward"
+        else:
+            should_penalize, penalty_mag = self._should_penalize(metrics)
+            if should_penalize:
+                learning_rate = self._apply_penalty(learning_rate, penalty_mag)
+                action = "penalty"
+
+        learning_rate, extreme_state = self._check_extreme_states(learning_rate)
+        if extreme_state.startswith("extreme"):
+            action = f"{extreme_state}_reset"
+
+        self.learning_rate_history.append(learning_rate)
+        self.emotional_state_actions.append(action)
+
+        return learning_rate, action
+
+    # ============ END REWARD/PENALTY SYSTEM METHODS ============
 
     def _compute_health_scores(self, epoch: int) -> Tuple[float, float]:
         """Compute cancer and alzheimer scores"""
         total_adds = self.layers_added + self.total_heads_added + self.total_nodes_added
         total_removes = self.layers_removed + self.total_heads_removed + self.total_nodes_removed
 
+        hs_config = self.config.health_score
         # Cancer: excessive growth
         growth_rate = total_adds / (epoch + 1)
-        cancer = min(1.0, growth_rate / 10.0)
+        cancer = min(1.0, growth_rate / hs_config.cancer_denominator)
 
         # Alzheimer: excessive removal
         removal_rate = total_removes / (epoch + 1)
-        alzheimer = min(1.0, removal_rate / 10.0)
+        alzheimer = min(1.0, removal_rate / hs_config.alzheimer_denominator)
 
         return cancer, alzheimer
 
@@ -645,16 +944,20 @@ class DynamicTransformer:
             if efficiencies[min_idx] < efficiency_threshold * 0.3:
                 self.remove_layer(min_idx)
 
-    def _apply_perturbation(self, fraction: float = 0.005) -> None:
+    def _apply_perturbation(self, fraction: float = None) -> None:
         """Apply random perturbation to avoid overfitting"""
+        if fraction is None:
+            fraction = self.config.perturbation.perturbation_fraction
+        scale = self.config.perturbation.perturbation_scale
+
         self.perturbations_applied += 1
         for layer in self.layers:
             # Perturb attention weights
             mask = np.random.random(layer.attention.W_q.shape) < fraction
-            layer.attention.W_q[mask] *= (1 + np.random.randn() * 0.01)
+            layer.attention.W_q[mask] *= (1 + np.random.randn() * scale)
 
             mask = np.random.random(layer.attention.W_k.shape) < fraction
-            layer.attention.W_k[mask] *= (1 + np.random.randn() * 0.01)
+            layer.attention.W_k[mask] *= (1 + np.random.randn() * scale)
 
     def _record_architecture(self) -> None:
         """Record current architecture for history"""
@@ -676,8 +979,10 @@ class DynamicTransformer:
         self.grad_classifier.fill(0)
         self.grad_classifier_bias.fill(0)
 
-    def _clip_gradients(self, max_norm: float = 1.0) -> float:
+    def _clip_gradients(self, max_norm: float = None) -> float:
         """Clip gradients by global norm"""
+        if max_norm is None:
+            max_norm = self.config.gradient.gradient_clip_value
         all_grads = []
         all_grads.extend(self.token_embedding.gradients())
         all_grads.extend(self.final_norm.gradients())
@@ -760,8 +1065,8 @@ class DynamicTransformer:
         """
         Train with 3-phase dynamic approach (matching DynamicNetwork).
 
-        Phase 1: Exploration (10 epochs) - Aggressive architecture changes
-        Phase 2: Estimation (10 epochs) - Estimate required epochs
+        Phase 1: Exploration - Aggressive architecture changes
+        Phase 2: Estimation - Estimate required epochs
         Phase 3: Main Training - Adaptive architecture adjustment
         """
         start_time = time.time()
@@ -771,21 +1076,29 @@ class DynamicTransformer:
         train_acc_history: List[float] = []
         val_acc_history: List[float] = []
 
+        # Get training phase config
+        tp_config = self.config.training_phase
+        eff_config = self.config.efficiency
+        exploration_epochs = tp_config.exploration_epochs
+
         # ============ PHASE 1: EXPLORATION ============
         if verbose:
             print("=" * 60)
-            print("PHASE 1: EXPLORATION (10 epochs)")
+            print(f"PHASE 1: EXPLORATION ({exploration_epochs} epochs)")
             print("=" * 60)
             print(f"Initial architecture: {len(self.layers)} layers, {self.layers[0].num_heads} heads")
 
-        learning_rate = 0.01  # High LR for exploration
-        for epoch in range(10):
+        learning_rate = tp_config.exploration_learning_rate
+        for epoch in range(exploration_epochs):
             loss, acc = self._train_epoch(X_train, y_train, learning_rate, batch_size)
             cost_history.append(loss)
             train_acc_history.append(acc)
 
             # Aggressive architecture exploration
-            self._aggressive_architecture_adjustment(saturation_threshold=0.3, efficiency_threshold=0.3)
+            self._aggressive_architecture_adjustment(
+                saturation_threshold=eff_config.exploration_saturation_threshold,
+                efficiency_threshold=eff_config.exploration_efficiency_threshold
+            )
 
             efficiency = self._compute_efficiency(cost_history)
             efficiency_history.append(efficiency)
@@ -799,13 +1112,14 @@ class DynamicTransformer:
                 print(f"  Epoch {epoch}: loss={loss:.4f}, acc={acc:.2%}, layers={len(self.layers)}")
 
         # ============ PHASE 2: ESTIMATION ============
+        estimation_epochs = tp_config.estimation_epochs
         if verbose:
             print("=" * 60)
-            print("PHASE 2: ESTIMATION (10 epochs)")
+            print(f"PHASE 2: ESTIMATION ({estimation_epochs} epochs)")
             print("=" * 60)
 
-        learning_rate = 0.005
-        for epoch in range(10):
+        learning_rate = tp_config.estimation_learning_rate
+        for epoch in range(estimation_epochs):
             loss, acc = self._train_epoch(X_train, y_train, learning_rate, batch_size)
             cost_history.append(loss)
             train_acc_history.append(acc)
@@ -813,35 +1127,42 @@ class DynamicTransformer:
             efficiency = self._compute_efficiency(cost_history)
             efficiency_history.append(efficiency)
 
-            cancer, alzheimer = self._compute_health_scores(10 + epoch + 1)
+            cancer, alzheimer = self._compute_health_scores(exploration_epochs + epoch + 1)
             self.cancer_score_history.append(cancer)
             self.alzheimer_score_history.append(alzheimer)
             self._record_architecture()
 
-        # Estimate epochs needed for 90% efficiency
-        if len(cost_history) > 10:
-            avg_improvement = (cost_history[10] - cost_history[-1]) / 10
-            efficiency_gap = 0.9 - efficiency_history[-1]
-            estimated_epochs = max(10, min(150, int(efficiency_gap / (avg_improvement * 0.1 + 1e-8))))
+        # Estimate epochs needed for target efficiency
+        if len(cost_history) > exploration_epochs:
+            avg_improvement = (cost_history[exploration_epochs] - cost_history[-1]) / estimation_epochs
+            efficiency_gap = tp_config.target_efficiency - efficiency_history[-1]
+            estimated_epochs = max(
+                tp_config.min_estimated_epochs,
+                min(tp_config.max_estimated_epochs, int(efficiency_gap / (avg_improvement * 0.1 + 1e-8)))
+            )
         else:
             estimated_epochs = 50
 
         if verbose:
-            print(f"  Estimated epochs for 90% efficiency: {estimated_epochs}")
+            print(f"  Estimated epochs for {tp_config.target_efficiency:.0%} efficiency: {estimated_epochs}")
 
         # ============ PHASE 3: MAIN TRAINING ============
         if verbose:
             print("=" * 60)
             print(f"PHASE 3: MAIN TRAINING ({estimated_epochs} epochs)")
+            print("  Using Reward/Penalty System for adaptive LR")
             print("=" * 60)
 
-        perturbation_cutoff = int(estimated_epochs * 0.2)
-        learning_rate = 0.005
+        perturbation_cutoff = int(estimated_epochs * tp_config.perturbation_cutoff_ratio)
+        learning_rate = tp_config.main_learning_rate
+        self.rp_baseline_lr = learning_rate  # Set baseline for resets
         best_val_acc = 0.0
+        arch_freq = tp_config.architecture_adjustment_frequency
+        perturb_freq = tp_config.perturbation_frequency
 
         for epoch in range(estimated_epochs):
-            # Apply perturbation in first 20%
-            if epoch < perturbation_cutoff and epoch % 3 == 0:
+            # Apply perturbation in first portion
+            if epoch < perturbation_cutoff and epoch % perturb_freq == 0:
                 self._apply_perturbation()
 
             # Adaptive saturation threshold
@@ -853,13 +1174,13 @@ class DynamicTransformer:
             train_acc_history.append(acc)
 
             # Architecture adjustment with adaptive threshold
-            if epoch % 5 == 0:
-                self._architecture_adjustment(saturation_threshold, efficiency_threshold=0.5)
+            if epoch % arch_freq == 0:
+                self._architecture_adjustment(saturation_threshold, efficiency_threshold=eff_config.default_efficiency_threshold)
 
             efficiency = self._compute_efficiency(cost_history)
             efficiency_history.append(efficiency)
 
-            cancer, alzheimer = self._compute_health_scores(20 + epoch + 1)
+            cancer, alzheimer = self._compute_health_scores(exploration_epochs + estimation_epochs + epoch + 1)
             self.cancer_score_history.append(cancer)
             self.alzheimer_score_history.append(alzheimer)
             self._record_architecture()
@@ -872,19 +1193,22 @@ class DynamicTransformer:
                 val_acc_history.append(val_acc)
                 best_val_acc = max(best_val_acc, val_acc)
 
-            # Learning rate decay
-            if epoch > 0 and epoch % 20 == 0:
-                learning_rate *= 0.8
+            # Apply reward/penalty system (replaces fixed LR decay)
+            learning_rate, action = self._apply_reward_penalty_system(
+                learning_rate, cost_history, efficiency_history
+            )
 
             if verbose and epoch % 10 == 0:
-                msg = f"  Epoch {epoch}: loss={loss:.4f}, acc={acc:.2%}, eff={efficiency:.2%}"
+                msg = f"  Epoch {epoch}: loss={loss:.4f}, acc={acc:.2%}, eff={efficiency:.2%}, lr={learning_rate:.4f}"
+                msg += f", R/P={self.total_rewards}/{self.total_penalties}"
                 if X_val is not None:
                     msg += f", val_acc={val_acc:.2%}"
                 print(msg)
 
             # Early stopping
-            if len(cost_history) > 30:
-                if cost_history[-30] - cost_history[-1] < 1e-5:
+            es_config = self.config.early_stopping
+            if len(cost_history) > es_config.window_size:
+                if cost_history[-es_config.window_size] - cost_history[-1] < es_config.improvement_threshold:
                     if verbose:
                         print(f"  Early stopping at epoch {epoch}")
                     break
@@ -915,6 +1239,16 @@ class DynamicTransformer:
             'nodes_added': self.total_nodes_added,
             'nodes_removed': self.total_nodes_removed,
             'perturbations_applied': self.perturbations_applied,
+            # Emotional state fields
+            'total_rewards': self.total_rewards,
+            'total_penalties': self.total_penalties,
+            'depression_history': self.depression_history,
+            'excitement_history': self.excitement_history,
+            'lr_reset_count': self.lr_reset_count,
+            'learning_rate_history': self.learning_rate_history,
+            'emotional_state_history': self.emotional_state_actions,
+            'final_depression_ratio': self.depression_ratio,
+            'final_excitement_ratio': self.excitement_ratio,
         }
 
         if verbose:
@@ -927,6 +1261,9 @@ class DynamicTransformer:
             print(f"Architecture changes: +{self.layers_added}/-{self.layers_removed} layers, "
                   f"+{self.total_heads_added}/-{self.total_heads_removed} heads, "
                   f"+{self.total_nodes_added}/-{self.total_nodes_removed} nodes")
+            print(f"Emotional state: {self.total_rewards} rewards, {self.total_penalties} penalties")
+            print(f"Depression ratio: {self.depression_ratio:.1%}, Excitement ratio: {self.excitement_ratio:.1%}")
+            print(f"LR resets: {self.lr_reset_count}")
             print("=" * 60)
 
         return self.training_history
@@ -968,16 +1305,33 @@ class DynamicTransformer:
         }
 
     def health_status(self) -> Dict:
-        """Get health status (matching DynamicNetwork API)"""
+        """Get health status including emotional state (matching DynamicNetwork API)"""
         cancer = self.cancer_score_history[-1] if self.cancer_score_history else 0.0
         alzheimer = self.alzheimer_score_history[-1] if self.alzheimer_score_history else 0.0
 
-        if max(cancer, alzheimer) < 0.3:
+        hs_config = self.config.health_score
+        if max(cancer, alzheimer) < hs_config.healthy_threshold:
             state = 'Healthy'
-        elif max(cancer, alzheimer) < 0.7:
+        elif max(cancer, alzheimer) < hs_config.at_risk_threshold:
             state = 'At Risk'
         else:
             state = 'Critical'
+
+        # Determine emotional state
+        depression = self.depression_ratio
+        excitement = self.excitement_ratio
+
+        rp_config = self.config.reward_penalty
+        if depression > rp_config.extreme_threshold:
+            emotional_state = "extreme_depression"
+        elif excitement > rp_config.extreme_threshold:
+            emotional_state = "extreme_excitement"
+        elif depression > 0.5:
+            emotional_state = "depressed"
+        elif excitement > 0.5:
+            emotional_state = "excited"
+        else:
+            emotional_state = "neutral"
 
         return {
             'state': state,
@@ -987,6 +1341,13 @@ class DynamicTransformer:
             'num_layers': len(self.layers),
             'total_heads': sum(l.num_heads for l in self.layers),
             'total_ffn_nodes': sum(l.ffn_dim for l in self.layers),
+            # Emotional state fields
+            'depression_ratio': depression,
+            'excitement_ratio': excitement,
+            'emotional_state': emotional_state,
+            'total_rewards': self.total_rewards,
+            'total_penalties': self.total_penalties,
+            'lr_reset_count': self.lr_reset_count,
         }
 
     def count_parameters(self) -> int:
