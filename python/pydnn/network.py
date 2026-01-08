@@ -194,15 +194,16 @@ class EmotionalState:
 @dataclass
 class RewardPenaltyConfig:
     """Configuration for the reward/penalty system."""
-    cost_improvement_threshold: float = 0.001
-    efficiency_improvement_threshold: float = 0.01
-    min_learning_rate: float = 1e-6
-    max_learning_rate: float = 1.0
+    cost_improvement_threshold: float = 0.005    # 0.5% threshold (was 0.001)
+    efficiency_improvement_threshold: float = 0.02  # 2% threshold (was 0.01)
+    min_learning_rate: float = 1e-5              # Increased (was 1e-6)
+    max_learning_rate: float = 0.5               # Reduced (was 1.0)
     baseline_learning_rate: float = 0.1
-    max_adjustment_factor: float = 2.0   # Max LR increase per penalty
-    min_adjustment_factor: float = 0.5   # Max LR decrease per reward
-    extreme_threshold: float = 0.8       # Depression/excitement threshold
-    window_size: int = 10                # Window for trend analysis
+    max_adjustment_factor: float = 1.5           # More conservative (was 2.0)
+    min_adjustment_factor: float = 0.7           # More conservative (was 0.5)
+    extreme_threshold: float = 0.7               # Earlier intervention (was 0.8)
+    moderate_threshold: float = 0.6              # NEW: Partial intervention threshold
+    window_size: int = 15                        # Larger window (was 10)
 
 
 @dataclass
@@ -210,10 +211,10 @@ class TrainingPhaseConfig:
     """Configuration for the 3-phase training approach."""
     # Phase 1: Exploration
     exploration_epochs: int = 10
-    exploration_learning_rate: float = 0.5
+    exploration_learning_rate: float = 0.2        # Reduced from 0.5
     exploration_batch_size: int = 64
-    exploration_saturation_threshold: float = 0.3
-    exploration_efficiency_threshold: float = 0.3
+    exploration_saturation_threshold: float = 0.6  # Increased from 0.3
+    exploration_efficiency_threshold: float = 0.2  # Lowered from 0.3 for less removal
 
     # Phase 2: Estimation
     estimation_epochs: int = 10
@@ -227,9 +228,9 @@ class TrainingPhaseConfig:
     perturbation_cutoff_ratio: float = 0.2  # First 20% of epochs
 
     # Epoch estimation
-    target_efficiency: float = 0.9
-    min_estimated_epochs: int = 10
-    max_estimated_epochs: int = 500
+    target_efficiency: float = 0.8               # Reduced from 0.9
+    min_estimated_epochs: int = 50               # Increased from 10
+    max_estimated_epochs: int = 300              # Reduced from 500
 
 
 @dataclass
@@ -237,19 +238,19 @@ class ArchitectureConfig:
     """Configuration for dynamic architecture constraints."""
     # Node limits
     min_nodes_per_layer: int = 16
-    max_nodes_per_layer: int = 2000
+    max_nodes_per_layer: int = 1024          # Reduced (was 2000)
     min_nodes_to_keep: int = 8
 
     # Layer limits
-    max_layers: int = 10
+    max_layers: int = 6                      # Reduced (was 10)
     min_layers: int = 1
 
-    # Growth rates
-    exploration_growth_rate: float = 0.25    # 25% (1/4)
-    main_growth_rate: float = 0.125          # 12.5% (1/8)
+    # Growth rates - significantly reduced for stability
+    exploration_growth_rate: float = 0.10    # 10% (was 25%)
+    main_growth_rate: float = 0.05           # 5% (was 12.5%)
 
     # Initial sizing
-    min_initial_hidden_size: int = 16
+    min_initial_hidden_size: int = 32        # Increased (was 16)
 
 
 @dataclass
@@ -416,7 +417,6 @@ class DynamicNetwork:
         self._trained = False
         self._training_result: Optional[TrainingResult] = None
         self._layers: List[Dict] = []
-        self._sigmoid_cache: Dict[float, float] = {}  # Cache for sigmoid threshold computation
         self._cpp_error_type: Optional[str] = None
         self._cpp_error_msg: Optional[str] = None
 
@@ -796,11 +796,25 @@ class DynamicNetwork:
 
             self._safe_callback(callback, exploration_epochs + epoch, epoch_cost, efficiency)
 
-        # Estimate epochs needed to reach target efficiency
-        avg_improvement = (estimation_costs[0] - estimation_costs[-1]) / estimation_epochs if estimation_costs else 0.001
-        current_efficiency = efficiency_history[-1] if efficiency_history else 0.5
-        efficiency_gap = self.training_phase.target_efficiency - current_efficiency
-        estimated_epochs = int(efficiency_gap / (avg_improvement * 0.1 + 1e-8))
+        # Estimate epochs needed based on cost reduction rate
+        if estimation_costs and len(estimation_costs) >= 2:
+            cost_reduction_rate = (estimation_costs[0] - estimation_costs[-1]) / estimation_epochs
+            current_cost = estimation_costs[-1]
+            initial_cost = estimation_costs[0]
+
+            if cost_reduction_rate > 1e-6 and current_cost > 0:
+                # Target: reduce cost by 99%
+                target_cost = initial_cost * 0.01
+                remaining_cost = max(0, current_cost - target_cost)
+                # Apply diminishing returns factor (0.5) - progress slows over time
+                effective_rate = cost_reduction_rate * 0.5
+                estimated_epochs = int(remaining_cost / (effective_rate + 1e-6))
+            else:
+                # No meaningful progress - use default
+                estimated_epochs = 100
+        else:
+            estimated_epochs = 100
+
         estimated_epochs = max(self.training_phase.min_estimated_epochs, min(self.training_phase.max_estimated_epochs, estimated_epochs))
 
         phase2_time = time.time() - phase2_start
@@ -969,11 +983,11 @@ class DynamicNetwork:
         W2 = np.random.randn(self.output_size, hidden_size).astype(np.float32) * np.sqrt(2.0 / hidden_size)
         b2 = np.zeros(self.output_size, dtype=np.float32)
 
-        # Store layers
+        # Store layers (output layer has no efficiency - nodes are fixed)
         initial_eff = self.efficiency.initial_efficiency
         self._layers = [
             {"W": W1, "b": b1, "efficiency": np.ones(hidden_size) * initial_eff},
-            {"W": W2, "b": b2, "efficiency": np.ones(self.output_size) * initial_eff}
+            {"W": W2, "b": b2, "efficiency": None}  # Output layer - no dynamic node management
         ]
 
     def _count_nodes(self) -> int:
@@ -1034,10 +1048,15 @@ class DynamicNetwork:
                 dW = dz.T @ activations[i]
                 db = np.sum(dz, axis=0)
 
-                # NaN/Inf detection - skip update if gradients are invalid
+                # Gradient clipping FIRST (before NaN check - clipping may fix large values)
+                clip_value = self.gradient.gradient_clip_value
+                dW = np.clip(dW, -clip_value, clip_value)
+                db = np.clip(db, -clip_value, clip_value)
+
+                # NaN/Inf detection AFTER clipping - skip update only if still invalid
                 if not np.isfinite(dW).all() or not np.isfinite(db).all():
                     warnings.warn(
-                        f"NaN/Inf detected in gradients at layer {i}, batch {batch_idx}. Skipping update.",
+                        f"NaN/Inf detected in gradients at layer {i}, batch {batch_idx} after clipping. Skipping update.",
                         RuntimeWarning
                     )
                     if i > 0:
@@ -1045,21 +1064,17 @@ class DynamicNetwork:
                         dz = da * (z_values[i - 1] > 0).astype(np.float32)
                     continue
 
-                # Gradient clipping
-                clip_value = self.gradient.gradient_clip_value
-                dW = np.clip(dW, -clip_value, clip_value)
-                db = np.clip(db, -clip_value, clip_value)
-
                 # Update weights
                 self._layers[i]["W"] -= learning_rate * dW
                 self._layers[i]["b"] -= learning_rate * db
 
-                # Update efficiency based on gradient magnitude
-                grad_magnitude = np.mean(np.abs(dW), axis=1)
-                eff_decay = self.efficiency.efficiency_decay
-                eff_scale = self.efficiency.efficiency_update_scale
-                eff_grad_mult = self.efficiency.efficiency_gradient_multiplier
-                self._layers[i]["efficiency"] = eff_decay * self._layers[i]["efficiency"] + eff_scale * np.clip(grad_magnitude * eff_grad_mult, 0, 1)
+                # Update efficiency based on gradient magnitude (skip output layer)
+                if self._layers[i]["efficiency"] is not None:
+                    grad_magnitude = np.mean(np.abs(dW), axis=1)
+                    eff_decay = self.efficiency.efficiency_decay
+                    eff_scale = self.efficiency.efficiency_update_scale
+                    eff_grad_mult = self.efficiency.efficiency_gradient_multiplier
+                    self._layers[i]["efficiency"] = eff_decay * self._layers[i]["efficiency"] + eff_scale * np.clip(grad_magnitude * eff_grad_mult, 0, 1)
 
                 if i > 0:
                     da = dz @ self._layers[i]["W"]
@@ -1077,11 +1092,28 @@ class DynamicNetwork:
         return avg_cost
 
     def _compute_efficiency(self, cost_history: List[float]) -> float:
-        """Compute efficiency metric based on cost reduction."""
+        """Compute efficiency metric based on cost reduction using windowed averaging."""
         if len(cost_history) < 2:
             return self.efficiency.initial_efficiency
-        improvement = (cost_history[-2] - cost_history[-1]) / (cost_history[-2] + 1e-8)
-        return min(1.0, max(0.0, self.sigmoid_threshold.center + improvement * self.efficiency.efficiency_gradient_multiplier))
+
+        # Use a window for more stable efficiency computation
+        window_size = min(5, len(cost_history))
+        recent_costs = cost_history[-window_size:]
+
+        # Calculate average improvement rate over window
+        if len(recent_costs) >= 2:
+            total_improvement = (recent_costs[0] - recent_costs[-1]) / (recent_costs[0] + 1e-8)
+            avg_improvement = total_improvement / (len(recent_costs) - 1)
+        else:
+            avg_improvement = 0.0
+
+        # Use sigmoid transformation for bounded, smooth efficiency
+        # This maps any real number to (0, 1) range naturally
+        k = self.sigmoid_threshold.k
+        scaled_improvement = avg_improvement * 100.0
+        efficiency = 1.0 / (1.0 + np.exp(-k * scaled_improvement / 5.0))
+
+        return efficiency
 
     def _compute_health_scores(self, nodes_added: int, nodes_removed: int,
                                layers_added: int, layers_removed: int, epoch: int) -> Tuple[float, float]:
@@ -1098,19 +1130,13 @@ class DynamicNetwork:
         return cancer, alzheimer
 
     def _sigmoid_threshold(self, efficiency: float) -> float:
-        """Compute adaptive saturation threshold using sigmoid function with caching."""
-        # Quantize efficiency to 2 decimal places for cache lookup
-        cache_key = round(efficiency, 2)
-
-        if cache_key not in self._sigmoid_cache:
-            k = self.sigmoid_threshold.k
-            base = self.sigmoid_threshold.base
-            range_val = self.sigmoid_threshold.range_val
-            center = self.sigmoid_threshold.center
-            sigmoid = 1.0 / (1.0 + np.exp(-k * (cache_key - center)))
-            self._sigmoid_cache[cache_key] = base + range_val * sigmoid
-
-        return self._sigmoid_cache[cache_key]
+        """Compute adaptive saturation threshold using sigmoid function."""
+        k = self.sigmoid_threshold.k
+        base = self.sigmoid_threshold.base
+        range_val = self.sigmoid_threshold.range_val
+        center = self.sigmoid_threshold.center
+        sigmoid = 1.0 / (1.0 + np.exp(-k * (efficiency - center)))
+        return base + range_val * sigmoid
 
     # ============ REWARD/PENALTY SYSTEM METHODS ============
 
@@ -1309,7 +1335,7 @@ class DynamicNetwork:
         emotional_state: EmotionalState
     ) -> Tuple[float, str]:
         """
-        Check for extreme emotional states and reset LR if detected.
+        Check for extreme emotional states and adjust LR if needed.
 
         Returns:
             Tuple of (adjusted_lr, state_description)
@@ -1319,21 +1345,24 @@ class DynamicNetwork:
 
         state = "neutral"
 
-        # Check for extreme depression (too many penalties)
+        # Check for extreme states - full reset to baseline
         if depression > config.extreme_threshold:
             learning_rate = config.baseline_learning_rate
             emotional_state.lr_reset_count += 1
             state = "extreme_depression"
-
-        # Check for extreme excitement (too many rewards)
         elif excitement > config.extreme_threshold:
             learning_rate = config.baseline_learning_rate
             emotional_state.lr_reset_count += 1
             state = "extreme_excitement"
 
-        elif depression > 0.5:
+        # Check for moderate states - partial correction toward baseline
+        elif depression > config.moderate_threshold:
+            # Move 50% toward baseline
+            learning_rate = learning_rate + 0.5 * (config.baseline_learning_rate - learning_rate)
             state = "depressed"
-        elif excitement > 0.5:
+        elif excitement > config.moderate_threshold:
+            # Move 50% toward baseline
+            learning_rate = learning_rate + 0.5 * (config.baseline_learning_rate - learning_rate)
             state = "excited"
 
         # Record history
@@ -1503,21 +1532,33 @@ class DynamicNetwork:
         # Update next layer's input size
         if layer_idx < len(self._layers) - 1:
             next_layer = self._layers[layer_idx + 1]
-            new_cols = np.random.randn(next_layer["W"].shape[0], num_nodes).astype(np.float32) * np.sqrt(2.0 / (output_size + num_nodes))
+            # Use He initialization with correct fan-in (total nodes in current layer after addition)
+            fan_in = layer["W"].shape[0]  # New total nodes in current layer
+            std = np.sqrt(2.0 / fan_in)
+            new_cols = np.random.randn(next_layer["W"].shape[0], num_nodes).astype(np.float32) * std
             next_layer["W"] = np.hstack([next_layer["W"], new_cols])
 
     def _remove_nodes_from_layer(self, layer_idx: int, num_nodes: int) -> None:
         """Remove least efficient nodes from a layer."""
         layer = self._layers[layer_idx]
         n = layer["W"].shape[0]
+        efficiency = layer["efficiency"]
+
+        # Bounds check: ensure we don't remove too many nodes
+        min_nodes = 4
+        if num_nodes >= len(efficiency) - min_nodes:
+            num_nodes = len(efficiency) - min_nodes
+            if num_nodes <= 0:
+                return  # Can't remove any nodes
+
         num_to_keep = n - num_nodes
 
-        if num_to_keep < 4:
+        if num_to_keep < min_nodes:
             return  # Keep minimum nodes
 
         # Use argpartition for O(n) partial sort instead of O(n log n) argsort
         # argpartition places the smallest num_nodes elements at the front (unsorted)
-        partition_indices = np.argpartition(layer["efficiency"], num_nodes)
+        partition_indices = np.argpartition(efficiency, num_nodes)
         indices_to_keep = partition_indices[num_nodes:]  # Keep the larger efficiency nodes
 
         # Remove from current layer
@@ -1566,7 +1607,7 @@ class DynamicNetwork:
                 {
                     'W': layer['W'].copy(),
                     'b': layer['b'].copy(),
-                    'efficiency': layer['efficiency'].copy()
+                    'efficiency': layer['efficiency'].copy() if layer['efficiency'] is not None else None
                 }
                 for layer in self._layers
             ]
@@ -1578,7 +1619,7 @@ class DynamicNetwork:
             {
                 'W': layer['W'].copy(),
                 'b': layer['b'].copy(),
-                'efficiency': layer['efficiency'].copy()
+                'efficiency': layer['efficiency'].copy() if layer['efficiency'] is not None else None
             }
             for layer in saved['layers']
         ]
