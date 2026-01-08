@@ -364,7 +364,7 @@ class DynamicNetwork:
                  input_shape: Tuple[int, ...],
                  output_size: int,
                  seed: int,
-                 cost_function: str = "MSE",
+                 cost_function: str = "CrossEntropy",
                  # Optional configuration objects
                  training_phase: Optional[TrainingPhaseConfig] = None,
                  architecture: Optional[ArchitectureConfig] = None,
@@ -717,6 +717,9 @@ class DynamicNetwork:
 
         exploration_costs = []
         learning_rate = self.training_phase.exploration_learning_rate
+        # Use lower learning rate for regression tasks (MSE is more sensitive)
+        if self.cost_function == "MSE":
+            learning_rate = min(learning_rate, 0.01)
         batch_size = self.training_phase.exploration_batch_size
 
         phase1_iter = range(exploration_epochs)
@@ -777,6 +780,9 @@ class DynamicNetwork:
 
         estimation_costs = []
         learning_rate = self.training_phase.estimation_learning_rate
+        # Use lower learning rate for regression tasks
+        if self.cost_function == "MSE":
+            learning_rate = min(learning_rate, 0.01)
 
         phase2_iter = range(estimation_epochs)
         if verbose and TQDM_AVAILABLE:
@@ -830,6 +836,9 @@ class DynamicNetwork:
 
         perturbation_cutoff = int(estimated_epochs * self.training_phase.perturbation_cutoff_ratio)
         learning_rate = self.training_phase.main_learning_rate
+        # Use lower learning rate for regression tasks
+        if self.cost_function == "MSE":
+            learning_rate = min(learning_rate, 0.01)
         batch_size = self.training_phase.main_initial_batch_size
 
         phase3_iter = range(estimated_epochs)
@@ -880,6 +889,9 @@ class DynamicNetwork:
             learning_rate, action = self._apply_reward_penalty_system(
                 learning_rate, cost_history, efficiency_history, rp_config, emotional_state
             )
+            # Cap learning rate for MSE (regression is more sensitive)
+            if self.cost_function == "MSE":
+                learning_rate = min(learning_rate, 0.01)
             learning_rate_history.append(learning_rate)
             emotional_state_actions.append(action)
 
@@ -1030,19 +1042,34 @@ class DynamicNetwork:
                     # ReLU for hidden layers
                     a = np.maximum(0, z)
                 else:
-                    # Softmax for output layer
-                    z_max = np.max(z, axis=1, keepdims=True)
-                    exp_z = np.exp(z - z_max)
-                    a = exp_z / (np.sum(exp_z, axis=1, keepdims=True) + 1e-8)
+                    # Output layer activation depends on cost function
+                    if self.cost_function == "MSE":
+                        # Linear activation for regression
+                        a = z
+                    else:
+                        # Softmax for classification (CrossEntropy)
+                        z_max = np.max(z, axis=1, keepdims=True)
+                        exp_z = np.exp(z - z_max)
+                        a = exp_z / (np.sum(exp_z, axis=1, keepdims=True) + 1e-8)
                 activations.append(a)
 
-            # Compute cost
-            log_probs = np.log(activations[-1] + 1e-8)
-            batch_cost = -np.mean(np.sum(batch_y * log_probs, axis=1))
+            # Compute cost based on cost function
+            if self.cost_function == "MSE":
+                # Mean Squared Error for regression
+                batch_cost = np.mean((activations[-1] - batch_y) ** 2)
+            else:
+                # Cross-Entropy for classification
+                log_probs = np.log(activations[-1] + 1e-8)
+                batch_cost = -np.mean(np.sum(batch_y * log_probs, axis=1))
             epoch_cost += batch_cost
 
-            # Backward pass
-            dz = (activations[-1] - batch_y) / m
+            # Backward pass - gradient depends on cost function
+            if self.cost_function == "MSE":
+                # MSE gradient: (output - target) / m (factor of 2 absorbed into learning rate)
+                dz = (activations[-1] - batch_y) / m
+            else:
+                # Cross-Entropy + Softmax gradient: (output - target) / m
+                dz = (activations[-1] - batch_y) / m
 
             for i in range(len(self._layers) - 1, -1, -1):
                 dW = dz.T @ activations[i]
@@ -1653,9 +1680,14 @@ class DynamicNetwork:
                     # ReLU for hidden layers
                     a = np.maximum(0, z)
                 else:
-                    # Softmax for output layer
-                    exp_z = np.exp(z - np.max(z, axis=1, keepdims=True))
-                    a = exp_z / (np.sum(exp_z, axis=1, keepdims=True) + 1e-8)
+                    # Output layer activation depends on cost function
+                    if self.cost_function == "MSE":
+                        # Linear activation for regression
+                        a = z
+                    else:
+                        # Softmax for classification
+                        exp_z = np.exp(z - np.max(z, axis=1, keepdims=True))
+                        a = exp_z / (np.sum(exp_z, axis=1, keepdims=True) + 1e-8)
             return a
 
     def health_status(self) -> HealthReport:
