@@ -37,6 +37,14 @@ class TrainingResult:
     architecture_history: List[Tuple[int, int]] = field(default_factory=list)
     perturbations_applied: int = 0
     phase_metrics: Dict[str, Any] = field(default_factory=dict)
+    # Emotional state fields
+    total_rewards: int = 0
+    total_penalties: int = 0
+    depression_history: List[float] = field(default_factory=list)
+    excitement_history: List[float] = field(default_factory=list)
+    lr_reset_count: int = 0
+    learning_rate_history: List[float] = field(default_factory=list)
+    emotional_state_history: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -50,6 +58,53 @@ class HealthReport:
     recommendations: List[str]
     current_layers: int
     current_nodes: int
+    depression_ratio: float = 0.0
+    excitement_ratio: float = 0.0
+    emotional_state: str = "neutral"
+
+
+@dataclass
+class EmotionalState:
+    """Tracks the network's emotional state during training."""
+    total_rewards: int = 0
+    total_penalties: int = 0
+    reward_history: List[float] = field(default_factory=list)
+    penalty_history: List[float] = field(default_factory=list)
+    depression_history: List[float] = field(default_factory=list)
+    excitement_history: List[float] = field(default_factory=list)
+    lr_reset_count: int = 0
+
+    @property
+    def total_adjustments(self) -> int:
+        return self.total_rewards + self.total_penalties
+
+    @property
+    def depression_ratio(self) -> float:
+        """Ratio of penalties to total adjustments."""
+        if self.total_adjustments == 0:
+            return 0.0
+        return self.total_penalties / self.total_adjustments
+
+    @property
+    def excitement_ratio(self) -> float:
+        """Ratio of rewards to total adjustments."""
+        if self.total_adjustments == 0:
+            return 0.0
+        return self.total_rewards / self.total_adjustments
+
+
+@dataclass
+class RewardPenaltyConfig:
+    """Configuration for the reward/penalty system."""
+    cost_improvement_threshold: float = 0.001
+    efficiency_improvement_threshold: float = 0.01
+    min_learning_rate: float = 1e-6
+    max_learning_rate: float = 1.0
+    baseline_learning_rate: float = 0.1
+    max_adjustment_factor: float = 2.0   # Max LR increase per penalty
+    min_adjustment_factor: float = 0.5   # Max LR decrease per reward
+    extreme_threshold: float = 0.8       # Depression/excitement threshold
+    window_size: int = 10                # Window for trend analysis
 
 
 class DynamicNetwork:
@@ -263,6 +318,12 @@ class DynamicNetwork:
         best_cost = float('inf')
         best_architecture = None
 
+        # Emotional state tracking (for Phase 3 reward/penalty system)
+        emotional_state = EmotionalState()
+        rp_config = RewardPenaltyConfig()
+        learning_rate_history = []
+        emotional_state_actions = []
+
         # Shuffle data
         indices = np.random.permutation(len(X))
         X = X[indices]
@@ -423,9 +484,12 @@ class DynamicNetwork:
             alzheimer_score_history.append(alzheimer)
             architecture_history.append((len(self._layers), self._count_nodes()))
 
-            # Adaptive learning rate decay
-            if epoch > 0 and epoch % 20 == 0:
-                learning_rate *= 0.8
+            # Apply reward/penalty system (replaces fixed LR decay)
+            learning_rate, action = self._apply_reward_penalty_system(
+                learning_rate, cost_history, efficiency_history, rp_config, emotional_state
+            )
+            learning_rate_history.append(learning_rate)
+            emotional_state_actions.append(action)
 
             # Adaptive batch size growth
             if epoch > 0 and epoch % 25 == 0:
@@ -436,13 +500,13 @@ class DynamicNetwork:
                 phase3_iter.set_postfix({
                     'cost': f'{epoch_cost:.4f}',
                     'eff': f'{efficiency:.2%}',
-                    'cancer': f'{cancer:.2%}',
-                    'alzh': f'{alzheimer:.2%}',
-                    'nodes': f'+{nodes_added}/-{nodes_removed}',
-                    'sat_th': f'{saturation_threshold:.2f}'
+                    'lr': f'{learning_rate:.4f}',
+                    'dep': f'{emotional_state.depression_ratio:.0%}',
+                    'exc': f'{emotional_state.excitement_ratio:.0%}',
+                    'R/P': f'{emotional_state.total_rewards}/{emotional_state.total_penalties}'
                 })
             elif verbose and epoch % 10 == 0:
-                print(f"  Epoch {epoch}: cost={epoch_cost:.4f}, eff={efficiency:.2%}, sat_th={saturation_threshold:.2f}")
+                print(f"  Epoch {epoch}: cost={epoch_cost:.4f}, eff={efficiency:.2%}, lr={learning_rate:.4f}, R/P={emotional_state.total_rewards}/{emotional_state.total_penalties}")
 
             if callback:
                 callback(total_epoch, epoch_cost, efficiency)
@@ -473,6 +537,9 @@ class DynamicNetwork:
             print(f"  Layers: +{layers_added} added, -{layers_removed} removed")
             print(f"  Perturbations: {perturbations_applied}")
             print(f"  Health: Cancer={cancer_score_history[-1]:.1%}, Alzheimer={alzheimer_score_history[-1]:.1%}")
+            print(f"  Emotional: {emotional_state.total_rewards} rewards, {emotional_state.total_penalties} penalties")
+            print(f"  Depression ratio: {emotional_state.depression_ratio:.1%}, Excitement ratio: {emotional_state.excitement_ratio:.1%}")
+            print(f"  LR resets: {emotional_state.lr_reset_count}")
             print("=" * 60)
 
         return TrainingResult(
@@ -499,8 +566,18 @@ class DynamicNetwork:
                 'phase2_time': phase2_time,
                 'phase3_time': phase3_time,
                 'estimated_epochs': estimated_epochs,
-                'exploration_best_cost': min(exploration_costs) if exploration_costs else 0.0
-            }
+                'exploration_best_cost': min(exploration_costs) if exploration_costs else 0.0,
+                'final_depression_ratio': emotional_state.depression_ratio,
+                'final_excitement_ratio': emotional_state.excitement_ratio
+            },
+            # Emotional state fields
+            total_rewards=emotional_state.total_rewards,
+            total_penalties=emotional_state.total_penalties,
+            depression_history=emotional_state.depression_history,
+            excitement_history=emotional_state.excitement_history,
+            lr_reset_count=emotional_state.lr_reset_count,
+            learning_rate_history=learning_rate_history,
+            emotional_state_history=emotional_state_actions
         )
 
     def _init_architecture(self, input_size: int) -> None:
@@ -614,6 +691,261 @@ class DynamicNetwork:
         """Compute adaptive saturation threshold using sigmoid function."""
         sigmoid = 1.0 / (1.0 + np.exp(-k * (efficiency - 0.5)))
         return base + range_val * sigmoid
+
+    # ============ REWARD/PENALTY SYSTEM METHODS ============
+
+    def _compute_improvement_metrics(
+        self,
+        cost_history: List[float],
+        efficiency_history: List[float],
+        window: int = 5
+    ) -> Dict[str, float]:
+        """
+        Compute improvement metrics over a sliding window.
+
+        Returns:
+            Dict with keys:
+            - cost_improvement: (old - new) / old (positive = improvement)
+            - efficiency_improvement: new - old (positive = improvement)
+            - cost_trend: average rate of change (negative = decreasing = good)
+            - efficiency_trend: average rate of change (positive = increasing = good)
+        """
+        if len(cost_history) < 2:
+            return {
+                "cost_improvement": 0.0,
+                "efficiency_improvement": 0.0,
+                "cost_trend": 0.0,
+                "efficiency_trend": 0.0
+            }
+
+        # Use most recent window for trend analysis
+        recent_costs = cost_history[-min(window, len(cost_history)):]
+        recent_efficiency = efficiency_history[-min(window, len(efficiency_history)):]
+
+        # Cost improvement (epoch-over-epoch)
+        cost_improvement = (cost_history[-2] - cost_history[-1]) / (cost_history[-2] + 1e-8)
+
+        # Efficiency improvement (epoch-over-epoch)
+        efficiency_improvement = efficiency_history[-1] - efficiency_history[-2] if len(efficiency_history) >= 2 else 0.0
+
+        # Trend analysis over window
+        if len(recent_costs) >= 2:
+            cost_trend = (recent_costs[-1] - recent_costs[0]) / (len(recent_costs) * (recent_costs[0] + 1e-8))
+        else:
+            cost_trend = 0.0
+
+        if len(recent_efficiency) >= 2:
+            efficiency_trend = (recent_efficiency[-1] - recent_efficiency[0]) / len(recent_efficiency)
+        else:
+            efficiency_trend = 0.0
+
+        return {
+            "cost_improvement": cost_improvement,
+            "efficiency_improvement": efficiency_improvement,
+            "cost_trend": cost_trend,
+            "efficiency_trend": efficiency_trend
+        }
+
+    def _should_reward(
+        self,
+        metrics: Dict[str, float],
+        config: RewardPenaltyConfig
+    ) -> Tuple[bool, float]:
+        """
+        Determine if current epoch deserves a reward.
+
+        Returns:
+            Tuple of (should_reward: bool, reward_magnitude: float)
+        """
+        # Reward conditions:
+        # 1. Cost is decreasing
+        # 2. Efficiency is good/improving
+        # 3. Trend is positive overall
+        cost_improving = metrics["cost_improvement"] > config.cost_improvement_threshold
+        efficiency_good = metrics["efficiency_improvement"] >= 0 or metrics["efficiency_trend"] > 0
+        trend_positive = metrics["cost_trend"] < 0  # Negative trend means cost decreasing
+
+        should_reward = cost_improving and efficiency_good and trend_positive
+
+        if should_reward:
+            # Magnitude proportional to improvement
+            magnitude = abs(metrics["cost_improvement"]) + abs(metrics["efficiency_improvement"]) * 0.5
+            magnitude = min(magnitude, 1.0)  # Cap at 1.0
+        else:
+            magnitude = 0.0
+
+        return should_reward, magnitude
+
+    def _should_penalize(
+        self,
+        metrics: Dict[str, float],
+        config: RewardPenaltyConfig
+    ) -> Tuple[bool, float]:
+        """
+        Determine if current epoch deserves a penalty.
+
+        Returns:
+            Tuple of (should_penalize: bool, penalty_magnitude: float)
+        """
+        # Penalty conditions:
+        # 1. Cost is increasing
+        # 2. Efficiency is declining
+        # 3. Trend is negative overall
+        cost_degrading = metrics["cost_improvement"] < -config.cost_improvement_threshold
+        efficiency_bad = metrics["efficiency_improvement"] < -config.efficiency_improvement_threshold
+        trend_negative = metrics["cost_trend"] > 0  # Positive trend means cost increasing
+
+        should_penalize = cost_degrading or (efficiency_bad and trend_negative)
+
+        if should_penalize:
+            # Magnitude proportional to degradation
+            magnitude = abs(metrics["cost_improvement"]) + abs(metrics["efficiency_improvement"]) * 0.5
+            magnitude = min(magnitude, 1.0)  # Cap at 1.0
+        else:
+            magnitude = 0.0
+
+        return should_penalize, magnitude
+
+    def _apply_reward(
+        self,
+        learning_rate: float,
+        magnitude: float,
+        config: RewardPenaltyConfig,
+        emotional_state: EmotionalState
+    ) -> float:
+        """
+        Apply reward by decreasing learning rate proportionally.
+
+        The intuition: good progress means we're on the right track,
+        so we can take smaller steps to fine-tune.
+
+        Returns:
+            Adjusted learning rate
+        """
+        # Decrease factor proportional to magnitude
+        # magnitude of 1.0 -> multiply by min_adjustment_factor (0.5)
+        # magnitude of 0.0 -> no change
+        decrease_factor = 1.0 - magnitude * (1.0 - config.min_adjustment_factor)
+
+        new_lr = learning_rate * decrease_factor
+        new_lr = max(new_lr, config.min_learning_rate)
+
+        # Update emotional state
+        emotional_state.total_rewards += 1
+        emotional_state.reward_history.append(magnitude)
+
+        return new_lr
+
+    def _apply_penalty(
+        self,
+        learning_rate: float,
+        magnitude: float,
+        config: RewardPenaltyConfig,
+        emotional_state: EmotionalState
+    ) -> float:
+        """
+        Apply penalty by increasing learning rate proportionally.
+
+        The intuition: poor progress means we might be stuck,
+        so we need larger steps to escape.
+
+        Returns:
+            Adjusted learning rate
+        """
+        # Increase factor proportional to magnitude
+        # magnitude of 1.0 -> multiply by max_adjustment_factor (2.0)
+        # magnitude of 0.0 -> no change
+        increase_factor = 1.0 + magnitude * (config.max_adjustment_factor - 1.0)
+
+        new_lr = learning_rate * increase_factor
+        new_lr = min(new_lr, config.max_learning_rate)
+
+        # Update emotional state
+        emotional_state.total_penalties += 1
+        emotional_state.penalty_history.append(magnitude)
+
+        return new_lr
+
+    def _check_extreme_states(
+        self,
+        learning_rate: float,
+        config: RewardPenaltyConfig,
+        emotional_state: EmotionalState
+    ) -> Tuple[float, str]:
+        """
+        Check for extreme emotional states and reset LR if detected.
+
+        Returns:
+            Tuple of (adjusted_lr, state_description)
+        """
+        depression = emotional_state.depression_ratio
+        excitement = emotional_state.excitement_ratio
+
+        state = "neutral"
+
+        # Check for extreme depression (too many penalties)
+        if depression > config.extreme_threshold:
+            learning_rate = config.baseline_learning_rate
+            emotional_state.lr_reset_count += 1
+            state = "extreme_depression"
+
+        # Check for extreme excitement (too many rewards)
+        elif excitement > config.extreme_threshold:
+            learning_rate = config.baseline_learning_rate
+            emotional_state.lr_reset_count += 1
+            state = "extreme_excitement"
+
+        elif depression > 0.5:
+            state = "depressed"
+        elif excitement > 0.5:
+            state = "excited"
+
+        # Record history
+        emotional_state.depression_history.append(depression)
+        emotional_state.excitement_history.append(excitement)
+
+        return learning_rate, state
+
+    def _apply_reward_penalty_system(
+        self,
+        learning_rate: float,
+        cost_history: List[float],
+        efficiency_history: List[float],
+        config: RewardPenaltyConfig,
+        emotional_state: EmotionalState
+    ) -> Tuple[float, str]:
+        """
+        Apply the complete reward/penalty system for one epoch.
+
+        Returns:
+            Tuple of (new_learning_rate, action_taken)
+            action_taken: "reward", "penalty", "neutral", "extreme_depression_reset", "extreme_excitement_reset"
+        """
+        # Compute metrics
+        metrics = self._compute_improvement_metrics(cost_history, efficiency_history, config.window_size)
+
+        action = "neutral"
+
+        # Check for reward
+        should_reward, reward_mag = self._should_reward(metrics, config)
+        if should_reward:
+            learning_rate = self._apply_reward(learning_rate, reward_mag, config, emotional_state)
+            action = "reward"
+        else:
+            # Check for penalty
+            should_penalize, penalty_mag = self._should_penalize(metrics, config)
+            if should_penalize:
+                learning_rate = self._apply_penalty(learning_rate, penalty_mag, config, emotional_state)
+                action = "penalty"
+
+        # Check for extreme states (may override previous adjustment)
+        learning_rate, extreme_state = self._check_extreme_states(learning_rate, config, emotional_state)
+        if extreme_state.startswith("extreme"):
+            action = f"{extreme_state}_reset"
+
+        return learning_rate, action
+
+    # ============ END REWARD/PENALTY SYSTEM METHODS ============
 
     def _apply_random_perturbation(self, fraction: float = 0.005) -> None:
         """Apply random perturbation to fraction of nodes to avoid overfitting."""
@@ -816,7 +1148,27 @@ class DynamicNetwork:
             return a
 
     def health_status(self) -> HealthReport:
-        """Get health status (cancer/alzheimer detection)."""
+        """Get health status including emotional state (cancer/alzheimer/depression/excitement)."""
+        # Compute emotional metrics from last training
+        depression = 0.0
+        excitement = 0.0
+        emotional_state = "neutral"
+
+        if self._training_result:
+            total = self._training_result.total_rewards + self._training_result.total_penalties
+            if total > 0:
+                depression = self._training_result.total_penalties / total
+                excitement = self._training_result.total_rewards / total
+
+            if depression > 0.8:
+                emotional_state = "extreme_depression"
+            elif excitement > 0.8:
+                emotional_state = "extreme_excitement"
+            elif depression > 0.5:
+                emotional_state = "depressed"
+            elif excitement > 0.5:
+                emotional_state = "excited"
+
         if self._use_cpp:
             from . import _dnn_core
             report = self._network.health_report()
@@ -828,7 +1180,10 @@ class DynamicNetwork:
                 diagnosis=report.diagnosis,
                 recommendations=list(report.recommendations),
                 current_layers=report.current_layers,
-                current_nodes=report.current_nodes
+                current_nodes=report.current_nodes,
+                depression_ratio=depression,
+                excitement_ratio=excitement,
+                emotional_state=emotional_state
             )
         else:
             return HealthReport(
@@ -839,7 +1194,10 @@ class DynamicNetwork:
                 diagnosis="Network is healthy",
                 recommendations=[],
                 current_layers=len(self._layers),
-                current_nodes=sum(l["W"].shape[0] for l in self._layers)
+                current_nodes=sum(l["W"].shape[0] for l in self._layers),
+                depression_ratio=depression,
+                excitement_ratio=excitement,
+                emotional_state=emotional_state
             )
 
     def efficiency_report(self, include_nodes: bool = False) -> Dict[str, Any]:

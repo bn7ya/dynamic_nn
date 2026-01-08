@@ -34,6 +34,10 @@ class TrainingVisualization:
     health_history: Optional[List[Dict[str, float]]] = None
     batch_size_history: Optional[List[int]] = None
     learning_rate_history: Optional[List[float]] = None
+    # Emotional state data
+    depression_history: Optional[List[float]] = None
+    excitement_history: Optional[List[float]] = None
+    emotional_actions: Optional[List[str]] = None
 
 
 class TrainingPlotter:
@@ -87,6 +91,8 @@ class TrainingPlotter:
         if data.layer_history:
             n_plots += 1
         if data.health_history:
+            n_plots += 1
+        if data.depression_history and data.excitement_history:
             n_plots += 1
 
         fig, axes = plt.subplots(n_plots, 1, figsize=(12, 4 * n_plots))
@@ -161,6 +167,24 @@ class TrainingPlotter:
             ax.set_ylim(0, 1)
             ax.legend()
             ax.grid(True, alpha=0.3)
+            plot_idx += 1
+
+        # Emotional state history (depression/excitement)
+        if data.depression_history and data.excitement_history:
+            ax = axes[plot_idx]
+            emotional_epochs = range(len(data.depression_history))
+
+            ax.plot(emotional_epochs, data.depression_history, 'b-', linewidth=2, label='Depression Ratio')
+            ax.plot(emotional_epochs, data.excitement_history, 'g-', linewidth=2, label='Excitement Ratio')
+            ax.axhline(y=0.8, color='red', linestyle='--', alpha=0.7, label='Extreme Threshold')
+            ax.fill_between(emotional_epochs, data.depression_history, alpha=0.2, color='b')
+            ax.fill_between(emotional_epochs, data.excitement_history, alpha=0.2, color='g')
+            ax.set_xlabel('Epoch')
+            ax.set_ylabel('Ratio')
+            ax.set_title('Emotional State Over Time (Depression/Excitement)')
+            ax.set_ylim(0, 1)
+            ax.legend()
+            ax.grid(True, alpha=0.3)
 
         plt.suptitle(title, fontsize=14, fontweight='bold')
         plt.tight_layout()
@@ -182,6 +206,8 @@ class TrainingPlotter:
             n_rows += 1
         if data.health_history:
             n_rows += 1
+        if data.depression_history and data.excitement_history:
+            n_rows += 1
 
         specs = [[{"secondary_y": True}] for _ in range(n_rows)]
         subplot_titles = ['Cost Over Time', 'Efficiency Over Time']
@@ -189,6 +215,8 @@ class TrainingPlotter:
             subplot_titles.append('Network Architecture Evolution')
         if data.health_history:
             subplot_titles.append('Network Health Over Time')
+        if data.depression_history and data.excitement_history:
+            subplot_titles.append('Emotional State Over Time')
 
         fig = make_subplots(rows=n_rows, cols=1,
                            specs=specs,
@@ -258,6 +286,26 @@ class TrainingPlotter:
             )
             fig.add_hline(y=0.7, line_dash="dash", line_color="orange",
                          annotation_text="Risk Threshold", row=row, col=1)
+            row += 1
+
+        # Emotional state history (depression/excitement)
+        if data.depression_history and data.excitement_history:
+            emotional_epochs = list(range(len(data.depression_history)))
+
+            fig.add_trace(
+                go.Scatter(x=emotional_epochs, y=data.depression_history, mode='lines',
+                          name='Depression Ratio', line=dict(color='blue', width=2),
+                          fill='tozeroy', fillcolor='rgba(0,0,255,0.1)'),
+                row=row, col=1
+            )
+            fig.add_trace(
+                go.Scatter(x=emotional_epochs, y=data.excitement_history, mode='lines',
+                          name='Excitement Ratio', line=dict(color='green', width=2),
+                          fill='tozeroy', fillcolor='rgba(0,255,0,0.1)'),
+                row=row, col=1
+            )
+            fig.add_hline(y=0.8, line_dash="dash", line_color="red",
+                         annotation_text="Extreme Threshold", row=row, col=1)
 
         fig.update_layout(
             title=dict(text=title, font=dict(size=16)),
@@ -551,10 +599,19 @@ def auto_generate_plots(training_result,
 
     # Training history plot
     plotter = TrainingPlotter(use_plotly=use_plotly)
+
+    # Get emotional state data if available
+    depression_history = getattr(training_result, 'depression_history', None)
+    excitement_history = getattr(training_result, 'excitement_history', None)
+    learning_rate_history = getattr(training_result, 'learning_rate_history', None)
+
     data = TrainingVisualization(
         cost_history=training_result.cost_history,
         efficiency_history=training_result.efficiency_history,
-        health_history=health_history
+        health_history=health_history,
+        learning_rate_history=learning_rate_history,
+        depression_history=depression_history,
+        excitement_history=excitement_history
     )
 
     ext = '.html' if use_plotly else '.png'
