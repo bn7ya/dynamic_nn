@@ -73,7 +73,22 @@ except ImportError as e:
     _CPP_ERROR = str(e)
 
 # Pure Python components (always available)
-from .network import DynamicNetwork, TrainingResult, HealthReport
+from .network import (
+    DynamicNetwork,
+    TrainingResult,
+    HealthReport,
+    # Configuration classes for advanced users
+    TrainingPhaseConfig,
+    ArchitectureConfig,
+    EfficiencyConfig,
+    HealthScoreConfig,
+    GradientConfig,
+    PerturbationConfig,
+    EarlyStoppingConfig,
+    RewardPenaltyConfig,
+    NormalizationConfig,
+    SigmoidThresholdConfig,
+)
 
 # Visualization (requires matplotlib or plotly)
 try:
@@ -114,6 +129,17 @@ __all__ = [
     "DynamicNetwork",
     "TrainingResult",
     "HealthReport",
+    # Configuration classes for advanced ML engineers
+    "TrainingPhaseConfig",
+    "ArchitectureConfig",
+    "EfficiencyConfig",
+    "HealthScoreConfig",
+    "GradientConfig",
+    "PerturbationConfig",
+    "EarlyStoppingConfig",
+    "RewardPenaltyConfig",
+    "NormalizationConfig",
+    "SigmoidThresholdConfig",
     # Model generation
     "ThreeModelGenerator",
     "ModelVariant",

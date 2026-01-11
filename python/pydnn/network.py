@@ -213,6 +213,19 @@ class RewardPenaltyConfig:
 
 
 @dataclass
+class NormalizationConfig:
+    """Configuration for data normalization."""
+    # Whether to auto-normalize input data
+    normalize_input: bool = True
+    # Whether to auto-normalize output data (for regression)
+    normalize_output: bool = True
+    # Normalization method: 'zscore' (mean=0, std=1) or 'minmax' (0-1 range)
+    method: str = 'zscore'
+    # Small constant to prevent division by zero
+    epsilon: float = 1e-8
+
+
+@dataclass
 class TrainingPhaseConfig:
     """Configuration for the 4-phase training approach."""
     # Phase 1: Exploration
@@ -248,7 +261,7 @@ class TrainingPhaseConfig:
     phase4_target_cost_reduction: float = 0.5    # Target 50% additional cost reduction
     phase4_min_epochs: int = 50                  # Increased from 20 for more training time
     phase4_max_epochs: int = 200                 # Maximum training epochs
-    phase4_patience: int = 15                    # Early stopping patience
+    phase4_patience: int = 35                    # Early stopping patience (increased from 15)
     phase4_min_improvement: float = 1e-5         # Minimum cost improvement threshold
 
 
@@ -305,7 +318,7 @@ class SigmoidThresholdConfig:
 @dataclass
 class HealthScoreConfig:
     """Configuration for cancer/alzheimer health score computation."""
-    # Denominators for normalization
+    # Denominators for normalization (rate-based)
     cancer_denominator: float = 5.0
     alzheimer_denominator: float = 5.0
 
@@ -315,6 +328,12 @@ class HealthScoreConfig:
     # Health state thresholds
     healthy_threshold: float = 0.3
     at_risk_threshold: float = 0.7
+
+    # Ratio-based thresholds (percentage of initial nodes)
+    # If more than this ratio of nodes are removed, trigger high Alzheimer score
+    alzheimer_ratio_threshold: float = 0.5  # 50% node removal triggers concern
+    # If more than this ratio of nodes are added, trigger high Cancer score
+    cancer_ratio_threshold: float = 2.0  # 200% growth (3x original size) triggers concern
 
 
 @dataclass
@@ -393,7 +412,8 @@ class DynamicNetwork:
                  gradient: Optional[GradientConfig] = None,
                  perturbation: Optional[PerturbationConfig] = None,
                  early_stopping: Optional[EarlyStoppingConfig] = None,
-                 reward_penalty: Optional[RewardPenaltyConfig] = None):
+                 reward_penalty: Optional[RewardPenaltyConfig] = None,
+                 normalization: Optional[NormalizationConfig] = None):
         """
         Initialize a Dynamic Neural Network.
 
@@ -411,6 +431,7 @@ class DynamicNetwork:
             perturbation: Configuration for random perturbation
             early_stopping: Configuration for early stopping criteria
             reward_penalty: Configuration for the reward/penalty system
+            normalization: Configuration for automatic data normalization
         """
         if cost_function not in self.COST_FUNCTIONS:
             raise ValueError(f"Unknown cost function: {cost_function}. "
@@ -431,6 +452,7 @@ class DynamicNetwork:
         self.perturbation = perturbation or PerturbationConfig()
         self.early_stopping = early_stopping or EarlyStoppingConfig()
         self.reward_penalty = reward_penalty or RewardPenaltyConfig()
+        self.normalization = normalization or NormalizationConfig()
 
         # Internal state
         self._trained = False
@@ -438,6 +460,19 @@ class DynamicNetwork:
         self._layers: List[Dict] = []
         self._cpp_error_type: Optional[str] = None
         self._cpp_error_msg: Optional[str] = None
+
+        # Normalization parameters (computed during fit, used in predict)
+        self._input_mean: Optional[np.ndarray] = None
+        self._input_std: Optional[np.ndarray] = None
+        self._input_min: Optional[np.ndarray] = None
+        self._input_max: Optional[np.ndarray] = None
+        self._output_mean: Optional[np.ndarray] = None
+        self._output_std: Optional[np.ndarray] = None
+        self._output_min: Optional[np.ndarray] = None
+        self._output_max: Optional[np.ndarray] = None
+
+        # Track initial node count for health scoring
+        self._initial_node_count: Optional[int] = None
 
         # Try to use C++ backend with detailed diagnostics
         success, error_type, error_msg = _detect_cpp_status()
@@ -643,6 +678,9 @@ class DynamicNetwork:
         # Convert to float32
         X = X.astype(np.float32)
         y = y.astype(np.float32)
+
+        # Apply normalization if enabled
+        X, y = self._normalize_data(X, y, verbose)
 
         if self._use_cpp:
             result = self._fit_cpp(X, y, callback, verbose)
@@ -1147,6 +1185,147 @@ class DynamicNetwork:
             {"W": W2, "b": b2, "efficiency": None}  # Output layer - no dynamic node management
         ]
 
+        # Store initial node count for health scoring
+        self._initial_node_count = self._count_nodes()
+
+    def _normalize_data(self, X: np.ndarray, y: np.ndarray, verbose: bool = False) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Normalize input and output data, storing parameters for denormalization.
+
+        Args:
+            X: Input data array
+            y: Target data array
+            verbose: Print normalization info
+
+        Returns:
+            Tuple of (normalized_X, normalized_y)
+        """
+        eps = self.normalization.epsilon
+        X_normalized = X.copy()
+        y_normalized = y.copy()
+
+        # Normalize input data
+        if self.normalization.normalize_input:
+            X_flat = X.reshape(len(X), -1)
+
+            if self.normalization.method == 'zscore':
+                self._input_mean = np.mean(X_flat, axis=0)
+                self._input_std = np.std(X_flat, axis=0) + eps
+                X_normalized = ((X_flat - self._input_mean) / self._input_std).reshape(X.shape)
+            elif self.normalization.method == 'minmax':
+                self._input_min = np.min(X_flat, axis=0)
+                self._input_max = np.max(X_flat, axis=0)
+                input_range = self._input_max - self._input_min + eps
+                X_normalized = ((X_flat - self._input_min) / input_range).reshape(X.shape)
+
+            if verbose:
+                print(f"  Input normalization: {self.normalization.method}")
+                if self.normalization.method == 'zscore':
+                    print(f"    Mean range: [{self._input_mean.min():.4f}, {self._input_mean.max():.4f}]")
+                    print(f"    Std range: [{self._input_std.min():.4f}, {self._input_std.max():.4f}]")
+
+        # Normalize output data (only for regression tasks)
+        if self.normalization.normalize_output and self.cost_function in ["MSE", "MAE", "Huber", "LogCosh"]:
+            y_flat = y.reshape(len(y), -1)
+
+            if self.normalization.method == 'zscore':
+                self._output_mean = np.mean(y_flat, axis=0)
+                self._output_std = np.std(y_flat, axis=0) + eps
+                y_normalized = ((y_flat - self._output_mean) / self._output_std).reshape(y.shape)
+            elif self.normalization.method == 'minmax':
+                self._output_min = np.min(y_flat, axis=0)
+                self._output_max = np.max(y_flat, axis=0)
+                output_range = self._output_max - self._output_min + eps
+                y_normalized = ((y_flat - self._output_min) / output_range).reshape(y.shape)
+
+            if verbose:
+                print(f"  Output normalization: {self.normalization.method}")
+                if self.normalization.method == 'zscore':
+                    print(f"    Mean range: [{self._output_mean.min():.4f}, {self._output_mean.max():.4f}]")
+                    print(f"    Std range: [{self._output_std.min():.4f}, {self._output_std.max():.4f}]")
+
+        return X_normalized.astype(np.float32), y_normalized.astype(np.float32)
+
+    def _normalize_input(self, X: np.ndarray) -> np.ndarray:
+        """
+        Normalize input data using stored parameters (for prediction).
+
+        Args:
+            X: Input data array
+
+        Returns:
+            Normalized input array
+        """
+        if not self.normalization.normalize_input:
+            return X
+
+        eps = self.normalization.epsilon
+        X_flat = X.reshape(len(X), -1)
+
+        if self.normalization.method == 'zscore' and self._input_mean is not None:
+            X_normalized = (X_flat - self._input_mean) / self._input_std
+        elif self.normalization.method == 'minmax' and self._input_min is not None:
+            input_range = self._input_max - self._input_min + eps
+            X_normalized = (X_flat - self._input_min) / input_range
+        else:
+            return X
+
+        return X_normalized.reshape(X.shape).astype(np.float32)
+
+    def _denormalize_output(self, y: np.ndarray) -> np.ndarray:
+        """
+        Denormalize output data using stored parameters.
+
+        Args:
+            y: Normalized output array
+
+        Returns:
+            Denormalized output array in original scale
+        """
+        if not self.normalization.normalize_output:
+            return y
+
+        # Only denormalize for regression tasks
+        if self.cost_function not in ["MSE", "MAE", "Huber", "LogCosh"]:
+            return y
+
+        eps = self.normalization.epsilon
+        y_flat = y.reshape(len(y), -1)
+
+        if self.normalization.method == 'zscore' and self._output_mean is not None:
+            y_denormalized = y_flat * self._output_std + self._output_mean
+        elif self.normalization.method == 'minmax' and self._output_min is not None:
+            output_range = self._output_max - self._output_min + eps
+            y_denormalized = y_flat * output_range + self._output_min
+        else:
+            return y
+
+        return y_denormalized.reshape(y.shape).astype(np.float32)
+
+    def get_normalization_params(self) -> Dict[str, Any]:
+        """
+        Get stored normalization parameters for external use.
+
+        Returns:
+            Dictionary containing normalization parameters:
+            - input_mean, input_std (for zscore)
+            - input_min, input_max (for minmax)
+            - output_mean, output_std (for zscore, regression only)
+            - output_min, output_max (for minmax, regression only)
+            - method: normalization method used
+        """
+        return {
+            'method': self.normalization.method,
+            'input_mean': self._input_mean,
+            'input_std': self._input_std,
+            'input_min': self._input_min,
+            'input_max': self._input_max,
+            'output_mean': self._output_mean,
+            'output_std': self._output_std,
+            'output_min': self._output_min,
+            'output_max': self._output_max,
+        }
+
     def _count_nodes(self) -> int:
         """Count total nodes in network."""
         return sum(layer["W"].shape[0] for layer in self._layers)
@@ -1289,15 +1468,50 @@ class DynamicNetwork:
 
     def _compute_health_scores(self, nodes_added: int, nodes_removed: int,
                                layers_added: int, layers_removed: int, epoch: int) -> Tuple[float, float]:
-        """Compute cancer and alzheimer scores."""
-        layer_weight = self.health_score.layer_weight
-        # Cancer score: excessive growth
-        growth_rate = (nodes_added + layers_added * layer_weight) / (epoch + 1)
-        cancer = min(1.0, growth_rate / self.health_score.cancer_denominator)
+        """
+        Compute cancer and alzheimer scores using both rate-based and ratio-based metrics.
 
-        # Alzheimer score: excessive removal
+        The health scores combine two approaches:
+        1. Rate-based: How fast nodes are being added/removed per epoch
+        2. Ratio-based: What percentage of initial nodes have been added/removed
+
+        This ensures that even slow but extensive pruning (e.g., 70% of nodes removed
+        over many epochs) is properly detected as Alzheimer state.
+        """
+        layer_weight = self.health_score.layer_weight
+
+        # ===== RATE-BASED SCORING (original method) =====
+        # Cancer score: excessive growth rate
+        growth_rate = (nodes_added + layers_added * layer_weight) / (epoch + 1)
+        cancer_rate = min(1.0, growth_rate / self.health_score.cancer_denominator)
+
+        # Alzheimer score: excessive removal rate
         removal_rate = (nodes_removed + layers_removed * layer_weight) / (epoch + 1)
-        alzheimer = min(1.0, removal_rate / self.health_score.alzheimer_denominator)
+        alzheimer_rate = min(1.0, removal_rate / self.health_score.alzheimer_denominator)
+
+        # ===== RATIO-BASED SCORING (new method to catch extensive changes) =====
+        # This catches cases where pruning happens slowly but extensively
+        cancer_ratio = 0.0
+        alzheimer_ratio = 0.0
+
+        if self._initial_node_count is not None and self._initial_node_count > 0:
+            initial = self._initial_node_count
+
+            # What percentage of initial nodes were removed?
+            removal_percentage = nodes_removed / initial
+            # Scale: 50% removal (threshold) = 1.0 score
+            alzheimer_ratio = min(1.0, removal_percentage / self.health_score.alzheimer_ratio_threshold)
+
+            # What percentage of initial nodes were added?
+            growth_percentage = nodes_added / initial
+            # Scale: 200% growth (threshold) = 1.0 score
+            cancer_ratio = min(1.0, growth_percentage / self.health_score.cancer_ratio_threshold)
+
+        # ===== COMBINE BOTH METRICS =====
+        # Take the maximum of rate-based and ratio-based scores
+        # This ensures both fast changes AND extensive changes are detected
+        cancer = max(cancer_rate, cancer_ratio)
+        alzheimer = max(alzheimer_rate, alzheimer_ratio)
 
         return cancer, alzheimer
 
@@ -1840,17 +2054,22 @@ class DynamicNetwork:
             for layer in saved['layers']
         ]
 
-    def predict(self, X: np.ndarray) -> np.ndarray:
+    def predict(self, X: np.ndarray, denormalize: bool = True) -> np.ndarray:
         """
         Make predictions.
 
         Args:
             X: Input data array
+            denormalize: Whether to denormalize output to original scale (default: True)
+                        Set to False if you want raw network output.
 
         Returns:
-            Predictions array
+            Predictions array (denormalized to original scale by default for regression)
         """
         X = X.astype(np.float32)
+
+        # Normalize input using stored parameters
+        X = self._normalize_input(X)
 
         if self._use_cpp:
             from . import _dnn_core
@@ -1859,7 +2078,7 @@ class DynamicNetwork:
                 tensor = _dnn_core.Tensor(x.flatten())
                 output = self._network.predict(tensor)
                 outputs.append(output.numpy())
-            return np.array(outputs)
+            output = np.array(outputs)
         else:
             # Python fallback - works with multi-layer dynamic architecture
             a = X.reshape(len(X), -1)
@@ -1877,7 +2096,13 @@ class DynamicNetwork:
                         # Softmax for classification
                         exp_z = np.exp(z - np.max(z, axis=1, keepdims=True))
                         a = exp_z / (np.sum(exp_z, axis=1, keepdims=True) + 1e-8)
-            return a
+            output = a
+
+        # Denormalize output for regression tasks
+        if denormalize:
+            output = self._denormalize_output(output)
+
+        return output
 
     def health_status(self) -> HealthReport:
         """Get health status including emotional state (cancer/alzheimer/depression/excitement)."""

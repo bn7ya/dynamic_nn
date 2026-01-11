@@ -177,6 +177,43 @@ public:
         return trainer_.health_report();
     }
 
+    py::array_t<T> normalize_input(py::array_t<T> input) {
+        auto tensor = numpy_to_tensor(input);
+        auto normalized = trainer_.normalize_input(tensor);
+        return tensor_to_numpy(normalized);
+    }
+
+    py::array_t<T> denormalize_output(py::array_t<T> output) {
+        auto tensor = numpy_to_tensor(output);
+        auto denormalized = trainer_.denormalize_output(tensor);
+        return tensor_to_numpy(denormalized);
+    }
+
+    py::dict get_normalization_params() const {
+        py::dict result;
+        const auto& params = trainer_.normalization_params();
+
+        result["input_normalized"] = params.input_normalized;
+        result["output_normalized"] = params.output_normalized;
+        result["method"] = params.method == training::NormalizationMethod::ZScore ? "zscore" : "minmax";
+
+        if (params.input_normalized) {
+            result["input_mean"] = py::array_t<T>(params.input_mean.size(), params.input_mean.data());
+            result["input_std"] = py::array_t<T>(params.input_std.size(), params.input_std.data());
+            result["input_min"] = py::array_t<T>(params.input_min.size(), params.input_min.data());
+            result["input_max"] = py::array_t<T>(params.input_max.size(), params.input_max.data());
+        }
+
+        if (params.output_normalized) {
+            result["output_mean"] = py::array_t<T>(params.output_mean.size(), params.output_mean.data());
+            result["output_std"] = py::array_t<T>(params.output_std.size(), params.output_std.data());
+            result["output_min"] = py::array_t<T>(params.output_min.size(), params.output_min.data());
+            result["output_max"] = py::array_t<T>(params.output_max.size(), params.output_max.data());
+        }
+
+        return result;
+    }
+
 private:
     training::Trainer<T> trainer_;
 };
@@ -201,6 +238,12 @@ PyNetwork<T> load_model(const std::string& path) {
 
 PYBIND11_MODULE(_dnn_core, m) {
     m.doc() = "Dynamic Neural Network C++ Core";
+
+    // Normalization method enum
+    py::enum_<training::NormalizationMethod>(m, "NormalizationMethod")
+        .value("ZScore", training::NormalizationMethod::ZScore)
+        .value("MinMax", training::NormalizationMethod::MinMax)
+        .export_values();
 
     // Cost function enum
     py::enum_<training::CostFunctionType>(m, "CostFunction")
@@ -269,6 +312,14 @@ PYBIND11_MODULE(_dnn_core, m) {
         .def_readwrite("max_layers", &core::NetworkConfig::max_layers)
         .def_readwrite("default_activation", &core::NetworkConfig::default_activation);
 
+    // Normalization config
+    py::class_<training::NormalizationConfig>(m, "NormalizationConfig")
+        .def(py::init<>())
+        .def_readwrite("normalize_input", &training::NormalizationConfig::normalize_input)
+        .def_readwrite("normalize_output", &training::NormalizationConfig::normalize_output)
+        .def_readwrite("method", &training::NormalizationConfig::method)
+        .def_readwrite("epsilon", &training::NormalizationConfig::epsilon);
+
     // Trainer config
     py::class_<training::TrainerConfig>(m, "TrainerConfig")
         .def(py::init<>())
@@ -283,7 +334,9 @@ PYBIND11_MODULE(_dnn_core, m) {
         .def_readwrite("cancer_threshold", &training::TrainerConfig::cancer_threshold)
         .def_readwrite("alzheimer_threshold", &training::TrainerConfig::alzheimer_threshold)
         .def_readwrite("enable_gradient_clipping", &training::TrainerConfig::enable_gradient_clipping)
-        .def_readwrite("gradient_clip_value", &training::TrainerConfig::gradient_clip_value);
+        .def_readwrite("gradient_clip_value", &training::TrainerConfig::gradient_clip_value)
+        .def_readwrite("normalization", &training::TrainerConfig::normalization)
+        .def_readwrite("phase4_patience", &training::TrainerConfig::phase4_patience);
 
     // Training result
     py::class_<training::TrainingResult>(m, "TrainingResult")
@@ -333,7 +386,10 @@ PYBIND11_MODULE(_dnn_core, m) {
         .def("set_epoch_callback", &PyTrainer<float>::set_epoch_callback)
         .def("learning_rate", &PyTrainer<float>::learning_rate)
         .def("batch_size", &PyTrainer<float>::batch_size)
-        .def("health_report", &PyTrainer<float>::health_report);
+        .def("health_report", &PyTrainer<float>::health_report)
+        .def("normalize_input", &PyTrainer<float>::normalize_input)
+        .def("denormalize_output", &PyTrainer<float>::denormalize_output)
+        .def("get_normalization_params", &PyTrainer<float>::get_normalization_params);
 
     // Model I/O functions
     m.def("save_model", &save_model<float>,

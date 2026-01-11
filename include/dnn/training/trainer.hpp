@@ -61,6 +61,47 @@ struct TrainingResult {
 };
 
 /**
+ * Normalization method enum.
+ */
+enum class NormalizationMethod {
+    ZScore,   // (x - mean) / std
+    MinMax    // (x - min) / (max - min)
+};
+
+/**
+ * Normalization configuration.
+ */
+struct NormalizationConfig {
+    bool normalize_input = true;           // Auto-normalize input data
+    bool normalize_output = true;          // Auto-normalize output data (for regression)
+    NormalizationMethod method = NormalizationMethod::ZScore;
+    double epsilon = 1e-8;                 // Prevent division by zero
+};
+
+/**
+ * Stored normalization parameters for denormalization.
+ */
+template<typename T>
+struct NormalizationParams {
+    // Input normalization params
+    std::vector<T> input_mean;
+    std::vector<T> input_std;
+    std::vector<T> input_min;
+    std::vector<T> input_max;
+
+    // Output normalization params
+    std::vector<T> output_mean;
+    std::vector<T> output_std;
+    std::vector<T> output_min;
+    std::vector<T> output_max;
+
+    bool input_normalized = false;
+    bool output_normalized = false;
+    NormalizationMethod method = NormalizationMethod::ZScore;
+    T epsilon = static_cast<T>(1e-8);
+};
+
+/**
  * Trainer configuration.
  */
 struct TrainerConfig {
@@ -97,6 +138,9 @@ struct TrainerConfig {
     double gradient_clip_value = 1.0;
     bool enable_gradient_clipping = true;
 
+    // Normalization (auto-normalize data even if not pre-normalized)
+    NormalizationConfig normalization;
+
     // Phase 4: Standard Training (frozen architecture, accuracy focus)
     bool phase4_enabled = true;
     double phase4_learning_rate = 0.005;          // Reduced from 0.01 for fine-tuning stability
@@ -107,7 +151,7 @@ struct TrainerConfig {
     double phase4_target_cost_reduction = 0.5;    // Target 50% additional cost reduction
     size_t phase4_min_epochs = 50;                // Increased from 20 for more training time
     size_t phase4_max_epochs = 200;               // Maximum training epochs
-    size_t phase4_patience = 15;                  // Early stopping patience
+    size_t phase4_patience = 35;                  // Early stopping patience (increased from 15)
     double phase4_min_improvement = 1e-5;         // Minimum cost improvement threshold
 };
 
@@ -130,13 +174,18 @@ public:
             const TrainerConfig& config = TrainerConfig())
         : network_(network)
         , config_(config)
+        , cost_type_(cost_type)
         , cost_function_(CostFunction<T>::create(cost_type))
         , batch_manager_(config.batch_config)
         , health_monitor_(network, config.cancer_threshold, config.alzheimer_threshold)
         , layer_manager_(network, health_monitor_)
         , trainable_scheduler_(network, config.trainable_config)
         , early_stopping_(config.patience, config.min_improvement, 10)
-        , learning_rate_(config.initial_learning_rate) {}
+        , learning_rate_(config.initial_learning_rate) {
+        // Initialize normalization params
+        norm_params_.method = config.normalization.method;
+        norm_params_.epsilon = static_cast<T>(config.normalization.epsilon);
+    }
 
     /**
      * Train the network.
@@ -149,6 +198,9 @@ public:
         result.cost_history.reserve(config_.max_epochs);
         result.efficiency_history.reserve(config_.max_epochs);
 
+        // Compute normalization parameters from all data first
+        compute_normalization_params(inputs, targets);
+
         // Split data for validation (80/10/10)
         size_t train_end = static_cast<size_t>(inputs.size() * 0.8);
         size_t val_end = static_cast<size_t>(inputs.size() * 0.9);
@@ -157,6 +209,10 @@ public:
         std::vector<Tensor<T>> train_targets(targets.begin(), targets.begin() + train_end);
         std::vector<Tensor<T>> val_inputs(inputs.begin() + train_end, inputs.begin() + val_end);
         std::vector<Tensor<T>> val_targets(targets.begin() + train_end, targets.begin() + val_end);
+
+        // Apply normalization to training data
+        normalize_data(train_inputs, train_targets);
+        normalize_data(val_inputs, val_targets);
 
         double previous_cost = std::numeric_limits<double>::max();
 
@@ -267,6 +323,12 @@ public:
         result.alzheimer_score_history.reserve(500);
         result.architecture_history.reserve(500);
 
+        // Compute normalization parameters and normalize data
+        compute_normalization_params(inputs, targets);
+        std::vector<Tensor<T>> norm_inputs = inputs;  // Copy for normalization
+        std::vector<Tensor<T>> norm_targets = targets;
+        normalize_data(norm_inputs, norm_targets);
+
         // ============ PHASE 1: EXPLORATION (10 epochs) ============
         auto phase1_start = std::chrono::high_resolution_clock::now();
         double exploration_lr = 0.5;  // High LR for wide exploration
@@ -274,7 +336,7 @@ public:
         for (size_t epoch = 0; epoch < 10; ++epoch) {
             health_monitor_.update_epoch(epoch);
 
-            double epoch_cost = train_epoch_with_lr(inputs, targets, exploration_lr);
+            double epoch_cost = train_epoch_with_lr(norm_inputs, norm_targets, exploration_lr);
             result.cost_history.push_back(epoch_cost);
 
             // Aggressive architecture exploration with low threshold
@@ -317,7 +379,7 @@ public:
         for (size_t epoch = 0; epoch < 10; ++epoch) {
             health_monitor_.update_epoch(10 + epoch);
 
-            double epoch_cost = train_epoch_with_lr(inputs, targets, estimation_lr);
+            double epoch_cost = train_epoch_with_lr(norm_inputs, norm_targets, estimation_lr);
             estimation_costs.push_back(epoch_cost);
             result.cost_history.push_back(epoch_cost);
 
@@ -359,7 +421,7 @@ public:
             double efficiency = compute_efficiency(result.cost_history);
             double sat_threshold = compute_sigmoid_threshold(efficiency);
 
-            double epoch_cost = train_epoch_with_lr(inputs, targets, main_lr);
+            double epoch_cost = train_epoch_with_lr(norm_inputs, norm_targets, main_lr);
             result.cost_history.push_back(epoch_cost);
 
             // Layer adjustment with adaptive threshold
@@ -425,7 +487,7 @@ public:
 
             for (size_t epoch = 0; epoch < phase4_estimated; ++epoch) {
                 // Train one epoch - NO architecture modifications (frozen)
-                double epoch_cost = train_epoch_with_lr(inputs, targets, phase4_lr);
+                double epoch_cost = train_epoch_with_lr(norm_inputs, norm_targets, phase4_lr);
                 result.cost_history.push_back(epoch_cost);
 
                 // Track metrics
@@ -693,6 +755,67 @@ public:
      */
     const TrainerConfig& config() const { return config_; }
 
+    /**
+     * Get normalization parameters (for denormalization in prediction).
+     */
+    const NormalizationParams<T>& normalization_params() const { return norm_params_; }
+
+    /**
+     * Normalize input tensor using stored parameters.
+     */
+    Tensor<T> normalize_input(const Tensor<T>& input) const {
+        if (!norm_params_.input_normalized || norm_params_.input_mean.empty()) {
+            return input;
+        }
+
+        Tensor<T> result = input.clone();
+        T* data = result.data();
+        size_t size = result.size();
+
+        if (norm_params_.method == NormalizationMethod::ZScore) {
+            for (size_t i = 0; i < size; ++i) {
+                size_t idx = i % norm_params_.input_mean.size();
+                data[i] = (data[i] - norm_params_.input_mean[idx]) / norm_params_.input_std[idx];
+            }
+        } else {  // MinMax
+            for (size_t i = 0; i < size; ++i) {
+                size_t idx = i % norm_params_.input_min.size();
+                T range = norm_params_.input_max[idx] - norm_params_.input_min[idx] + norm_params_.epsilon;
+                data[i] = (data[i] - norm_params_.input_min[idx]) / range;
+            }
+        }
+
+        return result;
+    }
+
+    /**
+     * Denormalize output tensor to original scale.
+     */
+    Tensor<T> denormalize_output(const Tensor<T>& output) const {
+        if (!norm_params_.output_normalized || norm_params_.output_mean.empty()) {
+            return output;
+        }
+
+        Tensor<T> result = output.clone();
+        T* data = result.data();
+        size_t size = result.size();
+
+        if (norm_params_.method == NormalizationMethod::ZScore) {
+            for (size_t i = 0; i < size; ++i) {
+                size_t idx = i % norm_params_.output_mean.size();
+                data[i] = data[i] * norm_params_.output_std[idx] + norm_params_.output_mean[idx];
+            }
+        } else {  // MinMax
+            for (size_t i = 0; i < size; ++i) {
+                size_t idx = i % norm_params_.output_min.size();
+                T range = norm_params_.output_max[idx] - norm_params_.output_min[idx] + norm_params_.epsilon;
+                data[i] = data[i] * range + norm_params_.output_min[idx];
+            }
+        }
+
+        return result;
+    }
+
 private:
     void clip_gradients() {
         // Simple gradient clipping by value
@@ -700,8 +823,144 @@ private:
         // For now, this is a placeholder
     }
 
+    /**
+     * Compute and store normalization parameters from training data.
+     */
+    void compute_normalization_params(const std::vector<Tensor<T>>& inputs,
+                                      const std::vector<Tensor<T>>& targets) {
+        if (inputs.empty()) return;
+
+        size_t input_size = inputs[0].size();
+        size_t output_size = targets[0].size();
+        size_t n_samples = inputs.size();
+
+        // Compute input normalization params
+        if (config_.normalization.normalize_input) {
+            norm_params_.input_mean.resize(input_size, T(0));
+            norm_params_.input_std.resize(input_size, T(0));
+            norm_params_.input_min.resize(input_size, std::numeric_limits<T>::max());
+            norm_params_.input_max.resize(input_size, std::numeric_limits<T>::lowest());
+
+            // Compute mean, min, max
+            for (const auto& input : inputs) {
+                const T* data = input.data();
+                for (size_t i = 0; i < input_size; ++i) {
+                    norm_params_.input_mean[i] += data[i];
+                    norm_params_.input_min[i] = std::min(norm_params_.input_min[i], data[i]);
+                    norm_params_.input_max[i] = std::max(norm_params_.input_max[i], data[i]);
+                }
+            }
+            for (size_t i = 0; i < input_size; ++i) {
+                norm_params_.input_mean[i] /= n_samples;
+            }
+
+            // Compute std
+            for (const auto& input : inputs) {
+                const T* data = input.data();
+                for (size_t i = 0; i < input_size; ++i) {
+                    T diff = data[i] - norm_params_.input_mean[i];
+                    norm_params_.input_std[i] += diff * diff;
+                }
+            }
+            for (size_t i = 0; i < input_size; ++i) {
+                norm_params_.input_std[i] = std::sqrt(norm_params_.input_std[i] / n_samples) + norm_params_.epsilon;
+            }
+
+            norm_params_.input_normalized = true;
+        }
+
+        // Compute output normalization params (only for regression)
+        bool is_regression = (cost_type_ == CostFunctionType::MeanSquaredError ||
+                             cost_type_ == CostFunctionType::MeanAbsoluteError ||
+                             cost_type_ == CostFunctionType::Huber ||
+                             cost_type_ == CostFunctionType::LogCosh);
+
+        if (config_.normalization.normalize_output && is_regression) {
+            norm_params_.output_mean.resize(output_size, T(0));
+            norm_params_.output_std.resize(output_size, T(0));
+            norm_params_.output_min.resize(output_size, std::numeric_limits<T>::max());
+            norm_params_.output_max.resize(output_size, std::numeric_limits<T>::lowest());
+
+            // Compute mean, min, max
+            for (const auto& target : targets) {
+                const T* data = target.data();
+                for (size_t i = 0; i < output_size; ++i) {
+                    norm_params_.output_mean[i] += data[i];
+                    norm_params_.output_min[i] = std::min(norm_params_.output_min[i], data[i]);
+                    norm_params_.output_max[i] = std::max(norm_params_.output_max[i], data[i]);
+                }
+            }
+            for (size_t i = 0; i < output_size; ++i) {
+                norm_params_.output_mean[i] /= n_samples;
+            }
+
+            // Compute std
+            for (const auto& target : targets) {
+                const T* data = target.data();
+                for (size_t i = 0; i < output_size; ++i) {
+                    T diff = data[i] - norm_params_.output_mean[i];
+                    norm_params_.output_std[i] += diff * diff;
+                }
+            }
+            for (size_t i = 0; i < output_size; ++i) {
+                norm_params_.output_std[i] = std::sqrt(norm_params_.output_std[i] / n_samples) + norm_params_.epsilon;
+            }
+
+            norm_params_.output_normalized = true;
+        }
+    }
+
+    /**
+     * Apply normalization to training data in-place.
+     */
+    void normalize_data(std::vector<Tensor<T>>& inputs,
+                       std::vector<Tensor<T>>& targets) {
+        // Normalize inputs
+        if (norm_params_.input_normalized) {
+            for (auto& input : inputs) {
+                T* data = input.data();
+                size_t size = input.size();
+
+                if (norm_params_.method == NormalizationMethod::ZScore) {
+                    for (size_t i = 0; i < size; ++i) {
+                        size_t idx = i % norm_params_.input_mean.size();
+                        data[i] = (data[i] - norm_params_.input_mean[idx]) / norm_params_.input_std[idx];
+                    }
+                } else {  // MinMax
+                    for (size_t i = 0; i < size; ++i) {
+                        size_t idx = i % norm_params_.input_min.size();
+                        T range = norm_params_.input_max[idx] - norm_params_.input_min[idx] + norm_params_.epsilon;
+                        data[i] = (data[i] - norm_params_.input_min[idx]) / range;
+                    }
+                }
+            }
+        }
+
+        // Normalize targets
+        if (norm_params_.output_normalized) {
+            for (auto& target : targets) {
+                T* data = target.data();
+                size_t size = target.size();
+
+                if (norm_params_.method == NormalizationMethod::ZScore) {
+                    for (size_t i = 0; i < size; ++i) {
+                        size_t idx = i % norm_params_.output_mean.size();
+                        data[i] = (data[i] - norm_params_.output_mean[idx]) / norm_params_.output_std[idx];
+                    }
+                } else {  // MinMax
+                    for (size_t i = 0; i < size; ++i) {
+                        size_t idx = i % norm_params_.output_min.size();
+                        T range = norm_params_.output_max[idx] - norm_params_.output_min[idx] + norm_params_.epsilon;
+                        data[i] = (data[i] - norm_params_.output_min[idx]) / range;
+                    }
+                }
+            }
+        }
+    }
+
     Network<T>& network_;
     TrainerConfig config_;
+    CostFunctionType cost_type_;
     std::unique_ptr<CostFunction<T>> cost_function_;
     BatchManager<T> batch_manager_;
     HealthMonitor<T> health_monitor_;
@@ -710,6 +969,7 @@ private:
     EarlyStopping<T> early_stopping_;
     double learning_rate_;
     EpochCallback<T> epoch_callback_;
+    NormalizationParams<T> norm_params_;
 };
 
 } // namespace training
