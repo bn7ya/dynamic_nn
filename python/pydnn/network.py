@@ -143,6 +143,12 @@ class TrainingResult:
     lr_reset_count: int = 0
     learning_rate_history: List[float] = field(default_factory=list)
     emotional_state_history: List[str] = field(default_factory=list)
+    # Phase 4 fields
+    phase4_epochs: int = 0
+    phase4_initial_cost: float = 0.0
+    phase4_final_cost: float = 0.0
+    phase4_cost_reduction: float = 0.0
+    phase4_early_stopped: bool = False
 
 
 @dataclass
@@ -208,38 +214,51 @@ class RewardPenaltyConfig:
 
 @dataclass
 class TrainingPhaseConfig:
-    """Configuration for the 3-phase training approach."""
+    """Configuration for the 4-phase training approach."""
     # Phase 1: Exploration
     exploration_epochs: int = 10
-    exploration_learning_rate: float = 0.2        # Reduced from 0.5
+    exploration_learning_rate: float = 0.05       # Reduced from 0.2 to prevent gradient explosion
     exploration_batch_size: int = 64
     exploration_saturation_threshold: float = 0.6  # Increased from 0.3
     exploration_efficiency_threshold: float = 0.2  # Lowered from 0.3 for less removal
 
     # Phase 2: Estimation
     estimation_epochs: int = 10
-    estimation_learning_rate: float = 0.1
+    estimation_learning_rate: float = 0.01        # Reduced from 0.1 for stability
 
     # Phase 3: Main Training
-    main_learning_rate: float = 0.1
+    main_learning_rate: float = 0.01              # Reduced from 0.1 to prevent divergence
     main_initial_batch_size: int = 32
     main_max_batch_size: int = 256
     batch_size_growth_interval: int = 25
     perturbation_cutoff_ratio: float = 0.2  # First 20% of epochs
 
-    # Epoch estimation
+    # Epoch estimation (Phase 3)
     target_efficiency: float = 0.8               # Reduced from 0.9
     min_estimated_epochs: int = 50               # Increased from 10
     max_estimated_epochs: int = 300              # Reduced from 500
+
+    # Phase 4: Standard Training (frozen architecture, accuracy focus)
+    phase4_enabled: bool = True
+    phase4_learning_rate: float = 0.005          # Reduced from 0.01 for fine-tuning stability
+    phase4_min_learning_rate: float = 0.0001     # Lower bound for LR
+    phase4_lr_decay_rate: float = 0.95           # Gentle decay
+    phase4_lr_decay_interval: int = 10           # Epochs between decay
+    phase4_batch_size: int = 64                  # Fixed batch size
+    phase4_target_cost_reduction: float = 0.5    # Target 50% additional cost reduction
+    phase4_min_epochs: int = 50                  # Increased from 20 for more training time
+    phase4_max_epochs: int = 200                 # Maximum training epochs
+    phase4_patience: int = 15                    # Early stopping patience
+    phase4_min_improvement: float = 1e-5         # Minimum cost improvement threshold
 
 
 @dataclass
 class ArchitectureConfig:
     """Configuration for dynamic architecture constraints."""
     # Node limits
-    min_nodes_per_layer: int = 16
+    min_nodes_per_layer: int = 32            # Increased from 16 to prevent under-capacity
     max_nodes_per_layer: int = 1024          # Reduced (was 2000)
-    min_nodes_to_keep: int = 8
+    min_nodes_to_keep: int = 16              # Increased from 8
 
     # Layer limits
     max_layers: int = 6                      # Reduced (was 10)
@@ -250,7 +269,7 @@ class ArchitectureConfig:
     main_growth_rate: float = 0.05           # 5% (was 12.5%)
 
     # Initial sizing
-    min_initial_hidden_size: int = 32        # Increased (was 16)
+    min_initial_hidden_size: int = 64        # Increased from 32 for larger initial capacity
 
 
 @dataclass
@@ -301,7 +320,7 @@ class HealthScoreConfig:
 @dataclass
 class GradientConfig:
     """Configuration for gradient handling and optimization."""
-    gradient_clip_value: float = 5.0
+    gradient_clip_value: float = 1.0         # Reduced from 5.0 for more aggressive clipping
     momentum: float = 0.9
 
 
@@ -315,8 +334,8 @@ class PerturbationConfig:
 @dataclass
 class EarlyStoppingConfig:
     """Configuration for early stopping criteria."""
-    window_size: int = 20
-    improvement_threshold: float = 1e-6
+    window_size: int = 30                    # Increased from 20 for less aggressive stopping
+    improvement_threshold: float = 1e-7      # Reduced from 1e-6 for less sensitivity
     max_consecutive_increases: int = 5
 
 
@@ -924,6 +943,118 @@ class DynamicNetwork:
 
         phase3_time = time.time() - phase3_start
 
+        # ============ PHASE 4: STANDARD TRAINING ============
+        # Initialize Phase 4 variables
+        phase4_time = 0.0
+        phase4_estimated_epochs = 0
+        phase4_epochs = 0
+        phase4_initial_cost = 0.0
+        phase4_final_cost = 0.0
+        phase4_cost_reduction = 0.0
+        phase4_early_stopped = False
+
+        if self.training_phase.phase4_enabled:
+            phase4_start = time.time()
+            phase3_final_cost = cost_history[-1] if cost_history else 0.0
+
+            # Estimate epochs for Phase 4
+            phase4_estimated_epochs = self._estimate_phase4_epochs(
+                phase3_final_cost,
+                cost_history[-50:]  # Use last 50 epochs of history
+            )
+
+            if verbose:
+                print("\n" + "=" * 60)
+                print(f"PHASE 4: STANDARD TRAINING ({phase4_estimated_epochs} epochs)")
+                print("=" * 60)
+                print(f"  Target: {self.training_phase.phase4_target_cost_reduction:.0%} cost reduction")
+                print(f"  Architecture frozen: {len(self._layers)} layers, {self._count_nodes()} nodes")
+
+            phase4_initial_cost = phase3_final_cost
+            phase4_learning_rate = self.training_phase.phase4_learning_rate
+
+            # Use lower LR for regression tasks
+            if self.cost_function == "MSE":
+                phase4_learning_rate = min(phase4_learning_rate, 0.005)
+
+            batch_size = self.training_phase.phase4_batch_size
+            patience_counter = 0
+            phase4_best_cost = phase4_initial_cost
+
+            phase4_iter = range(phase4_estimated_epochs)
+            if verbose and TQDM_AVAILABLE:
+                phase4_iter = tqdm(phase4_iter, desc="Phase 4: Standard", unit="epoch")
+
+            for epoch in phase4_iter:
+                total_epoch = exploration_epochs + estimation_epochs + estimated_epochs + epoch
+
+                # Train one epoch (NO architecture modifications - frozen)
+                epoch_cost = self._train_epoch(X, y, phase4_learning_rate, batch_size)
+                cost_history.append(epoch_cost)
+
+                # Track metrics (architecture is frozen, but we still track)
+                efficiency = self._compute_efficiency(cost_history)
+                efficiency_history.append(efficiency)
+                cancer, alzheimer = self._compute_health_scores(
+                    nodes_added, nodes_removed, layers_added, layers_removed, len(cost_history)
+                )
+                cancer_score_history.append(cancer)
+                alzheimer_score_history.append(alzheimer)
+                architecture_history.append((len(self._layers), self._count_nodes()))
+
+                # Track best cost
+                if epoch_cost < best_cost:
+                    best_cost = epoch_cost
+
+                # Track best cost and patience for early stopping
+                if epoch_cost < phase4_best_cost - self.training_phase.phase4_min_improvement:
+                    phase4_best_cost = epoch_cost
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+
+                # Learning rate decay
+                if epoch > 0 and epoch % self.training_phase.phase4_lr_decay_interval == 0:
+                    phase4_learning_rate = max(
+                        self.training_phase.phase4_min_learning_rate,
+                        phase4_learning_rate * self.training_phase.phase4_lr_decay_rate
+                    )
+
+                # Update progress bar
+                if verbose and TQDM_AVAILABLE:
+                    phase4_iter.set_postfix({
+                        'cost': f'{epoch_cost:.6f}',
+                        'eff': f'{efficiency:.2%}',
+                        'lr': f'{phase4_learning_rate:.5f}',
+                        'patience': f'{patience_counter}/{self.training_phase.phase4_patience}'
+                    })
+                elif verbose and epoch % 10 == 0:
+                    print(f"  Epoch {epoch}: cost={epoch_cost:.6f}, lr={phase4_learning_rate:.5f}")
+
+                self._safe_callback(callback, total_epoch, epoch_cost, efficiency)
+
+                # Early stopping check
+                if patience_counter >= self.training_phase.phase4_patience:
+                    if verbose:
+                        print(f"  Early stopping at epoch {epoch} (no improvement for {patience_counter} epochs)")
+                    phase4_early_stopped = True
+                    phase4_epochs = epoch + 1
+                    break
+
+                # Check if target reduction achieved
+                current_reduction = (phase4_initial_cost - epoch_cost) / (phase4_initial_cost + 1e-8)
+                if current_reduction >= self.training_phase.phase4_target_cost_reduction:
+                    if verbose:
+                        print(f"  Target cost reduction achieved at epoch {epoch} ({current_reduction:.1%})")
+                    phase4_epochs = epoch + 1
+                    break
+
+                phase4_epochs = epoch + 1
+
+            phase4_time = time.time() - phase4_start
+            phase4_final_cost = cost_history[-1] if cost_history else 0.0
+            phase4_cost_reduction = (phase4_initial_cost - phase4_final_cost) / (phase4_initial_cost + 1e-8)
+
         # ============ TRAINING SUMMARY ============
         training_time_ms = int((time.time() - start_time) * 1000)
 
@@ -932,10 +1063,13 @@ class DynamicNetwork:
             print("TRAINING SUMMARY")
             print("=" * 60)
             print(f"  Total Time: {training_time_ms / 1000:.2f}s")
-            print(f"  Phases: Exploration({phase1_time:.1f}s) → Estimation({phase2_time:.1f}s) → Training({phase3_time:.1f}s)")
+            if self.training_phase.phase4_enabled:
+                print(f"  Phases: Exploration({phase1_time:.1f}s) -> Estimation({phase2_time:.1f}s) -> Training({phase3_time:.1f}s) -> Standard({phase4_time:.1f}s)")
+            else:
+                print(f"  Phases: Exploration({phase1_time:.1f}s) -> Estimation({phase2_time:.1f}s) -> Training({phase3_time:.1f}s)")
             initial_arch = architecture_history[0] if architecture_history else (2, 0)
             final_arch = architecture_history[-1] if architecture_history else (len(self._layers), self._count_nodes())
-            print(f"  Architecture: {initial_arch[0]} layers → {final_arch[0]} layers, {initial_arch[1]} nodes → {final_arch[1]} nodes")
+            print(f"  Architecture: {initial_arch[0]} layers -> {final_arch[0]} layers, {initial_arch[1]} nodes -> {final_arch[1]} nodes")
             print(f"  Nodes: +{nodes_added} added, -{nodes_removed} removed")
             print(f"  Layers: +{layers_added} added, -{layers_removed} removed")
             print(f"  Perturbations: {perturbations_applied}")
@@ -943,6 +1077,8 @@ class DynamicNetwork:
             print(f"  Emotional: {emotional_state.total_rewards} rewards, {emotional_state.total_penalties} penalties")
             print(f"  Depression ratio: {emotional_state.depression_ratio:.1%}, Excitement ratio: {emotional_state.excitement_ratio:.1%}")
             print(f"  LR resets: {emotional_state.lr_reset_count}")
+            if self.training_phase.phase4_enabled:
+                print(f"  Phase 4: {phase4_epochs} epochs, cost reduced by {phase4_cost_reduction:.1%}")
             print("=" * 60)
 
         return TrainingResult(
@@ -968,6 +1104,9 @@ class DynamicNetwork:
                 'phase1_time': phase1_time,
                 'phase2_time': phase2_time,
                 'phase3_time': phase3_time,
+                'phase4_time': phase4_time,
+                'phase4_estimated_epochs': phase4_estimated_epochs,
+                'phase4_cost_reduction': phase4_cost_reduction,
                 'estimated_epochs': estimated_epochs,
                 'exploration_best_cost': min(exploration_costs) if exploration_costs else 0.0,
                 'final_depression_ratio': emotional_state.depression_ratio,
@@ -980,7 +1119,13 @@ class DynamicNetwork:
             excitement_history=emotional_state.excitement_history,
             lr_reset_count=emotional_state.lr_reset_count,
             learning_rate_history=learning_rate_history,
-            emotional_state_history=emotional_state_actions
+            emotional_state_history=emotional_state_actions,
+            # Phase 4 fields
+            phase4_epochs=phase4_epochs,
+            phase4_initial_cost=phase4_initial_cost,
+            phase4_final_cost=phase4_final_cost,
+            phase4_cost_reduction=phase4_cost_reduction,
+            phase4_early_stopped=phase4_early_stopped
         )
 
     def _init_architecture(self, input_size: int) -> None:
@@ -1164,6 +1309,50 @@ class DynamicNetwork:
         center = self.sigmoid_threshold.center
         sigmoid = 1.0 / (1.0 + np.exp(-k * (efficiency - center)))
         return base + range_val * sigmoid
+
+    def _estimate_phase4_epochs(self, phase3_final_cost: float,
+                                 cost_history: List[float]) -> int:
+        """
+        Estimate epochs needed for Phase 4 based on cost reduction rate.
+
+        Uses the cost reduction rate from recent training history and applies
+        a diminishing returns factor since Phase 4 improvement is typically slower.
+
+        Args:
+            phase3_final_cost: Final cost from Phase 3
+            cost_history: Cost history from training (uses last 20 epochs)
+
+        Returns:
+            Estimated number of epochs for Phase 4
+        """
+        window_size = min(20, len(cost_history))
+        if window_size < 2:
+            return self.training_phase.phase4_min_epochs
+
+        recent_costs = cost_history[-window_size:]
+        total_reduction = recent_costs[0] - recent_costs[-1]
+        reduction_per_epoch = total_reduction / (window_size - 1)
+
+        # Diminishing returns factor (Phase 4 improvement is slower)
+        diminishing_factor = 0.3
+        effective_rate = reduction_per_epoch * diminishing_factor
+
+        if effective_rate <= 0:
+            # No improvement or worsening - use minimum epochs
+            return self.training_phase.phase4_min_epochs
+
+        # Target cost after Phase 4
+        target_cost = phase3_final_cost * (1.0 - self.training_phase.phase4_target_cost_reduction)
+        remaining_reduction = phase3_final_cost - target_cost
+
+        # Estimate epochs needed
+        estimated_epochs = int(remaining_reduction / (effective_rate + 1e-8))
+
+        # Clamp to configured bounds
+        return max(
+            self.training_phase.phase4_min_epochs,
+            min(self.training_phase.phase4_max_epochs, estimated_epochs)
+        )
 
     # ============ REWARD/PENALTY SYSTEM METHODS ============
 

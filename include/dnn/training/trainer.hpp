@@ -49,6 +49,15 @@ struct TrainingResult {
     double phase2_time = 0.0;
     double phase3_time = 0.0;
     size_t estimated_epochs = 0;
+
+    // Phase 4 fields
+    double phase4_time = 0.0;
+    size_t phase4_epochs = 0;
+    double phase4_initial_cost = 0.0;
+    double phase4_final_cost = 0.0;
+    double phase4_cost_reduction = 0.0;
+    bool phase4_early_stopped = false;
+    size_t phase4_estimated_epochs = 0;
 };
 
 /**
@@ -56,7 +65,7 @@ struct TrainingResult {
  */
 struct TrainerConfig {
     // Learning rate (auto-adjusted internally)
-    double initial_learning_rate = 0.01;
+    double initial_learning_rate = 0.005;         // Reduced from 0.01 to prevent gradient explosion
     double min_learning_rate = 0.0001;
     double learning_rate_decay = 0.95;
     size_t decay_interval = 10;
@@ -74,8 +83,8 @@ struct TrainerConfig {
 
     // Early stopping
     bool enable_early_stopping = true;
-    size_t patience = 20;
-    double min_improvement = 0.001;
+    size_t patience = 30;                         // Increased from 20 for less aggressive stopping
+    double min_improvement = 0.0001;              // Reduced from 0.001 for less sensitivity
 
     // Batch management
     BatchConfig batch_config;
@@ -87,6 +96,19 @@ struct TrainerConfig {
     // Numerical stability
     double gradient_clip_value = 1.0;
     bool enable_gradient_clipping = true;
+
+    // Phase 4: Standard Training (frozen architecture, accuracy focus)
+    bool phase4_enabled = true;
+    double phase4_learning_rate = 0.005;          // Reduced from 0.01 for fine-tuning stability
+    double phase4_min_learning_rate = 0.0001;     // Lower bound for LR
+    double phase4_lr_decay_rate = 0.95;           // Gentle decay
+    size_t phase4_lr_decay_interval = 10;         // Epochs between decay
+    size_t phase4_batch_size = 64;                // Fixed batch size
+    double phase4_target_cost_reduction = 0.5;    // Target 50% additional cost reduction
+    size_t phase4_min_epochs = 50;                // Increased from 20 for more training time
+    size_t phase4_max_epochs = 200;               // Maximum training epochs
+    size_t phase4_patience = 15;                  // Early stopping patience
+    double phase4_min_improvement = 1e-5;         // Minimum cost improvement threshold
 };
 
 /**
@@ -384,6 +406,92 @@ public:
         auto phase3_end = std::chrono::high_resolution_clock::now();
         result.phase3_time = std::chrono::duration<double>(phase3_end - phase3_start).count();
 
+        // ============ PHASE 4: STANDARD TRAINING ============
+        if (config_.phase4_enabled) {
+            auto phase4_start = std::chrono::high_resolution_clock::now();
+
+            double phase3_final_cost = result.cost_history.back();
+            size_t phase4_estimated = estimate_phase4_epochs(
+                phase3_final_cost,
+                result.cost_history
+            );
+
+            result.phase4_initial_cost = phase3_final_cost;
+            result.phase4_estimated_epochs = phase4_estimated;
+
+            double phase4_lr = config_.phase4_learning_rate;
+            double phase4_best_cost = phase3_final_cost;
+            size_t patience_counter = 0;
+
+            for (size_t epoch = 0; epoch < phase4_estimated; ++epoch) {
+                // Train one epoch - NO architecture modifications (frozen)
+                double epoch_cost = train_epoch_with_lr(inputs, targets, phase4_lr);
+                result.cost_history.push_back(epoch_cost);
+
+                // Track metrics
+                double efficiency = compute_efficiency(result.cost_history);
+                result.efficiency_history.push_back(efficiency);
+
+                auto health = health_monitor_.diagnose();
+                result.cancer_score_history.push_back(health.cancer_score);
+                result.alzheimer_score_history.push_back(health.alzheimer_score);
+                result.architecture_history.emplace_back(network_.num_layers(), network_.num_nodes());
+
+                // Track best cost
+                if (epoch_cost < result.best_cost) {
+                    result.best_cost = epoch_cost;
+                }
+                if (efficiency > result.best_efficiency) {
+                    result.best_efficiency = efficiency;
+                }
+
+                // Track best cost and patience for early stopping
+                if (epoch_cost < phase4_best_cost - config_.phase4_min_improvement) {
+                    phase4_best_cost = epoch_cost;
+                    patience_counter = 0;
+                } else {
+                    patience_counter++;
+                }
+
+                // Learning rate decay
+                if (epoch > 0 && epoch % config_.phase4_lr_decay_interval == 0) {
+                    phase4_lr = std::max(config_.phase4_min_learning_rate,
+                                        phase4_lr * config_.phase4_lr_decay_rate);
+                }
+
+                // Callback
+                if (epoch_callback_) {
+                    epoch_callback_(20 + result.estimated_epochs + epoch,
+                                   epoch_cost, efficiency, network_);
+                }
+
+                // Early stopping check
+                if (patience_counter >= config_.phase4_patience) {
+                    result.phase4_early_stopped = true;
+                    result.stopping_reason = "Phase 4 early stopping (no improvement)";
+                    result.phase4_epochs = epoch + 1;
+                    break;
+                }
+
+                // Check if target reduction achieved
+                double cost_reduction = (result.phase4_initial_cost - epoch_cost) /
+                                       (result.phase4_initial_cost + 1e-8);
+                if (cost_reduction >= config_.phase4_target_cost_reduction) {
+                    result.stopping_reason = "Phase 4 target cost reduction achieved";
+                    result.phase4_epochs = epoch + 1;
+                    break;
+                }
+
+                result.phase4_epochs = epoch + 1;
+            }
+
+            auto phase4_end = std::chrono::high_resolution_clock::now();
+            result.phase4_time = std::chrono::duration<double>(phase4_end - phase4_start).count();
+            result.phase4_final_cost = result.cost_history.back();
+            result.phase4_cost_reduction = (result.phase4_initial_cost - result.phase4_final_cost) /
+                                          (result.phase4_initial_cost + 1e-8);
+        }
+
         // Finalize result
         auto total_end = std::chrono::high_resolution_clock::now();
         result.training_time = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -442,6 +550,46 @@ public:
         size_t total_nodes = network_.num_nodes();
         size_t num_to_perturb = std::max(size_t(1), static_cast<size_t>(total_nodes * fraction));
         // Network-level perturbation would be implemented here
+    }
+
+    /**
+     * Estimate epochs needed for Phase 4 based on cost reduction rate.
+     *
+     * Uses the cost reduction rate from recent training history and applies
+     * a diminishing returns factor since Phase 4 improvement is typically slower.
+     */
+    size_t estimate_phase4_epochs(double phase3_final_cost,
+                                  const std::vector<double>& cost_history) const {
+        size_t window_size = std::min(size_t(20), cost_history.size());
+        if (window_size < 2) {
+            return config_.phase4_min_epochs;
+        }
+
+        size_t start_idx = cost_history.size() - window_size;
+        double total_reduction = cost_history[start_idx] - cost_history.back();
+        double reduction_per_epoch = total_reduction / (window_size - 1);
+
+        // Diminishing returns factor (Phase 4 improvement is slower)
+        double diminishing_factor = 0.3;
+        double effective_rate = reduction_per_epoch * diminishing_factor;
+
+        if (effective_rate <= 0) {
+            // No improvement or worsening - use minimum epochs
+            return config_.phase4_min_epochs;
+        }
+
+        // Target cost after Phase 4
+        double target_cost = phase3_final_cost * (1.0 - config_.phase4_target_cost_reduction);
+        double remaining_reduction = phase3_final_cost - target_cost;
+
+        // Estimate epochs needed
+        size_t estimated = static_cast<size_t>(
+            remaining_reduction / (effective_rate + 1e-8)
+        );
+
+        // Clamp to configured bounds
+        return std::max(config_.phase4_min_epochs,
+                       std::min(config_.phase4_max_epochs, estimated));
     }
 
     /**
