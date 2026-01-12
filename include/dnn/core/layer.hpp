@@ -351,6 +351,99 @@ public:
     }
 
     /**
+     * Compute variance z-scores and adapt variance weights for all nodes.
+     * Should be called once before training starts.
+     */
+    void compute_initial_variance_zscores() {
+        if (nodes_.empty()) return;
+
+        // Collect all node variances
+        std::vector<double> variances;
+        variances.reserve(nodes_.size());
+
+        for (const auto& node : nodes_) {
+            auto metrics = node.compute_metrics();
+            variances.push_back(metrics.activation_variance);
+        }
+
+        // Compute mean
+        double sum = 0.0;
+        for (double v : variances) {
+            sum += v;
+        }
+        double mean = sum / variances.size();
+
+        // Compute standard deviation
+        double sq_sum = 0.0;
+        for (double v : variances) {
+            sq_sum += (v - mean) * (v - mean);
+        }
+        double std_dev = std::sqrt(sq_sum / variances.size());
+
+        // Avoid division by zero
+        if (std_dev < 1e-8) {
+            std_dev = 1e-8;
+        }
+
+        // Compute z-scores and adapt variance weights
+        for (size_t i = 0; i < nodes_.size(); ++i) {
+            double z = (variances[i] - mean) / std_dev;
+            nodes_[i].adapt_variance_weight(z);
+        }
+    }
+
+    /**
+     * Compute gradient threshold from current gradient statistics.
+     * Returns mean + std of gradient magnitudes.
+     */
+    double compute_gradient_threshold() const {
+        if (nodes_.empty()) return 0.1;
+
+        std::vector<double> grad_mags;
+        grad_mags.reserve(nodes_.size());
+
+        for (const auto& node : nodes_) {
+            auto metrics = node.compute_metrics();
+            grad_mags.push_back(metrics.gradient_magnitude_avg);
+        }
+
+        // Compute mean
+        double sum = 0.0;
+        for (double g : grad_mags) {
+            sum += g;
+        }
+        double mean = sum / grad_mags.size();
+
+        // Compute standard deviation
+        double sq_sum = 0.0;
+        for (double g : grad_mags) {
+            sq_sum += (g - mean) * (g - mean);
+        }
+        double std_dev = std::sqrt(sq_sum / grad_mags.size());
+
+        return mean + std_dev;
+    }
+
+    /**
+     * Set gradient threshold for all nodes in this layer.
+     */
+    void set_nodes_grad_threshold(double threshold) {
+        for (auto& node : nodes_) {
+            node.set_grad_threshold(threshold);
+        }
+    }
+
+    /**
+     * Adapt gradient/contribution weights for all nodes based on current gradient statistics.
+     * Should be called each epoch after training.
+     */
+    void adapt_node_weights() {
+        for (auto& node : nodes_) {
+            node.adapt_gradient_weight();
+        }
+    }
+
+    /**
      * Add nodes to the layer.
      */
     void add_nodes(size_t count) {

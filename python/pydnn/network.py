@@ -307,6 +307,71 @@ class EfficiencyConfig:
 
 
 @dataclass
+class EfficiencyWeights:
+    """
+    Adaptive weights for node efficiency score computation.
+    Weights adapt based on network behavior and are constrained to sum to 1.
+
+    Efficiency score: η = w_var*S_var + w_grad*S_grad + w_alive*S_alive + w_contrib*S_contrib
+    """
+    w_variance: float = 0.25
+    w_gradient: float = 0.30
+    w_alive: float = 0.25       # Static, never changes
+    w_contribution: float = 0.20
+    grad_threshold: float = 0.1  # Auto-detected from data
+
+    def normalize(self) -> None:
+        """Normalize weights to sum to 1.0"""
+        total = self.w_variance + self.w_gradient + self.w_alive + self.w_contribution
+        if total > 0:
+            self.w_variance /= total
+            self.w_gradient /= total
+            self.w_alive /= total
+            self.w_contribution /= total
+
+    def adapt_variance_from_zscore(self, z: float) -> None:
+        """
+        Adapt variance weight based on z-score.
+        High z-score (high variance) -> lower weight (already good)
+        Low z-score (low variance) -> higher weight (need improvement)
+        """
+        if z > 1.0:
+            self.w_variance = 0.15  # High variance already, less emphasis
+        elif z < -1.0:
+            self.w_variance = 0.35  # Low variance, more emphasis needed
+        else:
+            self.w_variance = 0.25  # Normal range
+        self.normalize()
+
+    def adapt_gradient_contribution(self, grad_mag: float) -> None:
+        """
+        Adapt gradient/contribution weights based on gradient magnitude.
+        High gradients -> lower gradient weight, higher contribution weight.
+        """
+        if grad_mag > self.grad_threshold:
+            excess = (grad_mag - self.grad_threshold) / self.grad_threshold
+            transfer = min(0.15, excess * 0.10)
+
+            self.w_gradient = max(0.10, 0.30 - transfer)
+            self.w_contribution = min(0.40, 0.20 + transfer)
+            self.normalize()
+
+    def get_weights(self) -> Tuple[float, float, float, float]:
+        """Get current weights as tuple (var, grad, alive, contrib)."""
+        return (self.w_variance, self.w_gradient, self.w_alive, self.w_contribution)
+
+    def copy(self) -> 'EfficiencyWeights':
+        """Create a copy of these weights."""
+        return EfficiencyWeights(
+            w_variance=self.w_variance,
+            w_gradient=self.w_gradient,
+            w_alive=self.w_alive,
+            w_contribution=self.w_contribution,
+            grad_threshold=self.grad_threshold
+        )
+
+
+@dataclass
 class SigmoidThresholdConfig:
     """Configuration for adaptive sigmoid threshold computation."""
     k: float = 5.0
@@ -764,6 +829,31 @@ class DynamicNetwork:
         X = X[indices]
         y = y[indices]
 
+        # ============ PRE-TRAINING: ADAPTIVE WEIGHT INITIALIZATION ============
+        # Run a forward pass to collect initial activation statistics
+        batch_size = min(100, len(X))
+        m = batch_size
+        batch_X = X[:m]
+        # Forward pass through all layers to collect activation statistics
+        activations = [batch_X.reshape(m, -1)]
+        for i, layer in enumerate(self._layers):
+            z = activations[-1] @ layer["W"].T + layer["b"]
+            if i < len(self._layers) - 1:
+                a = np.maximum(0, z)  # ReLU
+                # Record activation statistics
+                if layer.get("activation_stats") is not None:
+                    node_activations = np.mean(a, axis=0)
+                    layer["activation_stats"]["sum"] += node_activations
+                    layer["activation_stats"]["sq_sum"] += node_activations ** 2
+                    layer["activation_stats"]["count"] += 1
+            else:
+                a = z  # Output layer
+            activations.append(a)
+        # Compute variance z-scores and adapt variance weights for all layers
+        self._compute_initial_variance_zscores()
+        # Reset stats after initial pass
+        self._reset_layer_stats()
+
         # ============ PHASE 1: EXPLORATION ============
         phase1_start = time.time()
         exploration_epochs = self.training_phase.exploration_epochs
@@ -827,6 +917,10 @@ class DynamicNetwork:
 
         phase1_time = time.time() - phase1_start
 
+        # ============ POST-PHASE 1: COMPUTE GRADIENT THRESHOLDS ============
+        # Auto-detect gradient thresholds based on Phase 1 statistics
+        self._compute_gradient_threshold()
+
         # ============ PHASE 2: ESTIMATION ============
         phase2_start = time.time()
         estimation_epochs = self.training_phase.estimation_epochs
@@ -856,6 +950,9 @@ class DynamicNetwork:
             cancer_score_history.append(cancer)
             alzheimer_score_history.append(alzheimer)
             architecture_history.append((len(self._layers), self._count_nodes()))
+
+            # Adapt efficiency weights based on gradient statistics
+            self._adapt_node_weights()
 
             self._safe_callback(callback, exploration_epochs + epoch, epoch_cost, efficiency)
 
@@ -951,6 +1048,9 @@ class DynamicNetwork:
                 learning_rate = min(learning_rate, 0.01)
             learning_rate_history.append(learning_rate)
             emotional_state_actions.append(action)
+
+            # Adapt efficiency weights based on gradient statistics
+            self._adapt_node_weights()
 
             # Adaptive batch size growth
             if epoch > 0 and epoch % self.training_phase.batch_size_growth_interval == 0:
@@ -1057,6 +1157,9 @@ class DynamicNetwork:
                         self.training_phase.phase4_min_learning_rate,
                         phase4_learning_rate * self.training_phase.phase4_lr_decay_rate
                     )
+
+                # Adapt efficiency weights based on gradient statistics
+                self._adapt_node_weights()
 
                 # Update progress bar
                 if verbose and TQDM_AVAILABLE:
@@ -1181,8 +1284,23 @@ class DynamicNetwork:
         # Store layers (output layer has no efficiency - nodes are fixed)
         initial_eff = self.efficiency.initial_efficiency
         self._layers = [
-            {"W": W1, "b": b1, "efficiency": np.ones(hidden_size) * initial_eff},
-            {"W": W2, "b": b2, "efficiency": None}  # Output layer - no dynamic node management
+            {
+                "W": W1,
+                "b": b1,
+                "efficiency": np.ones(hidden_size) * initial_eff,
+                "efficiency_weights": [EfficiencyWeights() for _ in range(hidden_size)],
+                "activation_stats": {
+                    "sum": np.zeros(hidden_size),
+                    "sq_sum": np.zeros(hidden_size),
+                    "count": 0,
+                    "dead_count": np.zeros(hidden_size, dtype=np.int64)
+                },
+                "gradient_stats": {
+                    "sum": np.zeros(hidden_size),
+                    "count": 0
+                }
+            },
+            {"W": W2, "b": b2, "efficiency": None, "efficiency_weights": None}  # Output layer - no dynamic node management
         ]
 
         # Store initial node count for health scoring
@@ -1365,6 +1483,17 @@ class DynamicNetwork:
                 if i < len(self._layers) - 1:
                     # ReLU for hidden layers
                     a = np.maximum(0, z)
+
+                    # Record activation statistics for adaptive weights
+                    if layer.get("activation_stats") is not None:
+                        # Sum of activations per node (averaged across batch samples)
+                        node_activations = np.mean(a, axis=0)
+                        layer["activation_stats"]["sum"] += node_activations
+                        layer["activation_stats"]["sq_sum"] += node_activations ** 2
+                        layer["activation_stats"]["count"] += 1
+                        # Count dead activations (near zero)
+                        dead_mask = np.mean(np.abs(a) < 1e-7, axis=0)
+                        layer["activation_stats"]["dead_count"] += (dead_mask > 0.99).astype(np.int64)
                 else:
                     # Output layer activation depends on cost function
                     if self.cost_function == "MSE":
@@ -1427,6 +1556,11 @@ class DynamicNetwork:
                     eff_grad_mult = self.efficiency.efficiency_gradient_multiplier
                     self._layers[i]["efficiency"] = eff_decay * self._layers[i]["efficiency"] + eff_scale * np.clip(grad_magnitude * eff_grad_mult, 0, 1)
 
+                    # Record gradient statistics for adaptive weights
+                    if self._layers[i].get("gradient_stats") is not None:
+                        self._layers[i]["gradient_stats"]["sum"] += grad_magnitude
+                        self._layers[i]["gradient_stats"]["count"] += 1
+
                 if i > 0:
                     da = dz @ self._layers[i]["W"]
                     dz = da * (z_values[i - 1] > 0).astype(np.float32)
@@ -1465,6 +1599,99 @@ class DynamicNetwork:
         efficiency = 1.0 / (1.0 + np.exp(-k * scaled_improvement / 5.0))
 
         return efficiency
+
+    def _compute_initial_variance_zscores(self) -> None:
+        """
+        Compute variance z-scores and adapt variance weights for all nodes.
+        Should be called once before training starts, after an initial forward pass.
+        """
+        for layer in self._layers:
+            if layer.get("efficiency_weights") is None:
+                continue
+
+            stats = layer.get("activation_stats")
+            if stats is None or stats["count"] == 0:
+                continue
+
+            # Compute variance for each node
+            n = stats["count"]
+            mean = stats["sum"] / n
+            variance = stats["sq_sum"] / n - mean ** 2
+            variance = np.maximum(variance, 0)  # Handle numerical issues
+
+            # Compute z-scores across nodes in this layer
+            var_mean = np.mean(variance)
+            var_std = np.std(variance)
+            if var_std < 1e-8:
+                var_std = 1e-8
+
+            z_scores = (variance - var_mean) / var_std
+
+            # Adapt variance weights for each node
+            for i, weights in enumerate(layer["efficiency_weights"]):
+                weights.adapt_variance_from_zscore(z_scores[i])
+
+    def _compute_gradient_threshold(self) -> None:
+        """
+        Compute gradient threshold from current gradient statistics.
+        Sets threshold as mean + std of gradient magnitudes.
+        Should be called after Phase 1 (exploration).
+        """
+        for layer in self._layers:
+            if layer.get("efficiency_weights") is None:
+                continue
+
+            stats = layer.get("gradient_stats")
+            if stats is None or stats["count"] == 0:
+                continue
+
+            # Compute mean gradient magnitude per node
+            grad_mags = stats["sum"] / stats["count"]
+
+            # Compute threshold: mean + std
+            threshold = np.mean(grad_mags) + np.std(grad_mags)
+
+            # Set threshold for all nodes in this layer
+            for weights in layer["efficiency_weights"]:
+                weights.grad_threshold = threshold
+
+    def _adapt_node_weights(self) -> None:
+        """
+        Adapt gradient/contribution weights for all nodes based on current gradient statistics.
+        Should be called each epoch after training.
+        """
+        for layer in self._layers:
+            if layer.get("efficiency_weights") is None:
+                continue
+
+            stats = layer.get("gradient_stats")
+            if stats is None or stats["count"] == 0:
+                continue
+
+            # Compute mean gradient magnitude per node
+            grad_mags = stats["sum"] / stats["count"]
+
+            # Adapt weights for each node
+            for i, weights in enumerate(layer["efficiency_weights"]):
+                weights.adapt_gradient_contribution(grad_mags[i])
+
+    def _reset_layer_stats(self) -> None:
+        """Reset activation and gradient statistics for all layers."""
+        for layer in self._layers:
+            if layer.get("activation_stats") is not None:
+                n = layer["W"].shape[0]
+                layer["activation_stats"] = {
+                    "sum": np.zeros(n),
+                    "sq_sum": np.zeros(n),
+                    "count": 0,
+                    "dead_count": np.zeros(n, dtype=np.int64)
+                }
+            if layer.get("gradient_stats") is not None:
+                n = layer["W"].shape[0]
+                layer["gradient_stats"] = {
+                    "sum": np.zeros(n),
+                    "count": 0
+                }
 
     def _compute_health_scores(self, nodes_added: int, nodes_removed: int,
                                layers_added: int, layers_removed: int, epoch: int) -> Tuple[float, float]:
@@ -1959,6 +2186,26 @@ class DynamicNetwork:
         layer["b"] = np.concatenate([layer["b"], new_b])
         layer["efficiency"] = np.concatenate([layer["efficiency"], new_eff])
 
+        # Add efficiency weights for new nodes
+        if layer.get("efficiency_weights") is not None:
+            # Copy threshold from existing nodes if available
+            existing_threshold = layer["efficiency_weights"][0].grad_threshold if layer["efficiency_weights"] else 0.1
+            for _ in range(num_nodes):
+                new_weights = EfficiencyWeights()
+                new_weights.grad_threshold = existing_threshold
+                layer["efficiency_weights"].append(new_weights)
+
+        # Expand activation stats arrays
+        if layer.get("activation_stats") is not None:
+            n = layer["W"].shape[0]
+            layer["activation_stats"]["sum"] = np.concatenate([layer["activation_stats"]["sum"], np.zeros(num_nodes)])
+            layer["activation_stats"]["sq_sum"] = np.concatenate([layer["activation_stats"]["sq_sum"], np.zeros(num_nodes)])
+            layer["activation_stats"]["dead_count"] = np.concatenate([layer["activation_stats"]["dead_count"], np.zeros(num_nodes, dtype=np.int64)])
+
+        # Expand gradient stats arrays
+        if layer.get("gradient_stats") is not None:
+            layer["gradient_stats"]["sum"] = np.concatenate([layer["gradient_stats"]["sum"], np.zeros(num_nodes)])
+
         # Update next layer's input size
         if layer_idx < len(self._layers) - 1:
             next_layer = self._layers[layer_idx + 1]
@@ -1996,6 +2243,20 @@ class DynamicNetwork:
         layer["b"] = layer["b"][indices_to_keep]
         layer["efficiency"] = layer["efficiency"][indices_to_keep]
 
+        # Update efficiency weights
+        if layer.get("efficiency_weights") is not None:
+            layer["efficiency_weights"] = [layer["efficiency_weights"][i] for i in indices_to_keep]
+
+        # Update activation stats
+        if layer.get("activation_stats") is not None:
+            layer["activation_stats"]["sum"] = layer["activation_stats"]["sum"][indices_to_keep]
+            layer["activation_stats"]["sq_sum"] = layer["activation_stats"]["sq_sum"][indices_to_keep]
+            layer["activation_stats"]["dead_count"] = layer["activation_stats"]["dead_count"][indices_to_keep]
+
+        # Update gradient stats
+        if layer.get("gradient_stats") is not None:
+            layer["gradient_stats"]["sum"] = layer["gradient_stats"]["sum"][indices_to_keep]
+
         # Update next layer's input
         if layer_idx < len(self._layers) - 1:
             next_layer = self._layers[layer_idx + 1]
@@ -2022,7 +2283,33 @@ class DynamicNetwork:
         new_b = np.zeros(new_size, dtype=np.float32)
         new_eff = np.ones(new_size) * self.efficiency.initial_efficiency
 
-        new_layer = {"W": new_W, "b": new_b, "efficiency": new_eff}
+        # Get existing gradient threshold from previous layers
+        existing_threshold = 0.1
+        for layer in self._layers:
+            if layer.get("efficiency_weights") is not None and len(layer["efficiency_weights"]) > 0:
+                existing_threshold = layer["efficiency_weights"][0].grad_threshold
+                break
+
+        new_layer = {
+            "W": new_W,
+            "b": new_b,
+            "efficiency": new_eff,
+            "efficiency_weights": [EfficiencyWeights() for _ in range(new_size)],
+            "activation_stats": {
+                "sum": np.zeros(new_size),
+                "sq_sum": np.zeros(new_size),
+                "count": 0,
+                "dead_count": np.zeros(new_size, dtype=np.int64)
+            },
+            "gradient_stats": {
+                "sum": np.zeros(new_size),
+                "count": 0
+            }
+        }
+
+        # Set threshold for all new nodes
+        for weights in new_layer["efficiency_weights"]:
+            weights.grad_threshold = existing_threshold
 
         # Update next layer's input
         next_layer["W"] = np.random.randn(next_layer["W"].shape[0], new_size).astype(np.float32) * np.sqrt(2.0 / new_size)

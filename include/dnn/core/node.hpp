@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cmath>
 #include <atomic>
+#include <array>
 
 namespace dnn {
 namespace core {
@@ -20,6 +21,76 @@ struct NodeMetrics {
     uint64_t dead_count = 0;            // Times activation was zero (for ReLU)
     double efficiency_score = 0.0;      // Computed efficiency (0.0 - 1.0)
     std::string status = "normal";      // "normal", "dead", "saturated", "underutilized"
+};
+
+/**
+ * Adaptive weights for efficiency score computation.
+ * Weights adapt based on network behavior and are constrained to sum to 1.
+ */
+struct EfficiencyWeights {
+    double w_variance = 0.25;
+    double w_gradient = 0.30;
+    double w_alive = 0.25;           // Static, never changes
+    double w_contribution = 0.20;
+    double grad_threshold = 0.1;     // Auto-detected from data
+
+    /**
+     * Normalize weights to sum to 1.0
+     */
+    void normalize() {
+        double sum = w_variance + w_gradient + w_alive + w_contribution;
+        if (sum > 0) {
+            w_variance /= sum;
+            w_gradient /= sum;
+            w_alive /= sum;
+            w_contribution /= sum;
+        }
+    }
+
+    /**
+     * Adapt variance weight based on z-score.
+     * High z-score (high variance) -> lower weight (already good)
+     * Low z-score (low variance) -> higher weight (need improvement)
+     */
+    void adapt_variance_from_zscore(double z) {
+        if (z > 1.0) {
+            w_variance = 0.15;  // High variance already, less emphasis
+        } else if (z < -1.0) {
+            w_variance = 0.35;  // Low variance, more emphasis needed
+        } else {
+            w_variance = 0.25;  // Normal range
+        }
+        normalize();
+    }
+
+    /**
+     * Adapt gradient/contribution weights based on gradient magnitude.
+     * High gradients -> lower gradient weight, higher contribution weight.
+     */
+    void adapt_gradient_contribution(double grad_mag) {
+        if (grad_mag > grad_threshold) {
+            double excess = (grad_mag - grad_threshold) / grad_threshold;
+            double transfer = std::min(0.15, excess * 0.10);
+
+            w_gradient = std::max(0.10, 0.30 - transfer);
+            w_contribution = std::min(0.40, 0.20 + transfer);
+            normalize();
+        }
+    }
+
+    /**
+     * Set gradient threshold (auto-detected from data).
+     */
+    void set_grad_threshold(double threshold) {
+        grad_threshold = threshold;
+    }
+
+    /**
+     * Get current weights as array [var, grad, alive, contrib].
+     */
+    std::array<double, 4> get_weights() const {
+        return {w_variance, w_gradient, w_alive, w_contribution};
+    }
 };
 
 /**
@@ -164,9 +235,47 @@ public:
                std::abs(metrics.activation_mean) > 0.9;
     }
 
+    /**
+     * Get current efficiency weights.
+     */
+    const EfficiencyWeights& efficiency_weights() const {
+        return weights_;
+    }
+
+    /**
+     * Get mutable efficiency weights.
+     */
+    EfficiencyWeights& efficiency_weights() {
+        return weights_;
+    }
+
+    /**
+     * Adapt variance weight based on z-score (called once before training).
+     */
+    void adapt_variance_weight(double z_score) {
+        weights_.adapt_variance_from_zscore(z_score);
+    }
+
+    /**
+     * Adapt gradient/contribution weights based on gradient magnitude.
+     */
+    void adapt_gradient_weight() {
+        if (sample_count_ > 0) {
+            double grad_mag = gradient_sum_ / sample_count_;
+            weights_.adapt_gradient_contribution(grad_mag);
+        }
+    }
+
+    /**
+     * Set gradient threshold for adaptive weights.
+     */
+    void set_grad_threshold(double threshold) {
+        weights_.set_grad_threshold(threshold);
+    }
+
 private:
     double compute_efficiency_score(const NodeMetrics& metrics) const {
-        // Weighted combination of factors
+        // Weighted combination of factors using adaptive weights
 
         // 1. Variance score: nodes should have varied activations
         //    Too low variance = potentially dead or saturated
@@ -183,12 +292,12 @@ private:
         // 4. Contribution score
         double contribution_score = std::min(1.0, metrics.contribution_score / 0.1);
 
-        // Weighted combination
+        // Weighted combination using adaptive weights
         double efficiency =
-            0.25 * variance_score +
-            0.30 * gradient_score +
-            0.25 * alive_score +
-            0.20 * contribution_score;
+            weights_.w_variance * variance_score +
+            weights_.w_gradient * gradient_score +
+            weights_.w_alive * alive_score +
+            weights_.w_contribution * contribution_score;
 
         return std::max(0.0, std::min(1.0, efficiency));
     }
@@ -225,6 +334,9 @@ private:
     double contribution_sum_;
     uint64_t sample_count_;
     uint64_t dead_count_;
+
+    // Adaptive efficiency weights
+    EfficiencyWeights weights_;
 };
 
 } // namespace core

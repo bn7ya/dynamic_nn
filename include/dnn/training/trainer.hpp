@@ -329,6 +329,20 @@ public:
         std::vector<Tensor<T>> norm_targets = targets;
         normalize_data(norm_inputs, norm_targets);
 
+        // ============ PRE-TRAINING: ADAPTIVE WEIGHT INITIALIZATION ============
+        // Run a forward pass to collect initial activation statistics
+        for (size_t i = 0; i < std::min(size_t(100), norm_inputs.size()); ++i) {
+            network_.forward(norm_inputs[i]);
+        }
+        // Compute variance z-scores and adapt variance weights for all layers
+        for (size_t l = 0; l < network_.num_layers(); ++l) {
+            network_.layer(l).compute_initial_variance_zscores();
+        }
+        // Reset metrics after initial pass
+        for (size_t l = 0; l < network_.num_layers(); ++l) {
+            network_.layer(l).reset_node_metrics();
+        }
+
         // ============ PHASE 1: EXPLORATION (10 epochs) ============
         auto phase1_start = std::chrono::high_resolution_clock::now();
         double exploration_lr = 0.5;  // High LR for wide exploration
@@ -371,6 +385,13 @@ public:
         auto phase1_end = std::chrono::high_resolution_clock::now();
         result.phase1_time = std::chrono::duration<double>(phase1_end - phase1_start).count();
 
+        // ============ POST-PHASE 1: COMPUTE GRADIENT THRESHOLDS ============
+        // Auto-detect gradient thresholds based on Phase 1 statistics
+        for (size_t l = 0; l < network_.num_layers(); ++l) {
+            double grad_threshold = network_.layer(l).compute_gradient_threshold();
+            network_.layer(l).set_nodes_grad_threshold(grad_threshold);
+        }
+
         // ============ PHASE 2: ESTIMATION (10 epochs) ============
         auto phase2_start = std::chrono::high_resolution_clock::now();
         double estimation_lr = 0.1;  // Medium LR
@@ -390,6 +411,11 @@ public:
 
             double efficiency = compute_efficiency(result.cost_history);
             result.efficiency_history.push_back(efficiency);
+
+            // Adapt efficiency weights based on gradient statistics
+            for (size_t l = 0; l < network_.num_layers(); ++l) {
+                network_.layer(l).adapt_node_weights();
+            }
         }
 
         // Estimate epochs needed
@@ -452,6 +478,11 @@ public:
             // Learning rate decay
             if (epoch > 0 && epoch % 20 == 0) {
                 main_lr *= 0.8;
+            }
+
+            // Adapt efficiency weights based on gradient statistics
+            for (size_t l = 0; l < network_.num_layers(); ++l) {
+                network_.layer(l).adapt_node_weights();
             }
 
             // Early stopping
@@ -519,6 +550,11 @@ public:
                 if (epoch > 0 && epoch % config_.phase4_lr_decay_interval == 0) {
                     phase4_lr = std::max(config_.phase4_min_learning_rate,
                                         phase4_lr * config_.phase4_lr_decay_rate);
+                }
+
+                // Adapt efficiency weights based on gradient statistics
+                for (size_t l = 0; l < network_.num_layers(); ++l) {
+                    network_.layer(l).adapt_node_weights();
                 }
 
                 // Callback
