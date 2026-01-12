@@ -3,3 +3,6 @@
 *.pyc
 *.png
 python/pydnn/__pycache__/network.cpython-314.pyc
+
+build/
+nul

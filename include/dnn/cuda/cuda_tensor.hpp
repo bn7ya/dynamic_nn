@@ -1,10 +1,14 @@
 #pragma once
 
 /**
- * CUDA Tensor - GPU tensor stub for future implementation.
+ * CUDA Tensor - GPU tensor for accelerated operations.
  *
- * Provides interface for GPU-accelerated tensor operations.
- * Currently implemented as stubs that throw when CUDA is not enabled.
+ * When DNN_ENABLE_CUDA is defined:
+ * - Uses GPU memory via CUDA memory pool for efficient allocation
+ * - Provides data transfer between CPU and GPU
+ *
+ * When DNN_ENABLE_CUDA is NOT defined:
+ * - Throws runtime_error when attempting to create a CudaTensor
  */
 
 #include "cuda_stubs.hpp"
@@ -12,20 +16,25 @@
 #include <memory>
 #include <stdexcept>
 
+#ifdef DNN_ENABLE_CUDA
+#include "cuda_memory_pool.hpp"
+#endif
+
 namespace dnn {
 namespace cuda {
 
 /**
- * GPU Tensor class (stub implementation).
+ * GPU Tensor class.
  *
- * When CUDA is enabled, this class will manage GPU memory and
- * provide accelerated tensor operations.
+ * Manages GPU memory and provides data transfer operations.
+ * Move-only semantics to prevent accidental GPU memory copies.
  */
 template<typename T = float>
 class CudaTensor {
 public:
     /**
-     * Create empty tensor on GPU.
+     * Create tensor on GPU with given shape.
+     * Allocates GPU memory but does not initialize values.
      */
     explicit CudaTensor(const std::vector<size_t>& shape)
         : shape_(shape)
@@ -40,13 +49,25 @@ public:
                 "CudaTensor requires CUDA. Use core::Tensor for CPU operations."
             );
         }
+
+        // Allocate GPU memory
+        allocate();
     }
 
     /**
      * Create tensor from CPU tensor (copy to GPU).
      */
     explicit CudaTensor(const core::Tensor<T>& cpu_tensor)
-        : CudaTensor(cpu_tensor.shape()) {
+        : shape_(cpu_tensor.shape())
+        , size_(cpu_tensor.size())
+        , device_ptr_(nullptr) {
+        if (!is_cuda_available()) {
+            throw std::runtime_error(
+                "CudaTensor requires CUDA. Use core::Tensor for CPU operations."
+            );
+        }
+
+        allocate();
         to_device(cpu_tensor);
     }
 
@@ -54,13 +75,7 @@ public:
      * Destructor - free GPU memory.
      */
     ~CudaTensor() {
-        if (device_ptr_) {
-            try {
-                cuda_free(device_ptr_);
-            } catch (...) {
-                // Ignore errors during destruction
-            }
-        }
+        deallocate();
     }
 
     // Disable copy (GPU memory management)
@@ -78,9 +93,7 @@ public:
 
     CudaTensor& operator=(CudaTensor&& other) noexcept {
         if (this != &other) {
-            if (device_ptr_) {
-                cuda_free(device_ptr_);
-            }
+            deallocate();
             shape_ = std::move(other.shape_);
             size_ = other.size_;
             device_ptr_ = other.device_ptr_;
@@ -103,7 +116,7 @@ public:
         }
 
         if (!device_ptr_) {
-            device_ptr_ = cuda_malloc(size_ * sizeof(T), MemoryType::Device);
+            allocate();
         }
 
         cuda_memcpy(device_ptr_, cpu_tensor.data(),
@@ -124,10 +137,28 @@ public:
         return cpu_tensor;
     }
 
+    /**
+     * Copy data to existing CPU tensor.
+     */
+    void to_host(core::Tensor<T>& cpu_tensor) const {
+        if (!is_cuda_available() || !device_ptr_) {
+            throw std::runtime_error("No GPU data to copy");
+        }
+
+        if (cpu_tensor.size() != size_) {
+            throw std::runtime_error("Size mismatch in to_host");
+        }
+
+        cuda_memcpy(cpu_tensor.data(), device_ptr_,
+                   size_ * sizeof(T), MemcpyKind::DeviceToHost);
+    }
+
     // Accessors
     const std::vector<size_t>& shape() const { return shape_; }
     size_t size() const { return size_; }
     size_t ndim() const { return shape_.size(); }
+    size_t bytes() const { return size_ * sizeof(T); }
+
     void* device_data() { return device_ptr_; }
     const void* device_data() const { return device_ptr_; }
 
@@ -136,7 +167,47 @@ public:
      */
     bool is_allocated() const { return device_ptr_ != nullptr; }
 
+    /**
+     * Reshape tensor (must preserve total size).
+     */
+    void reshape(const std::vector<size_t>& new_shape) {
+        size_t new_size = 1;
+        for (auto dim : new_shape) {
+            new_size *= dim;
+        }
+        if (new_size != size_) {
+            throw std::runtime_error("Reshape size mismatch");
+        }
+        shape_ = new_shape;
+    }
+
 private:
+    void allocate() {
+        if (size_ == 0) return;
+
+#ifdef DNN_ENABLE_CUDA
+        // Use memory pool for efficient allocation
+        device_ptr_ = CudaMemoryPool::instance().allocate(size_ * sizeof(T));
+#else
+        device_ptr_ = cuda_malloc(size_ * sizeof(T), MemoryType::Device);
+#endif
+    }
+
+    void deallocate() {
+        if (device_ptr_) {
+            try {
+#ifdef DNN_ENABLE_CUDA
+                CudaMemoryPool::instance().deallocate(device_ptr_);
+#else
+                cuda_free(device_ptr_);
+#endif
+            } catch (...) {
+                // Ignore errors during destruction
+            }
+            device_ptr_ = nullptr;
+        }
+    }
+
     std::vector<size_t> shape_;
     size_t size_;
     void* device_ptr_;

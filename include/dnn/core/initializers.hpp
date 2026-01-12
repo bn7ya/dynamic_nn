@@ -281,11 +281,11 @@ public:
         size_t n = std::max(rows, cols);
 
         // Generate random matrix
-        Tensor<T> random({n, n});
+        Tensor<T> random(std::vector<size_t>{n, n});
         rng.fill_normal(random, T(0), T(1));
 
         // QR decomposition (simplified Gram-Schmidt)
-        Tensor<T> Q({n, n});
+        Tensor<T> Q(std::vector<size_t>{n, n});
         for (size_t i = 0; i < n; ++i) {
             // Copy column i
             for (size_t j = 0; j < n; ++j) {

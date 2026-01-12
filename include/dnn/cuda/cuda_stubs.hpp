@@ -1,14 +1,18 @@
 #pragma once
 
 /**
- * CUDA Stubs - Placeholder interfaces for future GPU acceleration.
+ * CUDA Interface - GPU acceleration support.
  *
- * This file provides stub implementations that compile without CUDA.
- * When CUDA support is implemented, these stubs will be replaced with
- * actual CUDA implementations.
+ * When DNN_ENABLE_CUDA is defined:
+ * - Functions are implemented in cuda_runtime.cu
+ * - Full CUDA functionality is available
+ *
+ * When DNN_ENABLE_CUDA is NOT defined:
+ * - Stub implementations are used
+ * - Functions throw runtime_error or return defaults
  *
  * To enable CUDA, define DNN_ENABLE_CUDA before including this header
- * and link against the CUDA runtime.
+ * and link against the CUDA runtime and cuBLAS.
  */
 
 #include <cstddef>
@@ -19,19 +23,13 @@
 namespace dnn {
 namespace cuda {
 
-/**
- * CUDA availability check.
- */
-inline bool is_cuda_available() {
-#ifdef DNN_ENABLE_CUDA
-    return true;  // Would actually check cudaGetDeviceCount
-#else
-    return false;
-#endif
-}
+// ============================================================================
+// Device Information Structure
+// ============================================================================
 
 /**
- * Device information.
+ * Device information structure.
+ * Holds properties of a CUDA device.
  */
 struct DeviceInfo {
     int device_id = -1;
@@ -45,38 +43,9 @@ struct DeviceInfo {
     bool supports_tensor_cores = false;
 };
 
-/**
- * Get device information.
- */
-inline DeviceInfo get_device_info(int device_id = 0) {
-    (void)device_id;  // Suppress unused warning
-    DeviceInfo info;
-    info.device_id = -1;
-    info.name = "CUDA not enabled - using CPU";
-    return info;
-}
-
-/**
- * Get number of available CUDA devices.
- */
-inline int get_device_count() {
-    return 0;  // No devices when CUDA not enabled
-}
-
-/**
- * Set current CUDA device.
- */
-inline void set_device(int device_id) {
-    (void)device_id;
-    throw std::runtime_error("CUDA not enabled. Rebuild with DNN_ENABLE_CUDA to use GPU.");
-}
-
-/**
- * Synchronize current device.
- */
-inline void device_synchronize() {
-    // No-op without CUDA
-}
+// ============================================================================
+// Memory Types and Enums
+// ============================================================================
 
 /**
  * Memory allocation type.
@@ -86,23 +55,6 @@ enum class MemoryType {
     Pinned,      // Pinned host memory (faster transfers)
     Managed      // Unified memory (auto-migrates)
 };
-
-/**
- * CUDA memory allocation (stub).
- */
-inline void* cuda_malloc(size_t bytes, MemoryType type = MemoryType::Device) {
-    (void)bytes;
-    (void)type;
-    throw std::runtime_error("CUDA not enabled. Cannot allocate GPU memory.");
-}
-
-/**
- * CUDA memory free (stub).
- */
-inline void cuda_free(void* ptr) {
-    (void)ptr;
-    throw std::runtime_error("CUDA not enabled. Cannot free GPU memory.");
-}
 
 /**
  * Memory copy direction.
@@ -115,8 +67,145 @@ enum class MemcpyKind {
 };
 
 /**
- * CUDA memcpy (stub).
+ * CUDA stream handle.
  */
+using CudaStream = void*;
+
+/**
+ * CUDA event for timing.
+ */
+struct CudaEvent {
+    void* handle = nullptr;
+};
+
+// ============================================================================
+// Function Declarations / Stubs
+// ============================================================================
+
+#ifdef DNN_ENABLE_CUDA
+
+// When CUDA is enabled, these are implemented in cuda_runtime.cu
+
+/**
+ * Check if CUDA is available (has working GPU).
+ */
+bool is_cuda_available();
+
+/**
+ * Get device information.
+ */
+DeviceInfo get_device_info(int device_id = 0);
+
+/**
+ * Get number of available CUDA devices.
+ */
+int get_device_count();
+
+/**
+ * Set current CUDA device.
+ */
+void set_device(int device_id);
+
+/**
+ * Synchronize current device.
+ */
+void device_synchronize();
+
+/**
+ * Allocate GPU memory.
+ */
+void* cuda_malloc(size_t bytes, MemoryType type = MemoryType::Device);
+
+/**
+ * Free GPU memory.
+ */
+void cuda_free(void* ptr);
+
+/**
+ * Copy memory between host and device.
+ */
+void cuda_memcpy(void* dst, const void* src, size_t bytes, MemcpyKind kind);
+
+/**
+ * Create CUDA stream.
+ */
+CudaStream create_stream();
+
+/**
+ * Destroy CUDA stream.
+ */
+void destroy_stream(CudaStream stream);
+
+/**
+ * Synchronize stream.
+ */
+void stream_synchronize(CudaStream stream);
+
+/**
+ * Check for CUDA errors.
+ */
+void check_cuda_error(const char* file, int line);
+
+/**
+ * Create CUDA event.
+ */
+CudaEvent create_event();
+
+/**
+ * Destroy CUDA event.
+ */
+void destroy_event(CudaEvent& event);
+
+/**
+ * Record event on stream.
+ */
+void record_event(CudaEvent& event, CudaStream stream = nullptr);
+
+/**
+ * Get elapsed time between two events (milliseconds).
+ */
+float elapsed_time(CudaEvent& start, CudaEvent& end);
+
+#else // !DNN_ENABLE_CUDA
+
+// Stub implementations when CUDA is not enabled
+
+inline bool is_cuda_available() {
+    return false;
+}
+
+inline DeviceInfo get_device_info(int device_id = 0) {
+    (void)device_id;
+    DeviceInfo info;
+    info.device_id = -1;
+    info.name = "CUDA not enabled - using CPU";
+    return info;
+}
+
+inline int get_device_count() {
+    return 0;
+}
+
+inline void set_device(int device_id) {
+    (void)device_id;
+    throw std::runtime_error("CUDA not enabled. Rebuild with DNN_ENABLE_CUDA to use GPU.");
+}
+
+inline void device_synchronize() {
+    // No-op without CUDA
+}
+
+inline void* cuda_malloc(size_t bytes, MemoryType type = MemoryType::Device) {
+    (void)bytes;
+    (void)type;
+    throw std::runtime_error("CUDA not enabled. Cannot allocate GPU memory.");
+}
+
+inline void cuda_free(void* ptr) {
+    (void)ptr;
+    throw std::runtime_error("CUDA not enabled. Cannot free GPU memory.");
+}
+
 inline void cuda_memcpy(void* dst, const void* src, size_t bytes, MemcpyKind kind) {
     (void)dst;
     (void)src;
@@ -125,49 +214,22 @@ inline void cuda_memcpy(void* dst, const void* src, size_t bytes, MemcpyKind kin
     throw std::runtime_error("CUDA not enabled. Cannot perform GPU memory copy.");
 }
 
-/**
- * CUDA stream handle (stub).
- */
-using CudaStream = void*;
-
-/**
- * Create CUDA stream (stub).
- */
 inline CudaStream create_stream() {
     throw std::runtime_error("CUDA not enabled. Cannot create stream.");
 }
 
-/**
- * Destroy CUDA stream (stub).
- */
 inline void destroy_stream(CudaStream stream) {
     (void)stream;
 }
 
-/**
- * Synchronize stream (stub).
- */
 inline void stream_synchronize(CudaStream stream) {
     (void)stream;
 }
 
-/**
- * Check for CUDA errors (stub).
- */
 inline void check_cuda_error(const char* file, int line) {
     (void)file;
     (void)line;
-    // No-op without CUDA
 }
-
-#define CUDA_CHECK() ::dnn::cuda::check_cuda_error(__FILE__, __LINE__)
-
-/**
- * CUDA event for timing (stub).
- */
-struct CudaEvent {
-    void* handle = nullptr;
-};
 
 inline CudaEvent create_event() {
     throw std::runtime_error("CUDA not enabled. Cannot create event.");
@@ -187,6 +249,16 @@ inline float elapsed_time(CudaEvent& start, CudaEvent& end) {
     (void)end;
     return 0.0f;
 }
+
+#endif // DNN_ENABLE_CUDA
+
+// ============================================================================
+// Error Checking Macro
+// ============================================================================
+
+#ifndef DNN_ENABLE_CUDA
+#define CUDA_CHECK() ::dnn::cuda::check_cuda_error(__FILE__, __LINE__)
+#endif
 
 } // namespace cuda
 } // namespace dnn

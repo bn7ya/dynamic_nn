@@ -63,8 +63,8 @@ public:
         , input_size_(input_size)
         , output_size_(output_size)
         , activation_type_(activation)
-        , weights_({output_size, input_size})
-        , biases_({output_size})
+        , weights_(std::vector<size_t>{output_size, input_size})
+        , biases_(std::vector<size_t>{output_size})
         , rng_(std::make_unique<Random>(seed)) {
 
         // Initialize nodes
@@ -96,7 +96,7 @@ public:
 
         if (input.rank() == 1) {
             // Single sample: input is (input_size,)
-            linear_output = Tensor<T>({output_size_});
+            linear_output = Tensor<T>(std::vector<size_t>{output_size_});
             for (size_t i = 0; i < output_size_; ++i) {
                 T sum = biases_[i];
                 for (size_t j = 0; j < input_size_; ++j) {
@@ -110,7 +110,7 @@ public:
         } else if (input.rank() == 2) {
             // Batch: input is (batch_size, input_size)
             size_t batch_size = input.shape()[0];
-            linear_output = Tensor<T>({batch_size, output_size_});
+            linear_output = Tensor<T>(std::vector<size_t>{batch_size, output_size_});
 
             for (size_t b = 0; b < batch_size; ++b) {
                 for (size_t i = 0; i < output_size_; ++i) {
@@ -161,7 +161,7 @@ public:
             }
 
             // Compute input gradient: grad_input = weights^T @ grad_activation
-            Tensor<T> grad_input({input_size_});
+            Tensor<T> grad_input(std::vector<size_t>{input_size_});
             for (size_t j = 0; j < input_size_; ++j) {
                 T sum = T(0);
                 for (size_t i = 0; i < output_size_; ++i) {
@@ -188,7 +188,7 @@ public:
             }
 
             // Compute input gradient
-            Tensor<T> grad_input({batch_size, input_size_});
+            Tensor<T> grad_input(std::vector<size_t>{batch_size, input_size_});
             for (size_t b = 0; b < batch_size; ++b) {
                 for (size_t j = 0; j < input_size_; ++j) {
                     T sum = T(0);
@@ -227,8 +227,8 @@ public:
      */
     void zero_gradients() {
         if (weight_gradients_.empty()) {
-            weight_gradients_ = Tensor<T>({output_size_, input_size_}, T(0));
-            bias_gradients_ = Tensor<T>({output_size_}, T(0));
+            weight_gradients_ = Tensor<T>(std::vector<size_t>{output_size_, input_size_}, T(0));
+            bias_gradients_ = Tensor<T>(std::vector<size_t>{output_size_}, T(0));
         } else {
             weight_gradients_.fill(T(0));
             bias_gradients_.fill(T(0));
@@ -456,7 +456,7 @@ public:
         }
 
         // Expand weights matrix
-        Tensor<T> new_weights({output_size_, input_size_});
+        Tensor<T> new_weights(std::vector<size_t>{output_size_, input_size_});
 
         // Copy old weights
         for (size_t i = 0; i < old_output_size; ++i) {
@@ -475,7 +475,7 @@ public:
         weights_ = std::move(new_weights);
 
         // Expand biases
-        Tensor<T> new_biases({output_size_}, T(0));
+        Tensor<T> new_biases(std::vector<size_t>{output_size_}, T(0));
         for (size_t i = 0; i < old_output_size; ++i) {
             new_biases[i] = biases_[i];
         }
@@ -505,8 +505,8 @@ public:
 
         // Rebuild weights matrix
         size_t new_output_size = nodes_.size();
-        Tensor<T> new_weights({new_output_size, input_size_});
-        Tensor<T> new_biases({new_output_size});
+        Tensor<T> new_weights(std::vector<size_t>{new_output_size, input_size_});
+        Tensor<T> new_biases(std::vector<size_t>{new_output_size});
 
         size_t dest_i = 0;
         for (size_t i = 0; i < output_size_; ++i) {

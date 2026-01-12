@@ -2,20 +2,26 @@
 
 #include "simd_ops.hpp"
 
-#if defined(__AVX__) || defined(__AVX2__) || defined(DNN_ENABLE_AVX)
+#if defined(__AVX__) || defined(__AVX2__) || defined(DNN_ENABLE_AVX) || \
+    (defined(_MSC_VER) && defined(__AVX2__))
 #include <immintrin.h>
 #endif
 
 namespace dnn {
 namespace simd {
 
-#if defined(__AVX__) || defined(__AVX2__) || defined(DNN_ENABLE_AVX)
+// Forward declaration for template specialization
+template<typename T>
+class AVXOps;
+
+#if defined(__AVX__) || defined(__AVX2__) || defined(DNN_ENABLE_AVX) || \
+    (defined(_MSC_VER) && defined(__AVX2__))
 
 /**
  * AVX/AVX2 optimized operations for float.
  */
 template<>
-class AVXOps : public SIMDOps<float> {
+class AVXOps<float> : public SIMDOps<float> {
 public:
     void add(const float* a, const float* b, float* c, size_t n) const override {
         size_t i = 0;

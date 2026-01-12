@@ -5,6 +5,7 @@
 #include "cost_functions.hpp"
 #include "batch_manager.hpp"
 #include "early_stopping.hpp"
+#include "emotional_state.hpp"
 #include "../dynamics/layer_manager.hpp"
 #include "../dynamics/health_monitor.hpp"
 #include "../dynamics/trainable_scheduler.hpp"
@@ -58,6 +59,15 @@ struct TrainingResult {
     double phase4_cost_reduction = 0.0;
     bool phase4_early_stopped = false;
     size_t phase4_estimated_epochs = 0;
+
+    // Emotional learning fields (for Python parity)
+    int total_rewards = 0;
+    int total_penalties = 0;
+    std::vector<double> depression_history;
+    std::vector<double> excitement_history;
+    std::vector<double> learning_rate_history;
+    std::vector<std::string> emotional_state_history;
+    int lr_reset_count = 0;
 };
 
 /**
@@ -434,6 +444,11 @@ public:
         double main_lr = 0.1;
         size_t perturbation_cutoff = result.estimated_epochs / 5;  // First 20%
 
+        // Initialize emotional learning state
+        EmotionalState emotional_state;
+        RewardPenaltyConfig reward_penalty_config;
+        reward_penalty_config.baseline_learning_rate = main_lr;
+
         for (size_t epoch = 0; epoch < result.estimated_epochs; ++epoch) {
             health_monitor_.update_epoch(20 + epoch);
 
@@ -475,10 +490,15 @@ public:
                 result.best_efficiency = efficiency;
             }
 
-            // Learning rate decay
-            if (epoch > 0 && epoch % 20 == 0) {
-                main_lr *= 0.8;
-            }
+            // Apply reward/penalty system (matches Python implementation)
+            auto [new_lr, action] = apply_reward_penalty_system(
+                main_lr, result.cost_history, result.efficiency_history,
+                reward_penalty_config, emotional_state);
+            main_lr = new_lr;
+
+            // Track emotional learning metrics
+            result.learning_rate_history.push_back(main_lr);
+            result.emotional_state_history.push_back(action);
 
             // Adapt efficiency weights based on gradient statistics
             for (size_t l = 0; l < network_.num_layers(); ++l) {
@@ -495,6 +515,17 @@ public:
                 }
             }
         }
+
+        // Copy emotional state to result
+        result.total_rewards = emotional_state.total_rewards;
+        result.total_penalties = emotional_state.total_penalties;
+        result.lr_reset_count = emotional_state.lr_reset_count;
+        result.depression_history.assign(
+            emotional_state.depression_history.begin(),
+            emotional_state.depression_history.end());
+        result.excitement_history.assign(
+            emotional_state.excitement_history.begin(),
+            emotional_state.excitement_history.end());
 
         auto phase3_end = std::chrono::high_resolution_clock::now();
         result.phase3_time = std::chrono::duration<double>(phase3_end - phase3_start).count();
@@ -908,7 +939,7 @@ private:
         // Compute output normalization params (only for regression)
         bool is_regression = (cost_type_ == CostFunctionType::MeanSquaredError ||
                              cost_type_ == CostFunctionType::MeanAbsoluteError ||
-                             cost_type_ == CostFunctionType::Huber ||
+                             cost_type_ == CostFunctionType::HuberLoss ||
                              cost_type_ == CostFunctionType::LogCosh);
 
         if (config_.normalization.normalize_output && is_regression) {

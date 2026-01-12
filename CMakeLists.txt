@@ -12,6 +12,51 @@ option(DNN_BUILD_EXAMPLES "Build examples" ON)
 option(DNN_ENABLE_AVX "Enable AVX optimizations" ON)
 option(DNN_ENABLE_AVX2 "Enable AVX2 optimizations" ON)
 option(DNN_ENABLE_AVX512 "Enable AVX512 optimizations" OFF)
+option(DNN_ENABLE_CUDA "Enable CUDA GPU acceleration" ON)
+
+# CUDA Configuration
+if(DNN_ENABLE_CUDA)
+    include(CheckLanguage)
+    check_language(CUDA)
+
+    if(CMAKE_CUDA_COMPILER)
+        enable_language(CUDA)
+        find_package(CUDAToolkit REQUIRED)
+
+        # Set CUDA standard
+        set(CMAKE_CUDA_STANDARD 17)
+        set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+
+        # Compute capabilities: Turing(75), Ampere(80,86), Ada(89), Blackwell(100)
+        set(DNN_CUDA_ARCHITECTURES "75;80;86;89;100" CACHE STRING "CUDA architectures to compile for")
+        set(CMAKE_CUDA_ARCHITECTURES ${DNN_CUDA_ARCHITECTURES})
+
+        # CUDA compiler flags
+        if(MSVC)
+            set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=/W3")
+            set(CMAKE_CUDA_FLAGS_RELEASE "${CMAKE_CUDA_FLAGS_RELEASE} -Xcompiler=/O2")
+        else()
+            set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=-Wall")
+            set(CMAKE_CUDA_FLAGS_RELEASE "${CMAKE_CUDA_FLAGS_RELEASE} -O3")
+        endif()
+
+        # Optional fast math
+        option(DNN_CUDA_FAST_MATH "Enable CUDA fast math" OFF)
+        if(DNN_CUDA_FAST_MATH)
+            set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --use_fast_math")
+        endif()
+
+        set(DNN_HAS_CUDA TRUE)
+        message(STATUS "CUDA enabled with architectures: ${DNN_CUDA_ARCHITECTURES}")
+        message(STATUS "CUDA Toolkit version: ${CUDAToolkit_VERSION}")
+    else()
+        message(STATUS "CUDA compiler not found, CUDA support disabled")
+        set(DNN_HAS_CUDA FALSE)
+    endif()
+else()
+    set(DNN_HAS_CUDA FALSE)
+    message(STATUS "CUDA support disabled by user")
+endif()
 
 # Detect architecture
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
@@ -22,25 +67,39 @@ endif()
 
 message(STATUS "Building for architecture: ${DNN_ARCH}")
 
-# Compiler flags
+# Compiler flags (use generator expressions to avoid passing C++ flags to CUDA compiler)
 if(MSVC)
-    add_compile_options(/W4 /permissive-)
+    add_compile_options(
+        $<$<COMPILE_LANGUAGE:CXX>:/W4>
+        $<$<COMPILE_LANGUAGE:CXX>:/permissive->
+    )
     if(DNN_ENABLE_AVX2)
-        add_compile_options(/arch:AVX2)
+        add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/arch:AVX2>)
     elseif(DNN_ENABLE_AVX)
-        add_compile_options(/arch:AVX)
+        add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/arch:AVX>)
     endif()
     # Optimization flags for Release
     set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /O2 /Ob2 /Oi /Ot /GL")
     set(CMAKE_EXE_LINKER_FLAGS_RELEASE "${CMAKE_EXE_LINKER_FLAGS_RELEASE} /LTCG")
 else()
-    add_compile_options(-Wall -Wextra -Wpedantic)
+    add_compile_options(
+        $<$<COMPILE_LANGUAGE:CXX>:-Wall>
+        $<$<COMPILE_LANGUAGE:CXX>:-Wextra>
+        $<$<COMPILE_LANGUAGE:CXX>:-Wpedantic>
+    )
     if(DNN_ENABLE_AVX512)
-        add_compile_options(-mavx512f -mavx512dq -mavx512vl)
+        add_compile_options(
+            $<$<COMPILE_LANGUAGE:CXX>:-mavx512f>
+            $<$<COMPILE_LANGUAGE:CXX>:-mavx512dq>
+            $<$<COMPILE_LANGUAGE:CXX>:-mavx512vl>
+        )
     elseif(DNN_ENABLE_AVX2)
-        add_compile_options(-mavx2 -mfma)
+        add_compile_options(
+            $<$<COMPILE_LANGUAGE:CXX>:-mavx2>
+            $<$<COMPILE_LANGUAGE:CXX>:-mfma>
+        )
     elseif(DNN_ENABLE_AVX)
-        add_compile_options(-mavx)
+        add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-mavx>)
     endif()
     # Optimization flags for Release
     set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -march=native -flto")
@@ -93,16 +152,43 @@ set(DNN_IO_SOURCES
     src/io/model_serializer.cpp
 )
 
+# CUDA sources (only if CUDA is available)
+if(DNN_HAS_CUDA)
+    set(DNN_CUDA_SOURCES
+        src/cuda/cuda_runtime.cu
+        src/cuda/cuda_blas.cu
+        src/cuda/cuda_elementwise.cu
+        src/cuda/cuda_activations.cu
+        src/cuda/cuda_reductions.cu
+        src/cuda/cuda_memory_pool.cu
+        src/cuda/cuda_optimizers.cu
+    )
+    set_source_files_properties(${DNN_CUDA_SOURCES} PROPERTIES LANGUAGE CUDA)
+endif()
+
 # Core library
-add_library(dnn_core STATIC
-    ${DNN_CORE_SOURCES}
-    ${DNN_MEMORY_SOURCES}
-    ${DNN_SIMD_SOURCES}
-    ${DNN_TRAINING_SOURCES}
-    ${DNN_DYNAMICS_SOURCES}
-    ${DNN_CQRS_SOURCES}
-    ${DNN_IO_SOURCES}
-)
+if(DNN_HAS_CUDA)
+    add_library(dnn_core STATIC
+        ${DNN_CORE_SOURCES}
+        ${DNN_MEMORY_SOURCES}
+        ${DNN_SIMD_SOURCES}
+        ${DNN_TRAINING_SOURCES}
+        ${DNN_DYNAMICS_SOURCES}
+        ${DNN_CQRS_SOURCES}
+        ${DNN_IO_SOURCES}
+        ${DNN_CUDA_SOURCES}
+    )
+else()
+    add_library(dnn_core STATIC
+        ${DNN_CORE_SOURCES}
+        ${DNN_MEMORY_SOURCES}
+        ${DNN_SIMD_SOURCES}
+        ${DNN_TRAINING_SOURCES}
+        ${DNN_DYNAMICS_SOURCES}
+        ${DNN_CQRS_SOURCES}
+        ${DNN_IO_SOURCES}
+    )
+endif()
 
 target_include_directories(dnn_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -115,6 +201,18 @@ target_compile_definitions(dnn_core PRIVATE
     $<$<BOOL:${DNN_ENABLE_AVX2}>:DNN_ENABLE_AVX2>
     $<$<BOOL:${DNN_ENABLE_AVX512}>:DNN_ENABLE_AVX512>
 )
+
+# Windows: disable min/max macros that conflict with std::min/std::max
+if(MSVC)
+    target_compile_definitions(dnn_core PUBLIC NOMINMAX)
+endif()
+
+# CUDA compile definitions and linking
+if(DNN_HAS_CUDA)
+    target_compile_definitions(dnn_core PUBLIC DNN_ENABLE_CUDA)
+    target_include_directories(dnn_core PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
+    target_link_libraries(dnn_core PUBLIC CUDA::cudart CUDA::cublas)
+endif()
 
 # Thread support
 find_package(Threads REQUIRED)

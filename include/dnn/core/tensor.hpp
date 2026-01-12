@@ -353,7 +353,7 @@ public:
         size_t k = shape_[1];
         size_t n = other.shape_[1];
 
-        Tensor result({m, n});
+        Tensor result(shape_type{m, n});
         simd::ScalarOps<T> ops;
         ops.matmul(data_, other.data_, result.data_,
                    m, k, n, k, n, n);
@@ -368,7 +368,7 @@ public:
             throw exceptions::ShapeException("transpose", "Tensor must be 2D");
         }
 
-        Tensor result({shape_[1], shape_[0]});
+        Tensor result(shape_type{shape_[1], shape_[0]});
         for (size_t i = 0; i < shape_[0]; ++i) {
             for (size_t j = 0; j < shape_[1]; ++j) {
                 result.at(j, i) = at(i, j);
@@ -414,7 +414,7 @@ public:
         if (rank() != 2) {
             throw exceptions::ShapeException("row", "Tensor must be 2D");
         }
-        Tensor result({shape_[1]});
+        Tensor result(shape_type{shape_[1]});
         for (size_t j = 0; j < shape_[1]; ++j) {
             result[j] = at(i, j);
         }
@@ -428,7 +428,7 @@ public:
         if (rank() != 2) {
             throw exceptions::ShapeException("col", "Tensor must be 2D");
         }
-        Tensor result({shape_[0]});
+        Tensor result(shape_type{shape_[0]});
         for (size_t i = 0; i < shape_[0]; ++i) {
             result[i] = at(i, j);
         }
@@ -476,7 +476,7 @@ public:
     }
 
     static Tensor eye(size_t n) {
-        Tensor result({n, n}, T(0));
+        Tensor result(shape_type{n, n}, T(0));
         for (size_t i = 0; i < n; ++i) {
             result.at(i, i) = T(1);
         }

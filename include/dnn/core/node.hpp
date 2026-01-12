@@ -5,6 +5,7 @@
 #include <cmath>
 #include <atomic>
 #include <array>
+#include <string>
 
 namespace dnn {
 namespace core {

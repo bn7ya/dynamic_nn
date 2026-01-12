@@ -3,6 +3,7 @@
 #include "tensor.hpp"
 #include <random>
 #include <cstdint>
+#include <unordered_set>
 
 namespace dnn {
 namespace core {

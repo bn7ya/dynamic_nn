@@ -122,7 +122,7 @@ public:
         // Assume raw_data is already resized RGB pixels
         size_t expected = config_.channels * config_.target_height * config_.target_width;
 
-        Tensor<T> result({config_.channels, config_.target_height, config_.target_width});
+        Tensor<T> result(std::vector<size_t>{config_.channels, config_.target_height, config_.target_width});
 
         const uint8_t* pixels = static_cast<const uint8_t*>(raw_data);
         size_t idx = 0;
@@ -179,7 +179,7 @@ public:
         std::string str(text, size);
 
         // Simple character-level encoding (placeholder)
-        Tensor<T> result({config_.max_length});
+        Tensor<T> result(std::vector<size_t>{config_.max_length});
         result.fill(T(0));  // Padding
 
         for (size_t i = 0; i < std::min(size, config_.max_length); ++i) {
