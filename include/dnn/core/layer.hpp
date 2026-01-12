@@ -5,11 +5,17 @@
 #include "activations.hpp"
 #include "initializers.hpp"
 #include "random.hpp"
+#include "device.hpp"
 #include "../exceptions/dnn_exception.hpp"
 #include <vector>
 #include <memory>
 #include <algorithm>
 #include <cmath>
+
+#ifdef DNN_ENABLE_CUDA
+#include "../cuda/cuda_tensor.hpp"
+#include "../cuda/cuda_ops.hpp"
+#endif
 
 namespace dnn {
 namespace core {
@@ -55,14 +61,17 @@ public:
      * @param output_size Number of outputs (neurons)
      * @param activation Activation function type
      * @param seed Random seed for initialization
+     * @param device Device to run computations on (CPU or CUDA)
      */
     Layer(size_t input_size, size_t output_size,
           ActivationType activation = ActivationType::ReLU,
-          uint64_t seed = 42)
+          uint64_t seed = 42,
+          Device device = Device::CPU)
         : layer_type_(LayerType::Dense)
         , input_size_(input_size)
         , output_size_(output_size)
         , activation_type_(activation)
+        , device_(device)
         , weights_(std::vector<size_t>{output_size, input_size})
         , biases_(std::vector<size_t>{output_size})
         , rng_(std::make_unique<Random>(seed)) {
@@ -82,12 +91,67 @@ public:
 
         // Initialize biases to zero
         biases_.fill(T(0));
+
+        // If CUDA requested, move tensors to GPU
+        if (device_ == Device::CUDA) {
+            to_device(Device::CUDA);
+        }
     }
+
+    /**
+     * Move layer to specified device.
+     * @param device Target device (CPU or CUDA)
+     */
+    void to_device(Device device) {
+        if (device == device_) return;  // Already on target device
+
+        device_ = device;
+
+#ifdef DNN_ENABLE_CUDA
+        if (device == Device::CUDA) {
+            // Move weights and biases to GPU
+            gpu_weights_ = std::make_unique<cuda::CudaTensor<T>>(weights_);
+            gpu_biases_ = std::make_unique<cuda::CudaTensor<T>>(biases_);
+        } else {
+            // Move back to CPU - weights/biases should already be updated
+            if (gpu_weights_) {
+                weights_ = gpu_weights_->to_host();
+                gpu_weights_.reset();
+            }
+            if (gpu_biases_) {
+                biases_ = gpu_biases_->to_host();
+                gpu_biases_.reset();
+            }
+        }
+#else
+        if (device == Device::CUDA) {
+            throw std::runtime_error("CUDA not enabled. Rebuild with DNN_ENABLE_CUDA=ON");
+        }
+#endif
+    }
+
+    /**
+     * Get current device.
+     */
+    Device device() const { return device_; }
 
     /**
      * Forward pass.
      */
     Tensor<T> forward(const Tensor<T>& input) {
+#ifdef DNN_ENABLE_CUDA
+        if (device_ == Device::CUDA) {
+            return forward_cuda(input);
+        }
+#endif
+        return forward_cpu(input);
+    }
+
+private:
+    /**
+     * CPU forward pass implementation.
+     */
+    Tensor<T> forward_cpu(const Tensor<T>& input) {
         // Cache input for backward pass
         cached_input_ = input.clone();
 
@@ -133,12 +197,123 @@ public:
         return cached_output_.clone();
     }
 
+#ifdef DNN_ENABLE_CUDA
+    /**
+     * CUDA forward pass implementation.
+     */
+    Tensor<T> forward_cuda(const Tensor<T>& input) {
+        // Move input to GPU
+        cuda::CudaTensor<T> gpu_input(input);
+
+        // Cache input for backward pass (keep on CPU for now)
+        cached_input_ = input.clone();
+
+        size_t batch_size = (input.rank() == 2) ? input.shape()[0] : 1;
+
+        // Prepare output tensor on GPU
+        // For batch: output is (batch_size, output_size)
+        // Linear: Y = X @ W^T + B
+        std::vector<size_t> output_shape = (input.rank() == 2)
+            ? std::vector<size_t>{batch_size, output_size_}
+            : std::vector<size_t>{output_size_};
+
+        cuda::CudaTensor<T> gpu_output(output_shape);
+
+        // Ensure weights are on GPU
+        if (!gpu_weights_) {
+            gpu_weights_ = std::make_unique<cuda::CudaTensor<T>>(weights_);
+        }
+        if (!gpu_biases_) {
+            gpu_biases_ = std::make_unique<cuda::CudaTensor<T>>(biases_);
+        }
+
+        if (input.rank() == 1) {
+            // Single sample: y = W @ x + b
+            // Using gemv: y = alpha * A @ x + beta * y
+            // First copy biases to output
+            cuda::cuda_copy(*gpu_biases_, gpu_output);
+            // Then: output = 1.0 * weights @ input + 1.0 * output (biases)
+            cuda::cuda_gemv(*gpu_weights_, gpu_input, gpu_output, T(1), T(1), false);
+        } else {
+            // Batch: Y = X @ W^T + B (broadcast biases)
+            // Using gemm: C = alpha * A @ B + beta * C
+            // output = input @ weights^T, then add biases
+
+            // First: output = input @ weights^T
+            cuda::cuda_gemm(gpu_input, *gpu_weights_, gpu_output, T(1), T(0), false, true);
+
+            // Add biases to each row (broadcast)
+            // Create a temporary for bias broadcast
+            Tensor<T> bias_broadcast(output_shape);
+            for (size_t b = 0; b < batch_size; ++b) {
+                for (size_t i = 0; i < output_size_; ++i) {
+                    bias_broadcast.at(b, i) = biases_[i];
+                }
+            }
+            cuda::CudaTensor<T> gpu_bias_broadcast(bias_broadcast);
+            cuda::cuda_add(gpu_output, gpu_bias_broadcast, gpu_output);
+        }
+
+        // Copy result back to CPU for pre-activation cache
+        Tensor<T> linear_output = gpu_output.to_host();
+        cached_pre_activation_ = linear_output.clone();
+
+        // Apply activation on GPU
+        cuda::CudaTensor<T> gpu_activated(output_shape);
+
+        switch (activation_type_) {
+            case ActivationType::ReLU:
+                cuda::cuda_relu(gpu_output, gpu_activated);
+                break;
+            case ActivationType::Sigmoid:
+                cuda::cuda_sigmoid(gpu_output, gpu_activated);
+                break;
+            case ActivationType::Tanh:
+                cuda::cuda_tanh(gpu_output, gpu_activated);
+                break;
+            case ActivationType::Softmax:
+                cuda::cuda_softmax(gpu_output, gpu_activated);
+                break;
+            default:
+                // Fall back to CPU activation
+                cached_output_ = activation_->forward(linear_output);
+                return cached_output_.clone();
+        }
+
+        // Copy activated output back to CPU
+        cached_output_ = gpu_activated.to_host();
+
+        // Record node activations for metrics (sample from first batch item)
+        for (size_t i = 0; i < output_size_ && i < cached_pre_activation_.size(); ++i) {
+            nodes_[i].record_activation(static_cast<float>(
+                input.rank() == 1 ? cached_pre_activation_[i] : cached_pre_activation_.at(0, i)));
+        }
+
+        return cached_output_.clone();
+    }
+#endif
+
+public:
+
     /**
      * Backward pass.
      * @param grad_output Gradient from next layer
      * @return Gradient with respect to input
      */
     Tensor<T> backward(const Tensor<T>& grad_output) {
+#ifdef DNN_ENABLE_CUDA
+        if (device_ == Device::CUDA) {
+            return backward_cuda(grad_output);
+        }
+#endif
+        return backward_cpu(grad_output);
+    }
+
+private:
+    /**
+     * CPU backward pass implementation.
+     */
+    Tensor<T> backward_cpu(const Tensor<T>& grad_output) {
         // Compute activation gradient
         Tensor<T> grad_activation = activation_->backward(
             cached_pre_activation_, cached_output_, grad_output);
@@ -203,6 +378,96 @@ public:
 
         throw exceptions::ShapeException("backward", "Cached input has invalid shape");
     }
+
+#ifdef DNN_ENABLE_CUDA
+    /**
+     * CUDA backward pass implementation.
+     */
+    Tensor<T> backward_cuda(const Tensor<T>& grad_output) {
+        // Compute activation gradient on CPU (for now, since we cached on CPU)
+        Tensor<T> grad_activation = activation_->backward(
+            cached_pre_activation_, cached_output_, grad_output);
+
+        // Move grad_activation to GPU
+        cuda::CudaTensor<T> gpu_grad_activation(grad_activation);
+
+        // Move cached input to GPU
+        cuda::CudaTensor<T> gpu_cached_input(cached_input_);
+
+        size_t batch_size = (cached_input_.rank() == 2) ? cached_input_.shape()[0] : 1;
+
+        // Compute weight gradients: dW = grad_activation^T @ cached_input
+        // For batch: dW = sum over batch of (grad[b] outer input[b])
+        // Using gemm: dW += grad_activation^T @ cached_input
+
+        // Compute input gradient: grad_input = grad_activation @ weights
+        // Using gemm: grad_input = grad_activation @ weights
+
+        if (cached_input_.rank() == 1) {
+            // Single sample
+            // Weight gradient: dW[i,j] = grad_activation[i] * cached_input[j]
+            // This is an outer product
+
+            // For now, compute on CPU and accumulate
+            for (size_t i = 0; i < output_size_; ++i) {
+                if (nodes_[i].is_trainable()) {
+                    for (size_t j = 0; j < input_size_; ++j) {
+                        weight_gradients_.at(i, j) += grad_activation[i] * cached_input_[j];
+                    }
+                    bias_gradients_[i] += grad_activation[i];
+                }
+                nodes_[i].record_gradient(static_cast<float>(grad_activation[i]));
+            }
+
+            // Compute input gradient on GPU: grad_input = weights^T @ grad_activation
+            cuda::CudaTensor<T> gpu_grad_input(std::vector<size_t>{input_size_});
+            cuda::cuda_gemv(*gpu_weights_, gpu_grad_activation, gpu_grad_input, T(1), T(0), true);
+
+            return gpu_grad_input.to_host();
+
+        } else {
+            // Batch mode
+            // Weight gradient: dW = grad_activation^T @ cached_input
+            // Shape: (output_size, batch_size) @ (batch_size, input_size) = (output_size, input_size)
+
+            // Compute weight gradients on GPU
+            cuda::CudaTensor<T> gpu_weight_grad(std::vector<size_t>{output_size_, input_size_});
+            cuda::cuda_gemm(gpu_grad_activation, gpu_cached_input, gpu_weight_grad, T(1), T(0), true, false);
+
+            // Accumulate weight gradients to CPU
+            Tensor<T> weight_grad_cpu = gpu_weight_grad.to_host();
+            for (size_t i = 0; i < output_size_; ++i) {
+                if (nodes_[i].is_trainable()) {
+                    for (size_t j = 0; j < input_size_; ++j) {
+                        weight_gradients_.at(i, j) += weight_grad_cpu.at(i, j);
+                    }
+                }
+            }
+
+            // Bias gradient: sum of grad_activation along batch dimension
+            for (size_t b = 0; b < batch_size; ++b) {
+                for (size_t i = 0; i < output_size_; ++i) {
+                    if (nodes_[i].is_trainable()) {
+                        bias_gradients_[i] += grad_activation.at(b, i);
+                    }
+                }
+            }
+
+            // Record metrics
+            for (size_t i = 0; i < output_size_; ++i) {
+                nodes_[i].record_gradient(static_cast<float>(grad_activation.at(0, i)));
+            }
+
+            // Compute input gradient on GPU: grad_input = grad_activation @ weights
+            cuda::CudaTensor<T> gpu_grad_input(std::vector<size_t>{batch_size, input_size_});
+            cuda::cuda_gemm(gpu_grad_activation, *gpu_weights_, gpu_grad_input, T(1), T(0), false, false);
+
+            return gpu_grad_input.to_host();
+        }
+    }
+#endif
+
+public:
 
     /**
      * Apply accumulated gradients and update weights.
@@ -585,6 +850,7 @@ private:
     size_t input_size_;
     size_t output_size_;
     ActivationType activation_type_;
+    Device device_ = Device::CPU;
 
     Tensor<T> weights_;
     Tensor<T> biases_;
@@ -601,6 +867,12 @@ private:
 
     std::unique_ptr<Activation<T>> activation_;
     std::unique_ptr<Random> rng_;
+
+#ifdef DNN_ENABLE_CUDA
+    // GPU tensors for CUDA mode
+    std::unique_ptr<cuda::CudaTensor<T>> gpu_weights_;
+    std::unique_ptr<cuda::CudaTensor<T>> gpu_biases_;
+#endif
 };
 
 // Type alias

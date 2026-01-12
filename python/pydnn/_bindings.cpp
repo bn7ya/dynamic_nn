@@ -12,6 +12,7 @@
 #include "dnn/core/tensor.hpp"
 #include "dnn/core/network.hpp"
 #include "dnn/core/activations.hpp"
+#include "dnn/core/device.hpp"
 #include "dnn/training/trainer.hpp"
 #include "dnn/training/cost_functions.hpp"
 #include "dnn/dynamics/health_monitor.hpp"
@@ -77,6 +78,9 @@ public:
 
     size_t num_layers() const { return network_.num_layers(); }
     size_t num_parameters() const { return network_.num_parameters(); }
+
+    void to(core::Device device) { network_.to(device); }
+    core::Device device() const { return network_.device(); }
 
     py::dict efficiency_report(bool include_nodes = false) {
         py::dict result;
@@ -281,6 +285,21 @@ PYBIND11_MODULE(_dnn_core, m) {
         .value("Critical", dynamics::HealthState::Critical)
         .export_values();
 
+    // Device enum
+    py::enum_<core::Device>(m, "Device")
+        .value("CPU", core::Device::CPU)
+        .value("CUDA", core::Device::CUDA)
+        .export_values();
+
+    // CUDA availability check
+    m.def("cuda_available", []() {
+#ifdef DNN_ENABLE_CUDA
+        return true;  // Runtime check would go here
+#else
+        return false;
+#endif
+    }, "Check if CUDA is available");
+
     // Tensor class (float)
     py::class_<core::Tensor<float>>(m, "Tensor")
         .def(py::init<const std::vector<size_t>&>())
@@ -307,10 +326,9 @@ PYBIND11_MODULE(_dnn_core, m) {
         .def_readwrite("seed", &core::NetworkConfig::seed)
         .def_readwrite("input_shape", &core::NetworkConfig::input_shape)
         .def_readwrite("output_size", &core::NetworkConfig::output_size)
-        .def_readwrite("initial_hidden_layers", &core::NetworkConfig::initial_hidden_layers)
-        .def_readwrite("min_layers", &core::NetworkConfig::min_layers)
-        .def_readwrite("max_layers", &core::NetworkConfig::max_layers)
-        .def_readwrite("default_activation", &core::NetworkConfig::default_activation);
+        .def_readwrite("output_activation", &core::NetworkConfig::output_activation)
+        .def_readwrite("hidden_activation", &core::NetworkConfig::hidden_activation)
+        .def_readwrite("device", &core::NetworkConfig::device);
 
     // Normalization config
     py::class_<training::NormalizationConfig>(m, "NormalizationConfig")
@@ -374,7 +392,11 @@ PYBIND11_MODULE(_dnn_core, m) {
         .def("num_layers", &PyNetwork<float>::num_layers)
         .def("num_parameters", &PyNetwork<float>::num_parameters)
         .def("efficiency_report", &PyNetwork<float>::efficiency_report,
-             py::arg("include_nodes") = false);
+             py::arg("include_nodes") = false)
+        .def("to", &PyNetwork<float>::to, py::arg("device"),
+             "Move network to specified device (CPU or CUDA)")
+        .def("device", &PyNetwork<float>::device,
+             "Get current device");
 
     // Trainer class
     py::class_<PyTrainer<float>>(m, "Trainer")

@@ -468,6 +468,7 @@ class DynamicNetwork:
                  output_size: int,
                  seed: int,
                  cost_function: str = "CrossEntropy",
+                 device: str = "cpu",
                  # Optional configuration objects
                  training_phase: Optional[TrainingPhaseConfig] = None,
                  architecture: Optional[ArchitectureConfig] = None,
@@ -487,6 +488,7 @@ class DynamicNetwork:
             output_size: Number of output neurons
             seed: Random seed for reproducibility
             cost_function: One of the available cost functions
+            device: Device to run on ("cpu" or "cuda")
             training_phase: Configuration for training phases (exploration, estimation, main)
             architecture: Configuration for dynamic architecture constraints
             efficiency: Configuration for efficiency computation and thresholds
@@ -498,6 +500,14 @@ class DynamicNetwork:
             reward_penalty: Configuration for the reward/penalty system
             normalization: Configuration for automatic data normalization
         """
+        # Validate device
+        device = device.lower()
+        if device not in ("cpu", "cuda", "gpu"):
+            raise ValueError(f"Unknown device: {device}. Use 'cpu' or 'cuda'")
+        if device == "gpu":
+            device = "cuda"
+        self._device = device
+
         if cost_function not in self.COST_FUNCTIONS:
             raise ValueError(f"Unknown cost function: {cost_function}. "
                            f"Available: {list(self.COST_FUNCTIONS.keys())}")
@@ -567,11 +577,19 @@ class DynamicNetwork:
         """Initialize using C++ backend."""
         from . import _dnn_core
 
+        # Check CUDA availability if requested
+        if self._device == "cuda" and not _dnn_core.cuda_available():
+            raise RuntimeError(
+                "CUDA requested but not available. "
+                "Rebuild pydnn with DNN_ENABLE_CUDA=ON or use device='cpu'"
+            )
+
         config = _dnn_core.NetworkConfig()
         config.seed = self.seed
         config.input_shape = list(self.input_shape)
         config.output_size = self.output_size
         config.cost_function = getattr(_dnn_core.CostFunction, self.cost_function)
+        config.device = _dnn_core.Device.CUDA if self._device == "cuda" else _dnn_core.Device.CPU
 
         self._network = _dnn_core.Network(config)
 
@@ -2456,6 +2474,40 @@ class DynamicNetwork:
                 "total_nodes": sum(l["W"].shape[0] for l in self._layers),
                 "total_parameters": sum(l["W"].size + l["b"].size for l in self._layers)
             }
+
+    def to(self, device: str) -> "DynamicNetwork":
+        """
+        Move network to specified device.
+
+        Args:
+            device: Target device ("cpu" or "cuda")
+
+        Returns:
+            self for method chaining
+        """
+        device = device.lower()
+        if device == "gpu":
+            device = "cuda"
+        if device not in ("cpu", "cuda"):
+            raise ValueError(f"Unknown device: {device}. Use 'cpu' or 'cuda'")
+
+        if self._use_cpp:
+            from . import _dnn_core
+            if device == "cuda" and not _dnn_core.cuda_available():
+                raise RuntimeError(
+                    "CUDA requested but not available. "
+                    "Rebuild pydnn with DNN_ENABLE_CUDA=ON"
+                )
+            target_device = _dnn_core.Device.CUDA if device == "cuda" else _dnn_core.Device.CPU
+            self._network.to(target_device)
+
+        self._device = device
+        return self
+
+    @property
+    def device(self) -> str:
+        """Current device ('cpu' or 'cuda')."""
+        return self._device
 
     @property
     def num_layers(self) -> int:

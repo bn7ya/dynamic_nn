@@ -64,6 +64,8 @@ try:
         CostFunction,
         Activation,
         HealthState,
+        Device,
+        cuda_available as _cpp_cuda_available,
         save_model,
         load_model,
     )
@@ -71,6 +73,25 @@ try:
 except ImportError as e:
     _CPP_AVAILABLE = False
     _CPP_ERROR = str(e)
+
+
+def cuda_available() -> bool:
+    """
+    Check if CUDA is available for GPU acceleration.
+
+    Returns:
+        True if CUDA is available, False otherwise.
+
+    Example:
+        >>> import pydnn
+        >>> if pydnn.cuda_available():
+        ...     network = pydnn.DynamicNetwork(..., device="cuda")
+        ... else:
+        ...     network = pydnn.DynamicNetwork(..., device="cpu")
+    """
+    if not _CPP_AVAILABLE:
+        return False
+    return _cpp_cuda_available()
 
 # Pure Python components (always available)
 from .network import (
@@ -129,6 +150,8 @@ __all__ = [
     "DynamicNetwork",
     "TrainingResult",
     "HealthReport",
+    # CUDA support
+    "cuda_available",
     # Configuration classes for advanced ML engineers
     "TrainingPhaseConfig",
     "ArchitectureConfig",
@@ -173,6 +196,7 @@ if _CPP_AVAILABLE:
         "CostFunction",
         "Activation",
         "HealthState",
+        "Device",
         "save_model",
         "load_model",
     ])

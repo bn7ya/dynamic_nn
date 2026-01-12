@@ -2,6 +2,7 @@
 
 #include "tensor.hpp"
 #include "layer.hpp"
+#include "device.hpp"
 #include "random.hpp"
 #include "../exceptions/dnn_exception.hpp"
 #include <vector>
@@ -25,6 +26,7 @@ struct NetworkConfig {
     CostFunctionType cost_function;                  // User-selected cost function
     ActivationType output_activation = ActivationType::Softmax;  // Output activation
     ActivationType hidden_activation = ActivationType::ReLU;     // Hidden layer activation
+    Device device = Device::CPU;                     // Device for computation (CPU or CUDA)
 };
 
 /**
@@ -73,6 +75,7 @@ public:
      */
     explicit Network(const NetworkConfig& config)
         : config_(config)
+        , device_(config.device)
         , rng_(std::make_unique<Random>(config.seed)) {
 
         // Compute input size from shape
@@ -97,6 +100,24 @@ public:
         state_.total_layers = layers_.size();
         update_state();
     }
+
+    /**
+     * Move network to specified device.
+     * @param device Target device (CPU or CUDA)
+     */
+    void to(Device device) {
+        if (device == device_) return;
+
+        device_ = device;
+        for (auto& layer : layers_) {
+            layer->to_device(device);
+        }
+    }
+
+    /**
+     * Get current device.
+     */
+    Device device() const { return device_; }
 
     /**
      * Forward pass through the network.
@@ -166,7 +187,8 @@ public:
                    ActivationType activation) {
         auto layer = std::make_unique<Layer<T>>(
             input_size, output_size, activation,
-            rng_->seed() + layers_.size());
+            rng_->seed() + layers_.size(),
+            device_);
         layers_.push_back(std::move(layer));
         update_state();
     }
@@ -456,6 +478,7 @@ private:
 
     NetworkConfig config_;
     size_t input_size_ = 0;
+    Device device_ = Device::CPU;
     std::vector<std::unique_ptr<Layer<T>>> layers_;
     TrainingState state_;
     std::unique_ptr<Random> rng_;
