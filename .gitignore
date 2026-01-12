@@ -1,8 +1,12 @@
 *.csv
 *.npy
 *.pyc
+*.pth
 *.png
 python/pydnn/__pycache__/network.cpython-314.pyc
 
 build/
 nul
+python/pydnn/__pycache__/*.pyc
+python/pydnn/*.pyd
+notebooks/text_to_image/models/*.pth

@@ -4,6 +4,7 @@
 #include "layer.hpp"
 #include "device.hpp"
 #include "random.hpp"
+#include "../training/cost_functions.hpp"
 #include "../exceptions/dnn_exception.hpp"
 #include <vector>
 #include <memory>
@@ -13,8 +14,8 @@
 namespace dnn {
 namespace core {
 
-// Forward declarations
-enum class CostFunctionType;
+// Use training::CostFunctionType in this namespace
+using training::CostFunctionType;
 
 /**
  * Network configuration.
@@ -23,7 +24,7 @@ struct NetworkConfig {
     uint64_t seed = 42;                              // ONLY required hyperparameter
     std::vector<size_t> input_shape;                 // Shape of input data
     size_t output_size = 0;                          // Number of output neurons
-    CostFunctionType cost_function;                  // User-selected cost function
+    CostFunctionType cost_function = CostFunctionType::CrossEntropy;  // User-selected cost function
     ActivationType output_activation = ActivationType::Softmax;  // Output activation
     ActivationType hidden_activation = ActivationType::ReLU;     // Hidden layer activation
     Device device = Device::CPU;                     // Device for computation (CPU or CUDA)

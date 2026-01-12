@@ -1,0 +1,10 @@
+{
+  "version": "1.0",
+  "seed": 42,
+  "input_shape": [
+    8
+  ],
+  "output_size": 40000,
+  "cost_function": "MSE",
+  "num_layers": 6
+}

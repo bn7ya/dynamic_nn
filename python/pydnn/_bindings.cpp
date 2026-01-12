@@ -93,7 +93,8 @@ public:
         py::list layer_efficiencies;
         for (size_t i = 0; i < total_layers; ++i) {
             const auto& layer = network_.layer(i);
-            double eff = layer.compute_efficiency();
+            auto metrics = layer.compute_metrics();
+            double eff = metrics.avg_node_efficiency;
             layer_efficiencies.append(eff);
             total_efficiency += eff;
             total_nodes += layer.output_size();
@@ -146,13 +147,13 @@ public:
         T* target_ptr = static_cast<T*>(target_buf.ptr);
 
         for (size_t i = 0; i < n_samples; ++i) {
-            core::Tensor<T> inp({input_size});
+            core::Tensor<T> inp(std::vector<size_t>{input_size});
             std::copy(input_ptr + i * input_size,
                      input_ptr + (i + 1) * input_size,
                      inp.data());
             input_tensors.push_back(std::move(inp));
 
-            core::Tensor<T> tgt({target_size});
+            core::Tensor<T> tgt(std::vector<size_t>{target_size});
             std::copy(target_ptr + i * target_size,
                      target_ptr + (i + 1) * target_size,
                      tgt.data());
@@ -229,15 +230,8 @@ void save_model(const PyNetwork<T>& network, const std::string& path, const std:
 }
 
 template<typename T>
-PyNetwork<T> load_model(const std::string& path) {
-    core::NetworkConfig config;
-    config.seed = 0; // Will be loaded from file
-    config.input_shape = {1}; // Placeholder
-    config.output_size = 1;
-
-    PyNetwork<T> network(config);
-    io::ModelSerializer<T>::load(network.network(), path);
-    return network;
+std::unique_ptr<core::Network<T>> load_model(const std::string& path) {
+    return io::ModelSerializer<T>::load(path);
 }
 
 PYBIND11_MODULE(_dnn_core, m) {
@@ -255,7 +249,7 @@ PYBIND11_MODULE(_dnn_core, m) {
         .value("MAE", training::CostFunctionType::MeanAbsoluteError)
         .value("CrossEntropy", training::CostFunctionType::CrossEntropy)
         .value("BinaryCrossEntropy", training::CostFunctionType::BinaryCrossEntropy)
-        .value("Huber", training::CostFunctionType::Huber)
+        .value("Huber", training::CostFunctionType::HuberLoss)
         .value("LogCosh", training::CostFunctionType::LogCosh)
         .value("KLDivergence", training::CostFunctionType::KLDivergence)
         .value("CosineSimilarity", training::CostFunctionType::CosineSimilarity)
@@ -309,16 +303,20 @@ PYBIND11_MODULE(_dnn_core, m) {
         .def("numpy", [](const core::Tensor<float>& t) {
             return tensor_to_numpy(t);
         })
-        .def("shape", &core::Tensor<float>::shape)
-        .def("size", &core::Tensor<float>::size)
-        .def("ndim", &core::Tensor<float>::ndim)
-        .def("fill", &core::Tensor<float>::fill)
-        .def("zeros", &core::Tensor<float>::zeros)
-        .def("ones", &core::Tensor<float>::ones)
-        .def("sum", &core::Tensor<float>::sum)
-        .def("mean", &core::Tensor<float>::mean)
-        .def("max", &core::Tensor<float>::max)
-        .def("min", &core::Tensor<float>::min);
+        .def("shape", [](const core::Tensor<float>& t) { return t.shape(); })
+        .def("size", [](const core::Tensor<float>& t) { return t.size(); })
+        .def("rank", [](const core::Tensor<float>& t) { return t.rank(); })
+        .def("fill", [](core::Tensor<float>& t, float v) { t.fill(v); })
+        .def_static("zeros", [](const std::vector<size_t>& shape) {
+            return core::Tensor<float>::zeros(shape);
+        })
+        .def_static("ones", [](const std::vector<size_t>& shape) {
+            return core::Tensor<float>::ones(shape);
+        })
+        .def("sum", [](const core::Tensor<float>& t) { return t.sum(); })
+        .def("mean", [](const core::Tensor<float>& t) { return t.mean(); })
+        .def("max", [](const core::Tensor<float>& t) { return t.max(); })
+        .def("min", [](const core::Tensor<float>& t) { return t.min(); });
 
     // Network config
     py::class_<core::NetworkConfig>(m, "NetworkConfig")
@@ -326,6 +324,7 @@ PYBIND11_MODULE(_dnn_core, m) {
         .def_readwrite("seed", &core::NetworkConfig::seed)
         .def_readwrite("input_shape", &core::NetworkConfig::input_shape)
         .def_readwrite("output_size", &core::NetworkConfig::output_size)
+        .def_readwrite("cost_function", &core::NetworkConfig::cost_function)
         .def_readwrite("output_activation", &core::NetworkConfig::output_activation)
         .def_readwrite("hidden_activation", &core::NetworkConfig::hidden_activation)
         .def_readwrite("device", &core::NetworkConfig::device);
