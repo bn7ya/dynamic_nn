@@ -272,3 +272,211 @@ class Expert:
             'node_efficiency_std': np.std(self.node_efficiency),
             'dead_nodes': np.sum(self.node_efficiency < 0.1),
         }
+
+    def compute_importance(
+        self,
+        utilization_weight: float = 0.3,
+        gradient_weight: float = 0.3,
+        loss_weight: float = 0.4
+    ) -> float:
+        """
+        Compute importance score for pruning/merging decisions.
+
+        Lower score = less important = candidate for removal.
+
+        Components:
+        1. Utilization score: How often this expert is selected
+        2. Gradient magnitude score: Is this expert still learning?
+        3. Loss contribution score: How much does this expert reduce loss?
+
+        Args:
+            utilization_weight: Weight for utilization component
+            gradient_weight: Weight for gradient magnitude component
+            loss_weight: Weight for loss contribution component
+
+        Returns:
+            float: Importance score in [0, 1], lower = more removable
+        """
+        # Component 1: Utilization (higher = more important)
+        if self.total_count > 0:
+            utilization = self.activation_count / self.total_count
+            # Scale expecting ~25% usage with 4 experts (1/num_experts)
+            S_util = min(1.0, utilization * 4.0)
+        else:
+            S_util = 0.0  # Never used = not important
+
+        # Component 2: Gradient magnitude (higher gradients = still learning = important)
+        if len(self.gradient_history) > 0:
+            recent_grads = self.gradient_history[-10:]
+            avg_grad = np.mean(recent_grads)
+            # Normalize - expect gradients around 0.01-0.1 during active learning
+            S_grad = min(1.0, avg_grad / 0.05)
+        else:
+            S_grad = 0.5  # No gradient history = neutral
+
+        # Component 3: Loss contribution (lower recent loss = more important)
+        if len(self.loss_history) > 0:
+            recent_loss = np.mean(self.loss_history[-10:])
+            # Invert: lower loss = higher importance
+            S_loss = np.exp(-recent_loss)  # Bounded to (0, 1]
+        else:
+            S_loss = 0.5  # No loss history = neutral
+
+        # Weighted combination
+        importance = (
+            utilization_weight * S_util +
+            gradient_weight * S_grad +
+            loss_weight * S_loss
+        )
+
+        return float(np.clip(importance, 0.0, 1.0))
+
+    def get_weight_vector(self) -> np.ndarray:
+        """
+        Flatten all expert weights into a single vector for similarity computation.
+
+        Used by merging logic to compute weight-space similarity between experts.
+
+        Returns:
+            np.ndarray: Flattened weight vector
+        """
+        return np.concatenate([
+            self.W1.flatten(),
+            self.b1.flatten(),
+            self.W2.flatten(),
+            self.b2.flatten()
+        ])
+
+    @classmethod
+    def clone_with_noise(
+        cls,
+        source_expert: 'Expert',
+        new_expert_id: int,
+        noise_scale: float = 0.1,
+        seed: Optional[int] = None
+    ) -> 'Expert':
+        """
+        Create a new expert by cloning an existing one and adding noise.
+
+        This implements the "clone from most-loaded expert" strategy.
+        The noise breaks symmetry so the new expert can specialize differently.
+
+        Args:
+            source_expert: Expert to clone from
+            new_expert_id: ID for the new expert
+            noise_scale: Standard deviation of Gaussian noise to add (relative to weight std)
+            seed: Random seed for reproducibility
+
+        Returns:
+            Expert: New expert with cloned + noised weights
+        """
+        if seed is not None:
+            np.random.seed(seed)
+
+        # Create new expert with same config
+        new_expert = cls(
+            input_dim=source_expert.input_dim,
+            output_dim=source_expert.output_dim,
+            config=source_expert.config,
+            expert_id=new_expert_id,
+            seed=seed if seed else new_expert_id
+        )
+
+        # Clone weights with noise
+        # Noise magnitude is scaled relative to weight standard deviation
+        def add_scaled_noise(weights: np.ndarray) -> np.ndarray:
+            weight_std = np.std(weights) + 1e-8
+            noise = np.random.randn(*weights.shape) * noise_scale * weight_std
+            return weights + noise
+
+        new_expert.W1 = add_scaled_noise(source_expert.W1.copy())
+        new_expert.b1 = add_scaled_noise(source_expert.b1.copy())
+        new_expert.W2 = add_scaled_noise(source_expert.W2.copy())
+        new_expert.b2 = add_scaled_noise(source_expert.b2.copy())
+
+        # Copy efficiency state (start similar to parent)
+        new_expert.efficiency = source_expert.efficiency * 0.9  # Slightly lower initially
+        new_expert.node_efficiency = source_expert.node_efficiency.copy() * 0.9
+
+        # Reset statistics - new expert starts fresh
+        new_expert.activation_count = 0
+        new_expert.total_count = 0
+        new_expert.recent_activations = 0
+        new_expert.recent_total = 0
+        new_expert.gradient_magnitude = 0.0
+        new_expert.gradient_history = []
+        new_expert.loss_history = []
+        new_expert.efficiency_history = []
+
+        return new_expert
+
+    @classmethod
+    def merge_experts(
+        cls,
+        expert1: 'Expert',
+        expert2: 'Expert',
+        merged_expert_id: int,
+        efficiency_weight: float = 0.5,
+        seed: Optional[int] = None
+    ) -> 'Expert':
+        """
+        Merge two experts into one by averaging their weights.
+
+        The merge is weighted by the efficiency of each expert, so the
+        more efficient expert contributes more to the merged weights.
+
+        Args:
+            expert1: First expert to merge
+            expert2: Second expert to merge
+            merged_expert_id: ID for the merged expert
+            efficiency_weight: Blend factor based on efficiency (0=average, 1=fully efficiency-weighted)
+            seed: Random seed
+
+        Returns:
+            Expert: New merged expert
+        """
+        if seed is not None:
+            np.random.seed(seed)
+
+        # Compute merge weights based on efficiency
+        eff1 = expert1.compute_efficiency()
+        eff2 = expert2.compute_efficiency()
+
+        # Interpolate between equal weighting and efficiency-based weighting
+        equal_w1, equal_w2 = 0.5, 0.5
+        if eff1 + eff2 > 0:
+            eff_w1 = eff1 / (eff1 + eff2)
+            eff_w2 = eff2 / (eff1 + eff2)
+        else:
+            eff_w1, eff_w2 = 0.5, 0.5
+
+        w1 = (1 - efficiency_weight) * equal_w1 + efficiency_weight * eff_w1
+        w2 = (1 - efficiency_weight) * equal_w2 + efficiency_weight * eff_w2
+
+        # Create merged expert
+        merged = cls(
+            input_dim=expert1.input_dim,
+            output_dim=expert1.output_dim,
+            config=expert1.config,
+            expert_id=merged_expert_id,
+            seed=seed if seed else merged_expert_id
+        )
+
+        # Weighted average of weights
+        merged.W1 = w1 * expert1.W1 + w2 * expert2.W1
+        merged.b1 = w1 * expert1.b1 + w2 * expert2.b1
+        merged.W2 = w1 * expert1.W2 + w2 * expert2.W2
+        merged.b2 = w1 * expert1.b2 + w2 * expert2.b2
+
+        # Merged efficiency is weighted combination
+        merged.efficiency = w1 * eff1 + w2 * eff2
+        merged.node_efficiency = w1 * expert1.node_efficiency + w2 * expert2.node_efficiency
+
+        # Reset statistics
+        merged.activation_count = 0
+        merged.total_count = 0
+        merged.gradient_history = []
+        merged.loss_history = []
+        merged.efficiency_history = [merged.efficiency]
+
+        return merged

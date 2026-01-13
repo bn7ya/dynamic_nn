@@ -81,6 +81,12 @@ class DynamicMoE:
         self.current_phase = 0
         self.trained = False
 
+        # Architecture change tracking (for dynamic expert modification)
+        self.experts_added = 0
+        self.experts_removed = 0
+        self.experts_merged = 0
+        self.expert_count_history: List[int] = []
+
         # Cache
         self._cache = {}
 
@@ -295,6 +301,9 @@ class DynamicMoE:
             print(f"Final Loss: {final_loss:.4f}")
             print(f"Final Perplexity: {self.compute_perplexity(final_loss):.2f}")
             print(f"Total Time: {elapsed_time/1000:.1f}s")
+            print(f"Final Experts: {len(self.moe_layer.experts)} (started with {self.config.gating.num_experts})")
+            if self.experts_added > 0 or self.experts_removed > 0 or self.experts_merged > 0:
+                print(f"Architecture Changes: +{self.experts_added} added, -{self.experts_removed} removed, ~{self.experts_merged} merged")
             print("=" * 60)
 
         return MoETrainingResult(
@@ -312,6 +321,12 @@ class DynamicMoE:
             total_rewards=self.total_rewards,
             total_penalties=self.total_penalties,
             learning_rate_history=self.learning_rate_history,
+            # Dynamic expert modification tracking
+            experts_added=self.experts_added,
+            experts_removed=self.experts_removed,
+            experts_merged=self.experts_merged,
+            final_num_experts=len(self.moe_layer.experts),
+            expert_count_history=self.expert_count_history,
         )
 
     def _phase1_exploration(
@@ -421,7 +436,12 @@ class DynamicMoE:
         verbose: bool
     ) -> None:
         """
-        Phase 3: Main training with reward/penalty system.
+        Phase 3: Main training with reward/penalty system AND dynamic expert modification.
+
+        Dynamic Expert Modification (following DynamicNetwork patterns):
+        - Add experts when load imbalance is high (cancer) or efficiency is very high
+        - Remove experts with low importance scores
+        - Merge experts with very similar weights
 
         Reward: Load becomes more balanced, experts specialize
         Penalty: Load imbalance increases, experts collapse
@@ -431,16 +451,23 @@ class DynamicMoE:
 
         config = self.config.training_phase
         rp_config = self.config.reward_penalty
+        de_config = self.config.dynamic_expert  # Dynamic expert config
         lr = config.main_learning_rate
         batch_size = config.main_batch_size
 
         prev_load_balance = self.moe_layer.gating.compute_load_balance_loss()
+
+        # Track last modification for cooldown
+        last_modification_epoch = -de_config.removal_cooldown_epochs
 
         for epoch in range(epochs):
             loss = self._train_epoch(X, y, lr, batch_size)
             self.cost_history.append(loss)
             self.perplexity_history.append(self.compute_perplexity(loss))
             self.learning_rate_history.append(lr)
+
+            # Track expert count
+            self.expert_count_history.append(len(self.moe_layer.experts))
 
             # Track health
             cancer, alzheimer = self.moe_layer.compute_health_scores()
@@ -450,6 +477,36 @@ class DynamicMoE:
             efficiency = np.mean(self.moe_layer.get_expert_efficiencies())
             self.efficiency_history.append(efficiency)
 
+            # === DYNAMIC EXPERT MODIFICATION ===
+            # Only modify after cooldown period
+            if epoch - last_modification_epoch >= de_config.removal_cooldown_epochs:
+                action, idx1, idx2 = self.moe_layer._should_modify_architecture(epoch, de_config)
+
+                if action == 'add':
+                    success = self.moe_layer._add_expert(de_config)
+                    if success:
+                        self.experts_added += 1
+                        last_modification_epoch = epoch
+                        if verbose:
+                            print(f"    [Epoch {epoch+1}] Added expert (now {len(self.moe_layer.experts)} experts)")
+
+                elif action == 'remove':
+                    success = self.moe_layer._remove_expert(idx1, de_config)
+                    if success:
+                        self.experts_removed += 1
+                        last_modification_epoch = epoch
+                        if verbose:
+                            print(f"    [Epoch {epoch+1}] Removed expert {idx1} (now {len(self.moe_layer.experts)} experts)")
+
+                elif action == 'merge':
+                    success = self.moe_layer._merge_experts(idx1, idx2, de_config)
+                    if success:
+                        self.experts_merged += 1
+                        last_modification_epoch = epoch
+                        if verbose:
+                            print(f"    [Epoch {epoch+1}] Merged experts {idx1}+{idx2} (now {len(self.moe_layer.experts)} experts)")
+
+            # === REWARD/PENALTY SYSTEM ===
             # Reward/Penalty based on load balance improvement
             curr_load_balance = self.moe_layer.gating.compute_load_balance_loss()
             balance_improved = curr_load_balance < prev_load_balance
@@ -477,7 +534,8 @@ class DynamicMoE:
 
             if verbose and (epoch + 1) % 10 == 0:
                 print(f"  Epoch {epoch+1}/{epochs}: Loss={loss:.4f}, "
-                      f"LR={lr:.5f}, R/P={self.total_rewards}/{self.total_penalties}")
+                      f"LR={lr:.5f}, R/P={self.total_rewards}/{self.total_penalties}, "
+                      f"Experts={len(self.moe_layer.experts)}")
 
     def _phase4_finetuning(
         self,

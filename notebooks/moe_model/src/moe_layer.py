@@ -9,11 +9,11 @@ import numpy as np
 from typing import Tuple, List, Dict, Optional
 
 try:
-    from .moe_config import DynamicMoEConfig, MoEHealthReport
+    from .moe_config import DynamicMoEConfig, MoEHealthReport, DynamicExpertConfig
     from .expert import Expert
     from .gating import GatingNetwork
 except ImportError:
-    from moe_config import DynamicMoEConfig, MoEHealthReport
+    from moe_config import DynamicMoEConfig, MoEHealthReport, DynamicExpertConfig
     from expert import Expert
     from gating import GatingNetwork
 
@@ -314,3 +314,276 @@ class MoELayer:
             'cancer_score': self.cancer_score_history[-1] if self.cancer_score_history else 0,
             'alzheimer_score': self.alzheimer_score_history[-1] if self.alzheimer_score_history else 0,
         }
+
+    # ==================== Dynamic Expert Modification ====================
+
+    def _add_expert(self, config: DynamicExpertConfig) -> bool:
+        """
+        Add a new expert by cloning from the most-loaded expert.
+
+        Process:
+        1. Check max_experts constraint
+        2. Find most-loaded expert (highest utilization)
+        3. Clone expert with noise
+        4. Expand gating network
+        5. Append to expert list
+
+        Args:
+            config: Dynamic expert configuration
+
+        Returns:
+            bool: True if expert was added, False if at max capacity
+        """
+        # Check constraint
+        if len(self.experts) >= config.max_experts:
+            return False
+
+        # Find most-loaded expert
+        load_dist = self.gating.get_load_distribution()
+        most_loaded_idx = int(np.argmax(load_dist))
+        source_expert = self.experts[most_loaded_idx]
+
+        # Create new expert slot in gating
+        new_expert_idx = self.gating.add_expert_slot()
+
+        # Clone the most-loaded expert with noise
+        new_expert = Expert.clone_with_noise(
+            source_expert=source_expert,
+            new_expert_id=new_expert_idx,
+            noise_scale=config.clone_noise_scale,
+            seed=self.config.seed + new_expert_idx + len(self.experts) * 100
+        )
+
+        # Add to expert list
+        self.experts.append(new_expert)
+
+        # Update layer state
+        self.num_experts = len(self.experts)
+
+        return True
+
+    def _remove_expert(self, idx: int, config: DynamicExpertConfig) -> bool:
+        """
+        Remove an expert by index.
+
+        Process:
+        1. Check min_experts constraint
+        2. Validate index
+        3. Remove from expert list
+        4. Contract gating network
+        5. Re-index remaining experts
+
+        Args:
+            idx: Index of expert to remove
+            config: Dynamic expert configuration
+
+        Returns:
+            bool: True if expert was removed, False if at minimum or invalid index
+        """
+        # Check constraint - must keep at least min_experts
+        if len(self.experts) <= config.min_experts:
+            return False
+
+        # Validate index
+        if idx < 0 or idx >= len(self.experts):
+            return False
+
+        # Remove from gating network first
+        self.gating.remove_expert_slot(idx)
+
+        # Remove from expert list
+        del self.experts[idx]
+
+        # Re-index remaining experts
+        for new_idx, expert in enumerate(self.experts):
+            expert.expert_id = new_idx
+
+        # Update layer state
+        self.num_experts = len(self.experts)
+
+        # Clear cache since expert indices changed
+        self._cache = {}
+
+        return True
+
+    def _merge_experts(
+        self,
+        idx1: int,
+        idx2: int,
+        config: DynamicExpertConfig
+    ) -> bool:
+        """
+        Merge two experts into one.
+
+        Process:
+        1. Check min_experts constraint (merge reduces count by 1)
+        2. Validate indices
+        3. Create merged expert
+        4. Remove both source experts from gating
+        5. Add merged expert slot
+        6. Update expert list
+
+        Args:
+            idx1: Index of first expert to merge
+            idx2: Index of second expert to merge
+            config: Dynamic expert configuration
+
+        Returns:
+            bool: True if merge succeeded, False otherwise
+        """
+        # After merge we have (N-1) experts, must maintain min_experts
+        if len(self.experts) - 1 < config.min_experts:
+            return False
+
+        # Validate indices
+        if idx1 == idx2:
+            return False
+        if idx1 < 0 or idx1 >= len(self.experts):
+            return False
+        if idx2 < 0 or idx2 >= len(self.experts):
+            return False
+
+        # Ensure idx1 < idx2 for removal order
+        if idx1 > idx2:
+            idx1, idx2 = idx2, idx1
+
+        expert1 = self.experts[idx1]
+        expert2 = self.experts[idx2]
+
+        # Create merged expert
+        merged_expert = Expert.merge_experts(
+            expert1=expert1,
+            expert2=expert2,
+            merged_expert_id=idx1,  # Will take the lower index
+            efficiency_weight=config.merge_efficiency_weight,
+            seed=self.config.seed + len(self.experts) * 100
+        )
+
+        # Remove higher index first (to preserve lower index)
+        self.gating.remove_expert_slot(idx2)
+        del self.experts[idx2]
+
+        # Replace expert at idx1 with merged expert
+        self.experts[idx1] = merged_expert
+
+        # Re-index all experts
+        for new_idx, expert in enumerate(self.experts):
+            expert.expert_id = new_idx
+
+        # Update layer state
+        self.num_experts = len(self.experts)
+
+        # Clear cache
+        self._cache = {}
+
+        return True
+
+    def _should_modify_architecture(
+        self,
+        epoch: int,
+        config: DynamicExpertConfig
+    ) -> Tuple[str, Optional[int], Optional[int]]:
+        """
+        Determine if architecture should be modified this epoch.
+
+        Uses efficiency-based decisions similar to DynamicNetwork.
+
+        Checks:
+        1. Addition trigger: High load imbalance (cancer) OR high overall efficiency
+        2. Removal trigger: Expert with low importance score
+        3. Merge trigger: Two experts with very similar weights
+
+        Args:
+            epoch: Current epoch number
+            config: Dynamic expert configuration
+
+        Returns:
+            Tuple of (action, idx1, idx2) where:
+            - action: 'none', 'add', 'remove', or 'merge'
+            - idx1: Primary index (for remove/merge)
+            - idx2: Secondary index (for merge only)
+        """
+        # Only check at intervals
+        if epoch % config.architecture_change_interval != 0:
+            return ('none', None, None)
+
+        # Get current metrics
+        cancer_score = self.gating.compute_cancer_score()
+        alzheimer_score = self.gating.compute_alzheimer_score()
+        efficiencies = self.get_expert_efficiencies()
+        mean_efficiency = np.mean(efficiencies)
+        load_dist = self.gating.get_load_distribution()
+
+        # --- Check for ADDITION ---
+        # Trigger: Cancer (expert domination) OR very high efficiency (model can handle more)
+        if config.enable_expert_addition:
+            should_add = (
+                (cancer_score > config.add_load_imbalance_threshold) or
+                (mean_efficiency > config.add_efficiency_threshold)
+            )
+            if should_add and np.random.random() < config.add_probability:
+                if len(self.experts) < config.max_experts:
+                    return ('add', None, None)
+
+        # --- Check for REMOVAL ---
+        # Trigger: Expert with low importance (low utilization + gradients + loss contribution)
+        if config.enable_expert_removal:
+            if len(self.experts) > config.min_experts:
+                # Compute importance scores for all experts
+                importance_scores = []
+                for expert in self.experts:
+                    importance = expert.compute_importance(
+                        utilization_weight=config.efficiency_utilization_weight,
+                        gradient_weight=config.efficiency_gradient_weight,
+                        loss_weight=config.efficiency_loss_weight
+                    )
+                    importance_scores.append(importance)
+
+                # Find least important expert
+                min_importance_idx = int(np.argmin(importance_scores))
+                min_importance = importance_scores[min_importance_idx]
+
+                # Also check load - if very low utilization, candidate for removal
+                min_load_idx = int(np.argmin(load_dist))
+                min_load = load_dist[min_load_idx]
+
+                # Remove if importance is very low OR utilization is very low
+                should_remove = (
+                    (min_importance < config.remove_efficiency_threshold) or
+                    (min_load < config.remove_utilization_threshold)
+                )
+
+                if should_remove and np.random.random() < config.remove_probability:
+                    # Choose the expert to remove (prefer low importance)
+                    remove_idx = min_importance_idx
+                    return ('remove', remove_idx, None)
+
+        # --- Check for MERGE ---
+        # Trigger: Two experts with very similar weights
+        if config.enable_expert_merging:
+            if len(self.experts) > config.min_experts:
+                # Compute pairwise weight similarity
+                weight_vectors = [expert.get_weight_vector() for expert in self.experts]
+
+                max_similarity = -1.0
+                merge_pair = (None, None)
+
+                for i in range(len(self.experts)):
+                    for j in range(i + 1, len(self.experts)):
+                        # Cosine similarity of weight vectors
+                        v1, v2 = weight_vectors[i], weight_vectors[j]
+                        norm1, norm2 = np.linalg.norm(v1), np.linalg.norm(v2)
+                        if norm1 > 1e-8 and norm2 > 1e-8:
+                            similarity = np.dot(v1, v2) / (norm1 * norm2)
+                        else:
+                            similarity = 0.0
+
+                        if similarity > max_similarity:
+                            max_similarity = similarity
+                            merge_pair = (i, j)
+
+                if max_similarity > config.merge_similarity_threshold:
+                    if np.random.random() < config.merge_probability:
+                        return ('merge', merge_pair[0], merge_pair[1])
+
+        return ('none', None, None)

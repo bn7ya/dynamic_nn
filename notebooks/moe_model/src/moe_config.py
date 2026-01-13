@@ -71,6 +71,44 @@ class MoEHealthConfig:
 
 
 @dataclass
+class DynamicExpertConfig:
+    """Configuration for dynamic expert modification (add/remove/merge)."""
+
+    # Expert count constraints
+    min_experts: int = 2
+    max_experts: int = 16
+
+    # Addition parameters (clone from most-loaded + noise)
+    enable_expert_addition: bool = True
+    add_probability: float = 0.3
+    clone_noise_scale: float = 0.1
+    add_efficiency_threshold: float = 0.8
+    add_load_imbalance_threshold: float = 0.6
+
+    # Removal parameters (based on efficiency score)
+    enable_expert_removal: bool = True
+    remove_probability: float = 0.2
+    remove_efficiency_threshold: float = 0.2
+    remove_utilization_threshold: float = 0.05
+    removal_cooldown_epochs: int = 10
+
+    # Merging parameters (combine similar experts)
+    enable_expert_merging: bool = True
+    merge_probability: float = 0.2
+    merge_similarity_threshold: float = 0.85
+    merge_efficiency_weight: float = 0.5
+
+    # Architecture change frequency
+    architecture_change_interval: int = 10
+    modification_phase: int = 3  # Only modify in Phase 3
+
+    # Importance score weights for removal decision
+    efficiency_utilization_weight: float = 0.3
+    efficiency_gradient_weight: float = 0.3
+    efficiency_loss_weight: float = 0.4
+
+
+@dataclass
 class MoETrainingPhaseConfig:
     """Configuration for 4-phase training approach (adapted for MoE)."""
     # Phase 1: Exploration - discover expert specializations
@@ -140,6 +178,7 @@ class DynamicMoEConfig:
     health: MoEHealthConfig = field(default_factory=MoEHealthConfig)
     training_phase: MoETrainingPhaseConfig = field(default_factory=MoETrainingPhaseConfig)
     reward_penalty: RewardPenaltyConfig = field(default_factory=RewardPenaltyConfig)
+    dynamic_expert: DynamicExpertConfig = field(default_factory=DynamicExpertConfig)
 
     # Gradient clipping
     max_grad_norm: float = 1.0
@@ -180,6 +219,13 @@ class MoETrainingResult:
 
     # Phase metrics
     phase_metrics: Dict[str, Any] = field(default_factory=dict)
+
+    # Architecture change tracking (dynamic expert modification)
+    experts_added: int = 0
+    experts_removed: int = 0
+    experts_merged: int = 0
+    final_num_experts: int = 0
+    expert_count_history: List[int] = field(default_factory=list)
 
 
 @dataclass

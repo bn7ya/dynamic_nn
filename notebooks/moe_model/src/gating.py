@@ -311,6 +311,87 @@ class GatingNetwork:
         """Unfreeze gating network."""
         self.trainable = True
 
+    def add_expert_slot(self) -> int:
+        """
+        Expand gating network to accommodate one additional expert.
+
+        Expands:
+        - W_gate: (input_dim, num_experts) -> (input_dim, num_experts+1)
+        - b_gate: (num_experts,) -> (num_experts+1,)
+        - expert_loads: (num_experts,) -> (num_experts+1,)
+        - dW_gate, db_gate: matching gradient accumulators
+
+        Returns:
+            int: Index of the new expert slot
+        """
+        new_expert_idx = self.num_experts
+
+        # Expand W_gate with small random initialization for new expert
+        new_W_col = np.random.randn(self.input_dim, 1) * 0.01
+        self.W_gate = np.hstack([self.W_gate, new_W_col])
+
+        # Expand b_gate with zero initialization
+        self.b_gate = np.append(self.b_gate, 0.0)
+
+        # Expand gradient accumulators
+        self.dW_gate = np.hstack([self.dW_gate, np.zeros((self.input_dim, 1))])
+        self.db_gate = np.append(self.db_gate, 0.0)
+
+        # Expand load tracking
+        self.expert_loads = np.append(self.expert_loads, 0.0)
+
+        # Update count
+        self.num_experts += 1
+
+        return new_expert_idx
+
+    def remove_expert_slot(self, idx: int) -> None:
+        """
+        Contract gating network by removing one expert slot.
+
+        Contracts:
+        - W_gate: remove column at idx
+        - b_gate: remove element at idx
+        - expert_loads: remove element at idx
+        - Re-index all tracking arrays
+
+        Args:
+            idx: Index of expert to remove (must be valid and not the only expert)
+
+        Raises:
+            ValueError: If idx is invalid or would remove last expert
+        """
+        if self.num_experts <= 1:
+            raise ValueError("Cannot remove the only expert")
+        if idx < 0 or idx >= self.num_experts:
+            raise ValueError(f"Invalid expert index {idx}, valid range [0, {self.num_experts-1}]")
+
+        # Create mask for columns/elements to keep
+        keep_mask = np.ones(self.num_experts, dtype=bool)
+        keep_mask[idx] = False
+
+        # Contract W_gate by removing column at idx
+        self.W_gate = self.W_gate[:, keep_mask]
+
+        # Contract b_gate by removing element at idx
+        self.b_gate = self.b_gate[keep_mask]
+
+        # Contract gradient accumulators
+        self.dW_gate = self.dW_gate[:, keep_mask]
+        self.db_gate = self.db_gate[keep_mask]
+
+        # Contract load tracking
+        self.expert_loads = self.expert_loads[keep_mask]
+
+        # Update count
+        self.num_experts -= 1
+
+        # Clear load history since indices no longer match
+        self.expert_load_history = []
+
+        # Clear cache since expert indices changed
+        self._cache = {}
+
     def get_stats(self) -> dict:
         """Get gating statistics for monitoring."""
         load_dist = self.get_load_distribution()
