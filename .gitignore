@@ -11,3 +11,5 @@ nul
 python/pydnn/__pycache__/*.pyc
 python/pydnn/*.pyd
 notebooks/text_to_image/models/*.pth
+notebooks
+examples
