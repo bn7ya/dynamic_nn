@@ -246,7 +246,7 @@ private:
         out << "# Auto-generated requirements for Dynamic Neural Network\n";
         out << "\n";
         out << "# Core library\n";
-        out << "pydnn>=1.0.0\n";
+        out << "pydnn>=0.0.1\n";
         out << "\n";
         out << "# Visualization (optional)\n";
         out << "matplotlib>=3.5.0\n";

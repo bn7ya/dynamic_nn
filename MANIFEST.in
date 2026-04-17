@@ -1,0 +1,15 @@
+include CMakeLists.txt
+include README.md
+include pyproject.toml
+recursive-include cmake *.cmake *.in
+recursive-include include *.hpp *.h
+recursive-include src *.cpp *.c *.cu *.h *.hpp
+recursive-include python/pydnn *.py *.cpp *.hpp *.h
+
+global-exclude __pycache__
+global-exclude *.pyc
+global-exclude *.pyo
+global-exclude *.so
+global-exclude *.pyd
+global-exclude *.dll
+global-exclude *.dylib

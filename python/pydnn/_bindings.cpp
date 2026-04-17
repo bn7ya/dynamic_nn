@@ -422,6 +422,6 @@ PYBIND11_MODULE(_dnn_core, m) {
           "Load model from file");
 
     // Version info
-    m.attr("__version__") = "1.0.0";
+    m.attr("__version__") = "0.0.1";
     m.attr("__author__") = "Dynamic Neural Network Library";
 }
