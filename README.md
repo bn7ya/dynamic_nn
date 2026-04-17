@@ -39,7 +39,7 @@ On top of that, the trainer adapts its own hyperparameters: learning rate, batch
 ### Install from source
 
 ```bash
-git clone https://github.com/dnn/dynamic_nn.git
+git clone https://github.com/bn7ya/dynamic_nn.git
 cd dynamic_nn
 pip install .
 ```
