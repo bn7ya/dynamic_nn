@@ -14,11 +14,6 @@ namespace simd {
 // Explicit template instantiation for factory methods
 
 template<>
-std::unique_ptr<SIMDOps<float>> SIMDOps<float>::create() {
-    return create(CPUFeatures::instance().best_available());
-}
-
-template<>
 std::unique_ptr<SIMDOps<float>> SIMDOps<float>::create(SIMDLevel level) {
 #if defined(__AVX__) || defined(__AVX2__) || defined(DNN_ENABLE_AVX) || \
     (defined(_MSC_VER) && defined(__AVX2__))
@@ -49,7 +44,7 @@ std::unique_ptr<SIMDOps<float>> SIMDOps<float>::create(SIMDLevel level) {
 }
 
 template<>
-std::unique_ptr<SIMDOps<double>> SIMDOps<double>::create() {
+std::unique_ptr<SIMDOps<float>> SIMDOps<float>::create() {
     return create(CPUFeatures::instance().best_available());
 }
 
@@ -60,6 +55,11 @@ std::unique_ptr<SIMDOps<double>> SIMDOps<double>::create(SIMDLevel level) {
     // TODO: Add AVX double implementation
     (void)level;
     return std::make_unique<ScalarOps<double>>();
+}
+
+template<>
+std::unique_ptr<SIMDOps<double>> SIMDOps<double>::create() {
+    return create(CPUFeatures::instance().best_available());
 }
 
 } // namespace simd

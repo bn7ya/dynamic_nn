@@ -21,9 +21,5 @@ template class SGDMomentumOptimizer<double>;
 template class AdamOptimizer<double>;
 template class RMSpropOptimizer<double>;
 
-// Factory method explicit instantiation
-template std::unique_ptr<Optimizer<float>> Optimizer<float>::create(const OptimizerConfig& config);
-template std::unique_ptr<Optimizer<double>> Optimizer<double>::create(const OptimizerConfig& config);
-
 } // namespace training
 } // namespace dnn

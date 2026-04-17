@@ -1,6 +1,7 @@
 #pragma once
 
 #include "aligned_allocator.hpp"
+#include <atomic>
 #include <mutex>
 #include <vector>
 #include <unordered_map>

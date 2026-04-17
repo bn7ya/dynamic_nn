@@ -5,6 +5,7 @@
 #include <typeindex>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 
 namespace dnn {
 namespace cqrs {
