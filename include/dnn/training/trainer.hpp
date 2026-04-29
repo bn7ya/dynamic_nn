@@ -163,6 +163,17 @@ struct TrainerConfig {
     size_t phase4_max_epochs = 200;               // Maximum training epochs
     size_t phase4_patience = 35;                  // Early stopping patience (increased from 15)
     double phase4_min_improvement = 1e-5;         // Minimum cost improvement threshold
+
+    // Concurrent runtime (StageController + MetricsBus + observer thread).
+    // When true, train_phased() routes the four stages through the
+    // controller-driven pipeline in include/dnn/training/runtime/. The
+    // controller publishes per-epoch metrics, runs an Estimation observer
+    // in parallel with the active training stage, and can raise a rewind
+    // signal so the controller wakes an earlier stage from its preserved
+    // state. When false (default), the legacy strictly-sequential body
+    // runs unchanged. This flag exists so the new path is opt-in until
+    // it has stabilised.
+    bool runtime_enabled = false;
 };
 
 /**
