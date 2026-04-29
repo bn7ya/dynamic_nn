@@ -859,9 +859,12 @@ class DynamicNetwork:
         """Train using C++ backend."""
         from . import _dnn_core
 
-        # Convert to C++ tensors
-        inputs = [_dnn_core.Tensor(x) for x in X]
-        targets = [_dnn_core.Tensor(t) for t in y]
+        # PyTrainer::train() accepts raw numpy arrays directly (it
+        # converts to per-sample tensors internally). Make sure the
+        # arrays are float32 and contiguous so the buffer protocol path
+        # in the binding is happy.
+        inputs = np.ascontiguousarray(X, dtype=np.float32)
+        targets = np.ascontiguousarray(y, dtype=np.float32)
 
         # Build a TrainerConfig that opts into the concurrent runtime
         # if the user requested it. Other fields keep their C++ defaults.
@@ -910,7 +913,11 @@ class DynamicNetwork:
             stopping_reason=cpp_result.stopping_reason,
             cost_history=list(cpp_result.cost_history),
             efficiency_history=list(cpp_result.efficiency_history),
-            training_time_ms=cpp_result.training_time.count()
+            training_time_ms=(
+                cpp_result.training_time.count()
+                if hasattr(cpp_result.training_time, "count")
+                else int(cpp_result.training_time)
+            ),
         )
 
     def _fit_python(self, X, y, callback, verbose) -> TrainingResult:
@@ -2518,9 +2525,12 @@ class DynamicNetwork:
             from . import _dnn_core
             outputs = []
             for x in X:
-                tensor = _dnn_core.Tensor(x.flatten())
-                output = self._network.predict(tensor)
-                outputs.append(output.numpy())
+                # PyNetwork::predict accepts a numpy array directly
+                # and returns a numpy array (not a Tensor).
+                output = self._network.predict(
+                    np.ascontiguousarray(x.flatten(), dtype=np.float32)
+                )
+                outputs.append(np.asarray(output))
             output = np.array(outputs)
         else:
             # Python fallback - works with multi-layer dynamic architecture
