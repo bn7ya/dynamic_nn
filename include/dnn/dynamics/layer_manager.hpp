@@ -233,7 +233,11 @@ public:
     }
 
     /**
-     * Remove a layer.
+     * Remove a layer (soft).
+     *
+     * Marks the layer inactive without dropping its weights, so the
+     * controller can reactivate it later. Hard removal is deferred to
+     * Network::compact() at end of training.
      */
     void remove_layer(size_t index) {
         if (!health_monitor_.allow_layer_removal()) {
@@ -244,7 +248,7 @@ public:
         }
 
         size_t nodes_removed = network_.layer(index).num_nodes();
-        network_.remove_layer(index);
+        network_.mark_layer_inactive(index);
         health_monitor_.record_change(-1, -static_cast<int>(nodes_removed));
     }
 

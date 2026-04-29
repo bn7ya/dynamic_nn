@@ -25,6 +25,8 @@ When the network sees low‑information neurons, it prunes them. When it sees a 
 
 On top of that, the trainer adapts its own hyperparameters: learning rate, batch size (small → large), and the fraction of trainable nodes (100% → 1%) all shift automatically as training progresses through its phases.
 
+> **Concurrent training (in progress).** The four phases — Exploration / Estimation / Main / Standard — are being moved off a strictly serial pipeline onto long-lived stage workers driven by a `StageController` with a feedback loop: the Estimation stage runs *in parallel* with whichever stage currently owns the weights, watches its cost trend, and rewinds the pipeline (Main → Estimation → Exploration) when convergence stalls. Mid-training "remove node" and "remove layer" never erase weights — they flip an active mask, so the controller can soft-prune capacity in one stage and reactivate it later from another. Hard erasure runs once at the end via `Network::compact()` to produce a lean inference-ready model. See `docs/dynamic_nn_diagram.md` for the architecture.
+
 ---
 
 ## Installation

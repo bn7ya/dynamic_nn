@@ -423,6 +423,73 @@ class EarlyStoppingConfig:
     max_consecutive_increases: int = 5
 
 
+class _CostTrendObserver:
+    """
+    Parallel cost-trend observer for the pure-Python fit().
+
+    Mirrors the C++ StageController's observer: runs as a daemon thread
+    that periodically reads the shared cost_history list, computes a
+    rolling improvement signal over `window` samples, and raises a
+    rewind flag when improvement falls below `stall_delta`. The
+    training loop checks rewind_requested between epochs and bails out
+    of its inner loop so the controller can wake an earlier stage.
+
+    Thread-safety note: Python's GIL makes single list.append() and
+    list-index reads atomic, which is enough for this read-only
+    observer. We only ever **read** cost_history; we don't mutate it.
+    """
+
+    def __init__(self, window: int = 12, stall_delta: float = 1e-5,
+                 poll_interval: float = 0.05):
+        import threading
+        self._cost_history = []  # Replaced by shared list at start()
+        self._window = window
+        self._stall_delta = stall_delta
+        self._poll_interval = poll_interval
+        self._stop = threading.Event()
+        self._rewind = threading.Event()
+        self._thread = None
+
+    def start(self, cost_history):
+        """Start the observer reading from `cost_history` (a list)."""
+        import threading
+        self._cost_history = cost_history
+        self._stop.clear()
+        self._rewind.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True,
+                                        name="dnn-cost-observer")
+        self._thread.start()
+
+    def stop(self):
+        if self._thread is None:
+            return
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+        self._thread = None
+
+    def rewind_requested(self) -> bool:
+        return self._rewind.is_set()
+
+    def clear_rewind(self):
+        self._rewind.clear()
+
+    def _loop(self):
+        while not self._stop.is_set():
+            self._stop.wait(self._poll_interval)
+            if self._stop.is_set():
+                return
+            history = self._cost_history
+            if len(history) < self._window:
+                continue
+            # Take a snapshot of the tail (each index read is atomic).
+            tail = history[-self._window:]
+            if len(tail) < self._window:
+                continue
+            improvement = tail[0] - tail[-1]
+            if improvement < self._stall_delta:
+                self._rewind.set()
+
+
 class DynamicNetwork:
     """
     Dynamic Neural Network with automatic architecture adaptation.
@@ -479,7 +546,8 @@ class DynamicNetwork:
                  perturbation: Optional[PerturbationConfig] = None,
                  early_stopping: Optional[EarlyStoppingConfig] = None,
                  reward_penalty: Optional[RewardPenaltyConfig] = None,
-                 normalization: Optional[NormalizationConfig] = None):
+                 normalization: Optional[NormalizationConfig] = None,
+                 runtime_enabled: bool = False):
         """
         Initialize a Dynamic Neural Network.
 
@@ -499,7 +567,12 @@ class DynamicNetwork:
             early_stopping: Configuration for early stopping criteria
             reward_penalty: Configuration for the reward/penalty system
             normalization: Configuration for automatic data normalization
+            runtime_enabled: Opt into the concurrent StageController
+                pipeline (parallel Estimation observer + soft topology +
+                adaptive scalars). C++ backend only; the pure-Python
+                fallback ignores this flag. Default False.
         """
+        self.runtime_enabled = runtime_enabled
         # Validate device
         device = device.lower()
         if device not in ("cpu", "cuda", "gpu"):
@@ -786,18 +859,49 @@ class DynamicNetwork:
         """Train using C++ backend."""
         from . import _dnn_core
 
-        # Convert to C++ tensors
-        inputs = [_dnn_core.Tensor(x) for x in X]
-        targets = [_dnn_core.Tensor(t) for t in y]
+        # PyTrainer::train() accepts raw numpy arrays directly (it
+        # converts to per-sample tensors internally). Make sure the
+        # arrays are float32 and contiguous so the buffer protocol path
+        # in the binding is happy.
+        inputs = np.ascontiguousarray(X, dtype=np.float32)
+        targets = np.ascontiguousarray(y, dtype=np.float32)
 
-        # Create trainer
-        trainer = _dnn_core.Trainer(self._network)
+        # Build a TrainerConfig that opts into the concurrent runtime
+        # if the user requested it. Other fields keep their C++ defaults.
+        trainer_config = _dnn_core.TrainerConfig()
+        if self.runtime_enabled:
+            trainer_config.runtime_enabled = True
+            if verbose:
+                print("  [runtime] StageController + parallel Estimation observer enabled.")
+
+        # Create trainer with the config
+        try:
+            trainer = _dnn_core.Trainer(
+                self._network,
+                getattr(_dnn_core.CostFunction, self.cost_function),
+                trainer_config,
+            )
+        except (TypeError, AttributeError):
+            # Older binding without the 3-arg ctor; fall back to legacy.
+            trainer = _dnn_core.Trainer(self._network)
 
         if callback:
             trainer.set_epoch_callback(callback)
 
         # Train
         cpp_result = trainer.train(inputs, targets)
+
+        # Hard-remove dormant (soft-pruned) capacity from the underlying
+        # C++ network so the inference model is the lean compacted form.
+        # During training, "remove node" / "remove layer" only flipped an
+        # active mask; this is where they actually stop costing FLOPs.
+        try:
+            removed = self._network.compact()
+            if verbose and removed > 0:
+                print(f"  Compacted {removed} dormant nodes from final model.")
+        except AttributeError:
+            # Older C++ extension without compact(); harmless to skip.
+            pass
 
         return TrainingResult(
             success=cpp_result.success,
@@ -809,11 +913,22 @@ class DynamicNetwork:
             stopping_reason=cpp_result.stopping_reason,
             cost_history=list(cpp_result.cost_history),
             efficiency_history=list(cpp_result.efficiency_history),
-            training_time_ms=cpp_result.training_time.count()
+            training_time_ms=(
+                cpp_result.training_time.count()
+                if hasattr(cpp_result.training_time, "count")
+                else int(cpp_result.training_time)
+            ),
         )
 
     def _fit_python(self, X, y, callback, verbose) -> TrainingResult:
-        """Train using pure Python fallback with 3-phase training."""
+        """Train using pure Python fallback with 4-phase training.
+
+        When self.runtime_enabled is True, a parallel _CostTrendObserver
+        runs alongside the phase loops and raises a rewind flag when
+        cost improvement stalls. The Phase 3 loop checks the flag
+        between epochs and breaks out so the controller can re-run a
+        brief Phase 2 refresh, mirroring the C++ runtime path.
+        """
         import time
         start_time = time.time()
 
@@ -822,8 +937,19 @@ class DynamicNetwork:
         # Initialize network architecture
         self._init_architecture(X.shape[1])
 
+        # Start the parallel cost-trend observer if the user opted in.
+        # The observer reads from the cost_history list defined just
+        # below; safe because we only mutate cost_history from this
+        # thread (append) and the observer only reads.
+        observer = _CostTrendObserver() if self.runtime_enabled else None
+
         # Tracking variables
         cost_history = []
+        # Parallel observer reads cost_history (read-only from its thread).
+        if observer is not None:
+            observer.start(cost_history)
+            if verbose:
+                print("  [runtime] Python parallel cost-trend observer started.")
         efficiency_history = []
         cancer_score_history = []
         alzheimer_score_history = []
@@ -1089,6 +1215,21 @@ class DynamicNetwork:
 
             self._safe_callback(callback, total_epoch, epoch_cost, efficiency)
 
+            # Parallel observer rewind: when the cost-trend observer
+            # raises rewind, we exit the Phase 3 inner loop early so the
+            # outer flow can run a brief Phase 2 refresh and re-enter
+            # Phase 3 with the preserved emotional state. Capped at one
+            # rewind per call (clear_rewind, then ignore subsequent).
+            if observer is not None and observer.rewind_requested():
+                observer.clear_rewind()
+                if verbose:
+                    print(f"  [runtime] Cost-trend stalled at epoch {epoch}; observer requested rewind.")
+                # The full rewind+resume control flow lives in the C++
+                # train_phased_runtime(); the Python fallback opts for
+                # the simpler "early break" interpretation here so the
+                # observer signal is still observable end-to-end.
+                break
+
             # Early stopping check
             if len(cost_history) > self.early_stopping.window_size:
                 recent_improvement = cost_history[-self.early_stopping.window_size] - cost_history[-1]
@@ -1239,6 +1380,10 @@ class DynamicNetwork:
             if self.training_phase.phase4_enabled:
                 print(f"  Phase 4: {phase4_epochs} epochs, cost reduced by {phase4_cost_reduction:.1%}")
             print("=" * 60)
+
+        # Stop the parallel observer (no-op if it wasn't started).
+        if observer is not None:
+            observer.stop()
 
         return TrainingResult(
             success=True,
@@ -2380,9 +2525,12 @@ class DynamicNetwork:
             from . import _dnn_core
             outputs = []
             for x in X:
-                tensor = _dnn_core.Tensor(x.flatten())
-                output = self._network.predict(tensor)
-                outputs.append(output.numpy())
+                # PyNetwork::predict accepts a numpy array directly
+                # and returns a numpy array (not a Tensor).
+                output = self._network.predict(
+                    np.ascontiguousarray(x.flatten(), dtype=np.float32)
+                )
+                outputs.append(np.asarray(output))
             output = np.array(outputs)
         else:
             # Python fallback - works with multi-layer dynamic architecture

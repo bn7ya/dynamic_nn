@@ -9,6 +9,10 @@
 #include "../dynamics/layer_manager.hpp"
 #include "../dynamics/health_monitor.hpp"
 #include "../dynamics/trainable_scheduler.hpp"
+#include "runtime/adaptive_config.hpp"
+#include "runtime/metrics_bus.hpp"
+#include "runtime/stage_controller.hpp"
+#include "runtime/topology_lock.hpp"
 #include <functional>
 #include <chrono>
 #include <memory>
@@ -163,6 +167,17 @@ struct TrainerConfig {
     size_t phase4_max_epochs = 200;               // Maximum training epochs
     size_t phase4_patience = 35;                  // Early stopping patience (increased from 15)
     double phase4_min_improvement = 1e-5;         // Minimum cost improvement threshold
+
+    // Concurrent runtime (StageController + MetricsBus + observer thread).
+    // When true, train_phased() routes the four stages through the
+    // controller-driven pipeline in include/dnn/training/runtime/. The
+    // controller publishes per-epoch metrics, runs an Estimation observer
+    // in parallel with the active training stage, and can raise a rewind
+    // signal so the controller wakes an earlier stage from its preserved
+    // state. When false (default), the legacy strictly-sequential body
+    // runs unchanged. This flag exists so the new path is opt-in until
+    // it has stabilised.
+    bool runtime_enabled = false;
 };
 
 /**
@@ -317,13 +332,34 @@ public:
     }
 
     /**
-     * Train with 3-phase approach:
-     * Phase 1: Exploration (10 epochs) - High LR, aggressive architecture changes
-     * Phase 2: Estimation (10 epochs) - Medium LR, estimate epochs needed
-     * Phase 3: Main training - Adaptive LR, perturbation, adaptive thresholds
+     * Train via the four-stage pipeline.
+     *
+     * Conceptually: Exploration → Estimation → Main → Standard. With
+     * TrainerConfig::runtime_enabled == true the call routes to
+     * train_phased_runtime(), which drives the four stages through a
+     * StageController. The Estimation **observer** thread runs in
+     * parallel for the lifetime of the call, drains the MetricsBus, and
+     * can raise rewind_requested() when Main's cost-trend stalls -- the
+     * controller responds with a brief Estimation refresh and re-enters
+     * Main with the preserved emotional state. Per-stage state (LR,
+     * emotional counters, epoch index) is preserved across suspends so
+     * rewinds don't lose learning progress.
+     *
+     * Topology mutations that previously hard-erased weights now go
+     * through Layer<T>::remove_nodes / Network<T>::mark_layer_inactive
+     * (soft); physical erasure runs only in Network<T>::compact() at
+     * end-of-training. Mutations take TopologyLock in write mode; the
+     * per-epoch step body holds it in read mode via run_stage().
+     *
+     * With runtime_enabled == false (the default) the legacy strictly
+     * sequential implementation runs unchanged.
      */
     TrainingResult train_phased(const std::vector<Tensor<T>>& inputs,
                                 const std::vector<Tensor<T>>& targets) {
+        if (config_.runtime_enabled) {
+            return train_phased_runtime(inputs, targets);
+        }
+
         auto total_start = std::chrono::high_resolution_clock::now();
 
         TrainingResult result;
@@ -635,6 +671,388 @@ public:
             result.stopping_reason = "Training completed";
         }
 
+        return result;
+    }
+
+    /**
+     * Concurrent-pipeline implementation of train_phased(), routed to
+     * when TrainerConfig::runtime_enabled == true.
+     *
+     * Each of the four stages runs as a callable handed to a
+     * StageController. The Estimation **observer** thread runs in
+     * parallel for the lifetime of the call: it drains the MetricsBus
+     * and (a) nudges RuntimeAdaptiveConfig scalars, (b) raises
+     * rewind_requested() when convergence stalls. When the Main stage
+     * sees a rewind it bails out of its inner loop; the controller
+     * loops once back through Estimation to refresh estimated_epochs
+     * and then re-enters Main with the preserved emotional state.
+     *
+     * Topology mutations during Main and Exploration take TopologyLock
+     * in write mode; the per-epoch step body holds it in read mode (via
+     * StageController::run_stage). Combined with Layer<T>'s soft-delete
+     * semantics this means in-flight workers never observe a half-applied
+     * topology change.
+     */
+    TrainingResult train_phased_runtime(const std::vector<Tensor<T>>& inputs,
+                                        const std::vector<Tensor<T>>& targets) {
+        namespace rt = dnn::training::runtime;
+
+        auto total_start = std::chrono::high_resolution_clock::now();
+
+        TrainingResult result;
+        result.cost_history.reserve(500);
+        result.efficiency_history.reserve(500);
+        result.cancer_score_history.reserve(500);
+        result.alzheimer_score_history.reserve(500);
+        result.architecture_history.reserve(500);
+
+        // Normalize data (same as legacy).
+        compute_normalization_params(inputs, targets);
+        std::vector<Tensor<T>> norm_inputs = inputs;
+        std::vector<Tensor<T>> norm_targets = targets;
+        normalize_data(norm_inputs, norm_targets);
+
+        // Pre-training adaptive weight initialisation (same as legacy).
+        for (size_t i = 0; i < std::min(size_t(100), norm_inputs.size()); ++i) {
+            network_.forward(norm_inputs[i]);
+        }
+        for (size_t l = 0; l < network_.num_layers(); ++l) {
+            network_.layer(l).compute_initial_variance_zscores();
+        }
+        for (size_t l = 0; l < network_.num_layers(); ++l) {
+            network_.layer(l).reset_node_metrics();
+        }
+
+        // Concurrent runtime substrate.
+        rt::MetricsBus bus(2048);
+        rt::TopologyLock topo_lock;
+        rt::RuntimeAdaptiveConfig adaptive_cfg;
+        rt::StageController controller(bus, adaptive_cfg, topo_lock);
+        controller.start_observer();
+
+        // Helper that records per-epoch metrics into `result`. Common to
+        // every stage so the result histories line up regardless of
+        // which stage is active.
+        auto record_epoch_metrics = [&](double epoch_cost) {
+            auto health = health_monitor_.diagnose();
+            result.cancer_score_history.push_back(health.cancer_score);
+            result.alzheimer_score_history.push_back(health.alzheimer_score);
+            result.architecture_history.emplace_back(network_.num_layers(),
+                                                     network_.num_nodes());
+            double efficiency = compute_efficiency(result.cost_history);
+            result.efficiency_history.push_back(efficiency);
+            if (epoch_cost < result.best_cost) result.best_cost = epoch_cost;
+            if (efficiency > result.best_efficiency) result.best_efficiency = efficiency;
+            return efficiency;
+        };
+
+        // ============ PHASE 1: EXPLORATION ============
+        auto phase1_start = std::chrono::high_resolution_clock::now();
+        const size_t phase1_epochs =
+            static_cast<size_t>(adaptive_cfg.exploration_epochs.current());
+
+        controller.run_stage(
+            rt::StageId::Exploration,
+            [&](uint64_t epoch_in_stage) {
+                health_monitor_.update_epoch(epoch_in_stage);
+                double lr = adaptive_cfg.exploration_lr.current();
+                double epoch_cost = train_epoch_with_lr(norm_inputs, norm_targets, lr);
+                result.cost_history.push_back(epoch_cost);
+
+                double sat = adaptive_cfg.exploration_saturation_threshold.current();
+                auto decision = layer_manager_.analyze_with_efficiency(sat);
+                if (decision.action != dynamics::LayerDecision::Action::None) {
+                    auto wlock = topo_lock.write_lock();
+                    layer_manager_.execute(decision);
+                    if (decision.action == dynamics::LayerDecision::Action::AddNodes) {
+                        result.nodes_added += decision.node_count;
+                    } else if (decision.action == dynamics::LayerDecision::Action::RemoveNodes) {
+                        result.nodes_removed += decision.nodes_to_remove.size();
+                    } else if (decision.action == dynamics::LayerDecision::Action::AddLayer) {
+                        result.layers_added++;
+                    } else if (decision.action == dynamics::LayerDecision::Action::RemoveLayer) {
+                        result.layers_removed++;
+                    }
+                }
+
+                double efficiency = record_epoch_metrics(epoch_cost);
+                controller.publish_metric(rt::StageId::Exploration,
+                                          epoch_in_stage, epoch_cost, efficiency,
+                                          lr, network_.topology_version());
+            },
+            [] { return true; },
+            phase1_epochs);
+
+        result.phase1_time = std::chrono::duration<double>(
+            std::chrono::high_resolution_clock::now() - phase1_start).count();
+
+        // Auto-detect gradient thresholds from Phase 1 statistics.
+        for (size_t l = 0; l < network_.num_layers(); ++l) {
+            double t = network_.layer(l).compute_gradient_threshold();
+            network_.layer(l).set_nodes_grad_threshold(t);
+        }
+
+        // ============ PHASE 2: ESTIMATION (observer also active) ============
+        auto phase2_start = std::chrono::high_resolution_clock::now();
+        const size_t phase2_epochs =
+            static_cast<size_t>(adaptive_cfg.estimation_epochs.current());
+        std::vector<double> estimation_costs;
+
+        controller.run_stage(
+            rt::StageId::Estimation,
+            [&](uint64_t epoch_in_stage) {
+                health_monitor_.update_epoch(phase1_epochs + epoch_in_stage);
+                double lr = adaptive_cfg.estimation_lr.current();
+                double epoch_cost = train_epoch_with_lr(norm_inputs, norm_targets, lr);
+                estimation_costs.push_back(epoch_cost);
+                result.cost_history.push_back(epoch_cost);
+                double efficiency = record_epoch_metrics(epoch_cost);
+                for (size_t l = 0; l < network_.num_layers(); ++l) {
+                    network_.layer(l).adapt_node_weights();
+                }
+                controller.publish_metric(rt::StageId::Estimation,
+                                          epoch_in_stage, epoch_cost, efficiency,
+                                          lr, network_.topology_version());
+            },
+            [] { return true; },
+            phase2_epochs);
+
+        // Estimate epochs needed for Main.
+        if (estimation_costs.size() >= 2) {
+            double avg_improvement =
+                (estimation_costs.front() - estimation_costs.back()) / phase2_epochs;
+            double current_efficiency = result.efficiency_history.back();
+            double gap = adaptive_cfg.target_efficiency.current() - current_efficiency;
+            result.estimated_epochs = static_cast<size_t>(std::max(
+                adaptive_cfg.main_epoch_min.current(),
+                std::min(adaptive_cfg.main_epoch_max.current(),
+                         gap / (avg_improvement * 0.1 + 1e-8))));
+        } else {
+            result.estimated_epochs =
+                static_cast<size_t>(adaptive_cfg.main_epoch_min.current());
+        }
+
+        result.phase2_time = std::chrono::duration<double>(
+            std::chrono::high_resolution_clock::now() - phase2_start).count();
+
+        // ============ PHASE 3: MAIN (with rewind handling) ============
+        auto phase3_start = std::chrono::high_resolution_clock::now();
+        EmotionalState emotional_state;
+        RewardPenaltyConfig rp_config;
+        rp_config.baseline_learning_rate = adaptive_cfg.main_lr.current();
+        rp_config.min_learning_rate = adaptive_cfg.reward_lr_floor.current();
+        rp_config.max_learning_rate = adaptive_cfg.reward_lr_ceiling.current();
+        double main_lr = adaptive_cfg.main_lr.current();
+        size_t perturbation_cutoff = static_cast<size_t>(
+            result.estimated_epochs * adaptive_cfg.perturbation_cutoff_ratio.current());
+
+        // Allow at most one rewind to keep training bounded; observer can
+        // raise rewind once during Main and the controller will re-run a
+        // brief Estimation pass before re-entering Main.
+        size_t rewinds_used = 0;
+        const size_t max_rewinds = 1;
+        bool keep_running = true;
+        size_t main_epochs_remaining = result.estimated_epochs;
+
+        while (keep_running && main_epochs_remaining > 0) {
+            controller.clear_rewind();
+            uint64_t executed = controller.run_stage(
+                rt::StageId::Main,
+                [&](uint64_t epoch_in_stage) {
+                    health_monitor_.update_epoch(
+                        phase1_epochs + phase2_epochs + epoch_in_stage);
+
+                    if (epoch_in_stage < perturbation_cutoff) {
+                        apply_random_perturbation(
+                            adaptive_cfg.perturbation_fraction.current());
+                        result.perturbations_applied++;
+                    }
+
+                    double efficiency_pre = compute_efficiency(result.cost_history);
+                    double sat_threshold = compute_sigmoid_threshold(efficiency_pre);
+                    (void)sat_threshold;  // currently used via layer_manager below
+
+                    double epoch_cost =
+                        train_epoch_with_lr(norm_inputs, norm_targets, main_lr);
+                    result.cost_history.push_back(epoch_cost);
+
+                    auto decision = layer_manager_.analyze_with_efficiency(efficiency_pre);
+                    if (decision.action != dynamics::LayerDecision::Action::None) {
+                        auto wlock = topo_lock.write_lock();
+                        layer_manager_.execute(decision);
+                        if (decision.action ==
+                            dynamics::LayerDecision::Action::AddNodes) {
+                            result.nodes_added += decision.node_count;
+                        }
+                    }
+
+                    double efficiency = record_epoch_metrics(epoch_cost);
+
+                    auto [new_lr, action] = apply_reward_penalty_system(
+                        main_lr, result.cost_history, result.efficiency_history,
+                        rp_config, emotional_state);
+                    main_lr = new_lr;
+                    result.learning_rate_history.push_back(main_lr);
+                    result.emotional_state_history.push_back(action);
+
+                    for (size_t l = 0; l < network_.num_layers(); ++l) {
+                        network_.layer(l).adapt_node_weights();
+                    }
+
+                    controller.publish_metric(rt::StageId::Main,
+                                              epoch_in_stage, epoch_cost,
+                                              efficiency, main_lr,
+                                              network_.topology_version());
+                },
+                [&] {
+                    if (controller.rewind_requested()) return false;
+                    size_t window =
+                        static_cast<size_t>(adaptive_cfg.early_stop_window.current());
+                    if (result.cost_history.size() > window) {
+                        double recent =
+                            result.cost_history[result.cost_history.size() - window]
+                            - result.cost_history.back();
+                        if (recent < 1e-6) {
+                            result.stopping_reason =
+                                "Early stopping (no improvement)";
+                            return false;
+                        }
+                    }
+                    return true;
+                },
+                main_epochs_remaining);
+
+            main_epochs_remaining = (executed < main_epochs_remaining)
+                                    ? main_epochs_remaining - executed
+                                    : 0;
+
+            if (controller.rewind_requested() && rewinds_used < max_rewinds) {
+                ++rewinds_used;
+                // Brief re-estimation pass: a few epochs of Estimation to
+                // refresh the cost-trend signal, then back into Main with
+                // preserved emotional state.
+                controller.clear_rewind();
+                size_t mini_phase2 = std::min<size_t>(phase2_epochs, 5);
+                std::vector<double> rewind_costs;
+                controller.run_stage(
+                    rt::StageId::Estimation,
+                    [&](uint64_t epoch_in_stage) {
+                        double lr = adaptive_cfg.estimation_lr.current();
+                        double c = train_epoch_with_lr(norm_inputs, norm_targets, lr);
+                        rewind_costs.push_back(c);
+                        result.cost_history.push_back(c);
+                        double e = record_epoch_metrics(c);
+                        controller.publish_metric(rt::StageId::Estimation,
+                                                  epoch_in_stage, c, e,
+                                                  lr, network_.topology_version());
+                    },
+                    [] { return true; },
+                    mini_phase2);
+                // Loop back into Main with whatever epochs remain.
+            } else {
+                keep_running = false;
+            }
+        }
+
+        // Copy emotional state into result.
+        result.total_rewards = emotional_state.total_rewards;
+        result.total_penalties = emotional_state.total_penalties;
+        result.lr_reset_count = emotional_state.lr_reset_count;
+        result.depression_history.assign(emotional_state.depression_history.begin(),
+                                         emotional_state.depression_history.end());
+        result.excitement_history.assign(emotional_state.excitement_history.begin(),
+                                         emotional_state.excitement_history.end());
+
+        result.phase3_time = std::chrono::duration<double>(
+            std::chrono::high_resolution_clock::now() - phase3_start).count();
+
+        // ============ PHASE 4: STANDARD (frozen architecture) ============
+        if (config_.phase4_enabled) {
+            auto phase4_start = std::chrono::high_resolution_clock::now();
+            double phase3_final_cost = result.cost_history.back();
+            size_t phase4_estimated =
+                estimate_phase4_epochs(phase3_final_cost, result.cost_history);
+            result.phase4_initial_cost = phase3_final_cost;
+            result.phase4_estimated_epochs = phase4_estimated;
+
+            double phase4_lr = config_.phase4_learning_rate;
+            double phase4_best_cost = phase3_final_cost;
+            size_t patience_counter = 0;
+
+            controller.run_stage(
+                rt::StageId::Standard,
+                [&](uint64_t epoch_in_stage) {
+                    double epoch_cost =
+                        train_epoch_with_lr(norm_inputs, norm_targets, phase4_lr);
+                    result.cost_history.push_back(epoch_cost);
+                    double efficiency = record_epoch_metrics(epoch_cost);
+
+                    if (epoch_cost < phase4_best_cost - config_.phase4_min_improvement) {
+                        phase4_best_cost = epoch_cost;
+                        patience_counter = 0;
+                    } else {
+                        ++patience_counter;
+                    }
+
+                    if (epoch_in_stage > 0 &&
+                        epoch_in_stage % config_.phase4_lr_decay_interval == 0) {
+                        phase4_lr = std::max(config_.phase4_min_learning_rate,
+                                             phase4_lr * config_.phase4_lr_decay_rate);
+                    }
+
+                    for (size_t l = 0; l < network_.num_layers(); ++l) {
+                        network_.layer(l).adapt_node_weights();
+                    }
+
+                    controller.publish_metric(rt::StageId::Standard,
+                                              epoch_in_stage, epoch_cost,
+                                              efficiency, phase4_lr,
+                                              network_.topology_version());
+                    result.phase4_epochs = static_cast<size_t>(epoch_in_stage + 1);
+                },
+                [&] {
+                    if (patience_counter >= config_.phase4_patience) {
+                        result.phase4_early_stopped = true;
+                        result.stopping_reason =
+                            "Phase 4 early stopping (no improvement)";
+                        return false;
+                    }
+                    if (!result.cost_history.empty()) {
+                        double reduction = (result.phase4_initial_cost
+                                            - result.cost_history.back())
+                                           / (result.phase4_initial_cost + 1e-8);
+                        if (reduction >= config_.phase4_target_cost_reduction) {
+                            result.stopping_reason =
+                                "Phase 4 target cost reduction achieved";
+                            return false;
+                        }
+                    }
+                    return true;
+                },
+                phase4_estimated);
+
+            result.phase4_time = std::chrono::duration<double>(
+                std::chrono::high_resolution_clock::now() - phase4_start).count();
+            result.phase4_final_cost = result.cost_history.back();
+            result.phase4_cost_reduction =
+                (result.phase4_initial_cost - result.phase4_final_cost)
+                / (result.phase4_initial_cost + 1e-8);
+        }
+
+        controller.stop_observer();
+
+        auto total_end = std::chrono::high_resolution_clock::now();
+        result.training_time =
+            std::chrono::duration_cast<std::chrono::milliseconds>(total_end - total_start);
+        result.success = true;
+        result.epochs_completed = result.cost_history.size();
+        result.final_cost =
+            result.cost_history.empty() ? 0.0 : result.cost_history.back();
+        result.final_efficiency =
+            result.efficiency_history.empty() ? 0.5 : result.efficiency_history.back();
+        if (result.stopping_reason.empty()) {
+            result.stopping_reason = "Training completed";
+        }
         return result;
     }
 

@@ -37,34 +37,78 @@
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Three-Phase Training Process
+## Concurrent Stage Training (StageController + StageWorkers)
+
+Training is no longer four sequential phases. The four stages run as
+**long-lived stage workers** managed by a `StageController` that observes a
+shared `MetricsBus` and decides which workers to wake or suspend. Stages
+keep their per-stage state (learning rate, emotional counters, epoch index)
+across suspend/resume cycles, so the controller can rewind ("Stage 3
+stalled → wake Stage 2 to re-estimate → Stage 2 may wake Stage 1 to
+re-explore") without losing any progress.
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────────────┐
-│                              3-PHASE TRAINING                                       │
+│                       CONCURRENT STAGE WORKERS (with feedback)                      │
 ├────────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                     │
-│  ╔═══════════════════╗    ╔═══════════════════╗    ╔═════════════════════════╗    │
-│  ║   PHASE 1         ║    ║   PHASE 2         ║    ║   PHASE 3               ║    │
-│  ║   EXPLORATION     ║───▶║   ESTIMATION      ║───▶║   MAIN TRAINING         ║    │
-│  ║   (10 epochs)     ║    ║   (10 epochs)     ║    ║   (N epochs, estimated) ║    │
-│  ╚═══════════════════╝    ╚═══════════════════╝    ╚═════════════════════════╝    │
-│           │                        │                          │                    │
-│           ▼                        ▼                          ▼                    │
-│  ┌─────────────────┐     ┌─────────────────┐      ┌─────────────────────────┐     │
-│  │ • LR = 0.5      │     │ • LR = 0.1      │      │ • LR = Adaptive (R/P)   │     │
-│  │ • Batch = 64    │     │ • Batch = 64    │      │ • Batch = 32 → 256      │     │
-│  │ • Aggressive    │     │ • Measure       │      │ • Adaptive saturation   │     │
-│  │   growth (25%)  │     │   improvement   │      │   threshold (sigmoid)   │     │
-│  │ • Find viable   │     │ • Estimate      │      │ • Conservative growth   │     │
-│  │   architectures │     │   epochs needed │      │   (12.5%)               │     │
-│  │ • Sat.th = 0.3  │     │   for 90% eff.  │      │ • Perturbations (20%)   │     │
-│  │ • Track best    │     │                 │      │ • Reward/Penalty System │     │
-│  │   architecture  │     │                 │      │ • Emotional State Track │     │
-│  └─────────────────┘     └─────────────────┘      └─────────────────────────┘     │
+│   ┌────────────┐    ┌────────────┐    ┌────────────┐    ┌────────────┐             │
+│   │ STAGE 1    │    │ STAGE 2    │    │ STAGE 3    │    │ STAGE 4    │             │
+│   │ Exploration│    │ Estimation │    │ Main       │    │ Standard   │             │
+│   │ (worker)   │    │ (observer) │    │ (worker)   │    │ (worker)   │             │
+│   └─────┬──────┘    └─────┬──────┘    └─────┬──────┘    └─────┬──────┘             │
+│         │ cost samples    │ trend signals   │ cost samples    │ cost samples       │
+│         ▼                 ▼                 ▼                 ▼                     │
+│   ┌──────────────────────────────────────────────────────────────────┐             │
+│   │                       METRICS BUS (ring buffer)                  │             │
+│   └─────────────────────────────┬────────────────────────────────────┘             │
+│                                 │                                                   │
+│                                 ▼                                                   │
+│         ┌────────────────────────────────────────────────────────┐                  │
+│         │                   STAGE CONTROLLER                     │                  │
+│         │                                                        │                  │
+│         │ • activate() / suspend() / reset() / finish()          │                  │
+│         │ • feedback rules: cost rising → wake earlier stage     │                  │
+│         │ • nudges RuntimeAdaptiveConfig scalars per epoch       │                  │
+│         └────────────────────────────────────────────────────────┘                  │
 │                                                                                     │
+│   Topology mutations go through TopologyLock (shared_mutex) so workers              │
+│   doing forward/backward never observe a half-applied add/remove.                   │
 └────────────────────────────────────────────────────────────────────────────────────┘
 ```
+
+**Stage roles**
+
+| Stage | Role | Modifies weights? | Modifies architecture? |
+|---|---|---|---|
+| 1 Exploration | Aggressively varies architecture; high LR | Yes | Yes (soft) |
+| 2 Estimation | Pure observer — tracks cost trend, retunes config scalars | No | No |
+| 3 Main | Adaptive LR via reward/penalty + emotional state | Yes | Yes (soft, conservative) |
+| 4 Standard | Frozen architecture, fine-tunes weights to a target reduction | Yes | No |
+
+Stage 2 runs **in parallel** with whichever worker currently owns the
+weights — it is a pure observer that publishes trend signals back to the
+controller, which uses them to rewind the pipeline if convergence stalls.
+
+**Soft topology**
+
+Mid-training "remove node" and "remove layer" no longer erase weights —
+they flip an `active_mask_` bit on the `Layer` (or `layer_active_` on the
+`Network`). Forward pass emits zero for inactive nodes, backward pass
+zeroes their grads, `apply_gradients` skips them, and `add_nodes` prefers
+**reactivating** dormant slots before allocating new ones. Hard removal
+runs once at end-of-training via `Network::compact()`, which produces the
+lean inference-ready graph. Bumped `topology_version_` lets workers detect
+that the graph has shifted under them.
+
+**Adaptive configuration**
+
+All previously hardcoded learning constants live in a
+`RuntimeAdaptiveConfig` of `AdaptiveScalar` fields (atomic, clamped to
+`[min, max]`). Stages read `scalar.current()` per epoch; the controller
+calls `scalar.scale()` or `scalar.nudge()` from the feedback loop. Affected:
+LR per stage, patience, batch growth, perturbation fraction, reward/penalty
+window, cancer/alzheimer thresholds, etc.
 
 ## Node Efficiency & Dynamic Architecture
 
@@ -634,7 +678,10 @@ network = DynamicNetwork(
     cost_function="CrossEntropy"
 )
 
-# Train with automatic 3-phase process
+# Train with the controller-driven concurrent stage workers
+# (Exploration / Estimation / Main / Standard with feedback rewinds).
+# Network::compact() is called automatically after fit() to hard-remove
+# any nodes/layers that were soft-pruned during training.
 result = network.fit(X_train, y_train, verbose=True)
 
 # Check health including emotional state
