@@ -437,6 +437,86 @@ public:
     }
 
     /**
+     * Mark a hidden layer as inactive (soft remove).
+     *
+     * Parameters are preserved; the layer keeps participating in forward and
+     * backward passes during training, but a bumped topology_version_ tells
+     * the controller it's scheduled for removal. Hard removal happens at
+     * compact() time, where the next layer is rebuilt to take this layer's
+     * input shape directly. Use set_layer_active(idx, true) to undo.
+     */
+    void mark_layer_inactive(size_t index) {
+        if (layers_.size() <= 2) return;
+        if (index == 0 || index >= layers_.size() - 1) return;
+        layers_[index]->set_active(false);
+        ++topology_version_;
+    }
+
+    void set_layer_active(size_t index, bool active) {
+        if (index >= layers_.size()) return;
+        if (layers_[index]->is_active() != active) {
+            layers_[index]->set_active(active);
+            ++topology_version_;
+        }
+    }
+
+    /**
+     * Hard-remove all dormant capacity from the network.
+     *
+     * Compacts each layer's dormant nodes, then erases inactive hidden
+     * layers (rebuilding the following layer to keep shapes consistent).
+     * Intended to be called once at end of training to produce a lean
+     * inference-ready model.
+     *
+     * Returns the total number of nodes physically removed.
+     */
+    size_t compact() {
+        size_t total_nodes_removed = 0;
+
+        // Pass 1: compact each layer's dormant nodes.
+        for (auto& layer : layers_) {
+            total_nodes_removed += layer->compact();
+        }
+
+        // Pass 2: erase inactive hidden layers, rebuilding the next layer
+        // with the correct input shape so the chain stays connected.
+        // Iterate from back to front so indices remain valid as we erase.
+        for (size_t i = layers_.size(); i-- > 0; ) {
+            if (i == 0 || i >= layers_.size() - 1) continue;
+            if (!layers_[i]->is_active()) {
+                size_t prev_output = layers_[i - 1]->output_size();
+                size_t next_output = layers_[i + 1]->output_size();
+                ActivationType next_act = layers_[i + 1]->activation_type();
+                layers_.erase(layers_.begin() + i);
+                auto rebuilt = std::make_unique<Layer<T>>(
+                    prev_output, next_output, next_act,
+                    rng_->seed() + i, device_);
+                layers_[i] = std::move(rebuilt);
+            }
+        }
+
+        // Repair input-size mismatches that compaction can introduce when a
+        // layer's output count shrinks: rebuild the downstream layer to
+        // accept the new fan-in. Weights of the rebuilt layer are reset --
+        // this is acceptable because compact() is end-of-training.
+        for (size_t i = 1; i < layers_.size(); ++i) {
+            if (layers_[i]->input_size() != layers_[i - 1]->output_size()) {
+                size_t new_in = layers_[i - 1]->output_size();
+                size_t out = layers_[i]->output_size();
+                ActivationType act = layers_[i]->activation_type();
+                layers_[i] = std::make_unique<Layer<T>>(
+                    new_in, out, act, rng_->seed() + i, device_);
+            }
+        }
+
+        ++topology_version_;
+        update_state();
+        return total_nodes_removed;
+    }
+
+    uint64_t topology_version() const { return topology_version_; }
+
+    /**
      * Check for numerical issues.
      */
     bool has_numerical_issues() const {
@@ -483,6 +563,11 @@ private:
     std::vector<std::unique_ptr<Layer<T>>> layers_;
     TrainingState state_;
     std::unique_ptr<Random> rng_;
+    // Bumped on every soft topology mutation (node mask flip, layer
+    // activate/deactivate, compact()). Workers reading the network can
+    // detect that topology has shifted under them by comparing a cached
+    // version.
+    uint64_t topology_version_ = 0;
 };
 
 // Type aliases

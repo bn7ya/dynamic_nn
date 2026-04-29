@@ -74,6 +74,7 @@ public:
         , device_(device)
         , weights_(std::vector<size_t>{output_size, input_size})
         , biases_(std::vector<size_t>{output_size})
+        , active_mask_(output_size, uint8_t(1))
         , rng_(std::make_unique<Random>(seed)) {
 
         // Initialize nodes
@@ -162,6 +163,10 @@ private:
             // Single sample: input is (input_size,)
             linear_output = Tensor<T>(std::vector<size_t>{output_size_});
             for (size_t i = 0; i < output_size_; ++i) {
+                if (!is_node_active(i)) {
+                    linear_output[i] = T(0);
+                    continue;
+                }
                 T sum = biases_[i];
                 for (size_t j = 0; j < input_size_; ++j) {
                     sum += input[j] * weights_.at(i, j);
@@ -178,6 +183,10 @@ private:
 
             for (size_t b = 0; b < batch_size; ++b) {
                 for (size_t i = 0; i < output_size_; ++i) {
+                    if (!is_node_active(i)) {
+                        linear_output.at(b, i) = T(0);
+                        continue;
+                    }
                     T sum = biases_[i];
                     for (size_t j = 0; j < input_size_; ++j) {
                         sum += input.at(b, j) * weights_.at(i, j);
@@ -318,10 +327,15 @@ private:
         Tensor<T> grad_activation = activation_->backward(
             cached_pre_activation_, cached_output_, grad_output);
 
+        // Zero gradients for inactive (dormant) nodes so their parameters
+        // don't drift and no gradient flows upstream through them.
+        zero_inactive_gradients(grad_activation);
+
         // Compute gradients for weights and biases
         if (cached_input_.rank() == 1) {
             // Single sample
             for (size_t i = 0; i < output_size_; ++i) {
+                if (!is_node_active(i)) continue;
                 if (nodes_[i].is_trainable()) {
                     // Weight gradient: outer product
                     for (size_t j = 0; j < input_size_; ++j) {
@@ -352,6 +366,7 @@ private:
 
             for (size_t b = 0; b < batch_size; ++b) {
                 for (size_t i = 0; i < output_size_; ++i) {
+                    if (!is_node_active(i)) continue;
                     if (nodes_[i].is_trainable()) {
                         for (size_t j = 0; j < input_size_; ++j) {
                             weight_gradients_.at(i, j) +=
@@ -388,6 +403,10 @@ private:
         Tensor<T> grad_activation = activation_->backward(
             cached_pre_activation_, cached_output_, grad_output);
 
+        // Zero gradients for inactive (dormant) nodes so their parameters
+        // don't drift and no gradient flows upstream through them.
+        zero_inactive_gradients(grad_activation);
+
         // Move grad_activation to GPU
         cuda::CudaTensor<T> gpu_grad_activation(grad_activation);
 
@@ -410,6 +429,7 @@ private:
 
             // For now, compute on CPU and accumulate
             for (size_t i = 0; i < output_size_; ++i) {
+                if (!is_node_active(i)) continue;
                 if (nodes_[i].is_trainable()) {
                     for (size_t j = 0; j < input_size_; ++j) {
                         weight_gradients_.at(i, j) += grad_activation[i] * cached_input_[j];
@@ -437,6 +457,7 @@ private:
             // Accumulate weight gradients to CPU
             Tensor<T> weight_grad_cpu = gpu_weight_grad.to_host();
             for (size_t i = 0; i < output_size_; ++i) {
+                if (!is_node_active(i)) continue;
                 if (nodes_[i].is_trainable()) {
                     for (size_t j = 0; j < input_size_; ++j) {
                         weight_gradients_.at(i, j) += weight_grad_cpu.at(i, j);
@@ -447,6 +468,7 @@ private:
             // Bias gradient: sum of grad_activation along batch dimension
             for (size_t b = 0; b < batch_size; ++b) {
                 for (size_t i = 0; i < output_size_; ++i) {
+                    if (!is_node_active(i)) continue;
                     if (nodes_[i].is_trainable()) {
                         bias_gradients_[i] += grad_activation.at(b, i);
                     }
@@ -475,6 +497,7 @@ public:
      */
     void apply_gradients(T learning_rate) {
         for (size_t i = 0; i < output_size_; ++i) {
+            if (!is_node_active(i)) continue;
             if (nodes_[i].is_trainable()) {
                 for (size_t j = 0; j < input_size_; ++j) {
                     weights_.at(i, j) -= learning_rate * weight_gradients_.at(i, j);
@@ -559,7 +582,12 @@ public:
         metrics.trainable_nodes = trainable_count();
 
         double efficiency_sum = 0.0;
-        for (const auto& node : nodes_) {
+        size_t counted = 0;
+        for (size_t i = 0; i < nodes_.size(); ++i) {
+            // Dormant nodes are excluded from health metrics; they're effectively
+            // not part of the running model until reactivated or compacted away.
+            if (!is_node_active(i)) continue;
+            const auto& node = nodes_[i];
             auto node_metrics = node.compute_metrics();
             double eff = node_metrics.efficiency_score;
 
@@ -570,9 +598,10 @@ public:
             if (node.is_dead()) metrics.dead_nodes++;
             if (node.is_saturated()) metrics.saturated_nodes++;
             if (node_metrics.status == "normal") metrics.active_nodes++;
+            ++counted;
         }
 
-        metrics.avg_node_efficiency = efficiency_sum / nodes_.size();
+        metrics.avg_node_efficiency = counted > 0 ? efficiency_sum / counted : 0.0;
 
         // Compute output variance from cached output
         if (!cached_output_.empty()) {
@@ -710,13 +739,37 @@ public:
 
     /**
      * Add nodes to the layer.
+     *
+     * Prefers reactivating dormant slots (preserving their parameters) before
+     * physically growing the weight matrix. This is the soft-add half of the
+     * dynamic-topology contract: a remove followed by an add of the same
+     * count round-trips with weights intact.
+     *
+     * @return Number of slots reactivated (the rest were freshly allocated).
      */
-    void add_nodes(size_t count) {
+    size_t add_nodes(size_t count) {
+        if (count == 0) return 0;
+
+        // First, reactivate dormant slots in index order.
+        size_t reactivated = 0;
+        for (size_t i = 0; i < active_mask_.size() && reactivated < count; ++i) {
+            if (!active_mask_[i]) {
+                active_mask_[i] = uint8_t(1);
+                ++reactivated;
+            }
+        }
+
+        size_t to_allocate = count - reactivated;
+        if (to_allocate == 0) {
+            ++topology_version_;
+            return reactivated;
+        }
+
         size_t old_output_size = output_size_;
-        output_size_ += count;
+        output_size_ += to_allocate;
 
         // Add new nodes
-        for (size_t i = 0; i < count; ++i) {
+        for (size_t i = 0; i < to_allocate; ++i) {
             nodes_.emplace_back(old_output_size + i, true);
         }
 
@@ -746,42 +799,68 @@ public:
         }
         biases_ = std::move(new_biases);
 
+        // Extend the active mask for the freshly allocated rows.
+        active_mask_.resize(output_size_, uint8_t(1));
+
         // Reset gradient accumulators
         weight_gradients_ = Tensor<T>();
         bias_gradients_ = Tensor<T>();
+
+        ++topology_version_;
+        return reactivated;
     }
 
     /**
-     * Remove nodes from the layer.
-     * @param indices Indices of nodes to remove (must be sorted ascending)
+     * Mark nodes as inactive (soft remove).
+     *
+     * Parameters are preserved so the slot can be reactivated later by
+     * add_nodes(). Hard removal happens only at compact() time, which is
+     * called once at the end of training.
      */
     void remove_nodes(std::vector<size_t> indices) {
         if (indices.empty()) return;
-
-        // Sort indices in descending order for removal
-        std::sort(indices.begin(), indices.end(), std::greater<size_t>());
-
-        // Remove from highest index first
         for (size_t idx : indices) {
+            if (idx < active_mask_.size()) {
+                active_mask_[idx] = uint8_t(0);
+            }
+        }
+        ++topology_version_;
+    }
+
+    /**
+     * Hard-remove all dormant nodes from this layer's dense buffers.
+     * Returns the number of nodes physically removed.
+     *
+     * Intended to be called once at end of training (Network::compact()),
+     * not in the hot training loop.
+     */
+    size_t compact() {
+        std::vector<size_t> to_remove;
+        for (size_t i = 0; i < active_mask_.size(); ++i) {
+            if (!active_mask_[i]) to_remove.push_back(i);
+        }
+        if (to_remove.empty()) return 0;
+
+        // Sort descending so we can erase from nodes_ in-place.
+        std::sort(to_remove.begin(), to_remove.end(), std::greater<size_t>());
+        for (size_t idx : to_remove) {
             if (idx < nodes_.size()) {
                 nodes_.erase(nodes_.begin() + idx);
             }
         }
 
-        // Rebuild weights matrix
         size_t new_output_size = nodes_.size();
         Tensor<T> new_weights(std::vector<size_t>{new_output_size, input_size_});
         Tensor<T> new_biases(std::vector<size_t>{new_output_size});
 
         size_t dest_i = 0;
         for (size_t i = 0; i < output_size_; ++i) {
-            bool keep = std::find(indices.begin(), indices.end(), i) == indices.end();
-            if (keep) {
+            if (active_mask_[i]) {
                 for (size_t j = 0; j < input_size_; ++j) {
                     new_weights.at(dest_i, j) = weights_.at(i, j);
                 }
                 new_biases[dest_i] = biases_[i];
-                dest_i++;
+                ++dest_i;
             }
         }
 
@@ -789,15 +868,44 @@ public:
         biases_ = std::move(new_biases);
         output_size_ = new_output_size;
 
-        // Update node indices
-        for (size_t i = 0; i < nodes_.size(); ++i) {
-            // Node indices would need to be updated - they're stored internally
-        }
+        active_mask_.assign(output_size_, uint8_t(1));
 
-        // Reset gradient accumulators
         weight_gradients_ = Tensor<T>();
         bias_gradients_ = Tensor<T>();
+
+#ifdef DNN_ENABLE_CUDA
+        // Force GPU buffers to be re-uploaded on next forward.
+        gpu_weights_.reset();
+        gpu_biases_.reset();
+#endif
+
+        ++topology_version_;
+        return to_remove.size();
     }
+
+    // Soft-topology accessors.
+    bool is_node_active(size_t i) const {
+        return i < active_mask_.size() && active_mask_[i] != 0;
+    }
+    void set_node_active(size_t i, bool a) {
+        if (i < active_mask_.size()) {
+            active_mask_[i] = a ? uint8_t(1) : uint8_t(0);
+            ++topology_version_;
+        }
+    }
+    size_t active_node_count() const {
+        size_t n = 0;
+        for (uint8_t v : active_mask_) if (v) ++n;
+        return n;
+    }
+    bool is_active() const { return layer_active_; }
+    void set_active(bool a) {
+        if (layer_active_ != a) {
+            layer_active_ = a;
+            ++topology_version_;
+        }
+    }
+    uint64_t topology_version() const { return topology_version_; }
 
     /**
      * Prune nodes below efficiency threshold.
@@ -842,10 +950,34 @@ public:
         copy->weights_ = weights_.clone();
         copy->biases_ = biases_.clone();
         copy->nodes_ = nodes_;
+        copy->active_mask_ = active_mask_;
+        copy->layer_active_ = layer_active_;
+        copy->topology_version_ = topology_version_;
         return copy;
     }
 
 private:
+    /**
+     * Zero out grad_activation entries for inactive nodes.
+     * Used by both CPU and CUDA backward to ensure dormant nodes' params
+     * don't drift and no gradient flows upstream through them.
+     */
+    void zero_inactive_gradients(Tensor<T>& grad_activation) const {
+        if (active_mask_.empty()) return;
+        if (grad_activation.rank() == 1) {
+            for (size_t i = 0; i < output_size_; ++i) {
+                if (!is_node_active(i)) grad_activation[i] = T(0);
+            }
+        } else if (grad_activation.rank() == 2) {
+            size_t batch_size = grad_activation.shape()[0];
+            for (size_t b = 0; b < batch_size; ++b) {
+                for (size_t i = 0; i < output_size_; ++i) {
+                    if (!is_node_active(i)) grad_activation.at(b, i) = T(0);
+                }
+            }
+        }
+    }
+
     LayerType layer_type_;
     size_t input_size_;
     size_t output_size_;
@@ -855,6 +987,15 @@ private:
     Tensor<T> weights_;
     Tensor<T> biases_;
     std::vector<Node> nodes_;
+
+    // Soft-topology state. active_mask_[i] == 0 means the i-th node is
+    // dormant: forward pass emits zero for it, backward pass accumulates no
+    // gradient against it, and apply_gradients skips it. Parameters are
+    // preserved across remove_nodes/add_nodes round-trips. Hard removal
+    // happens only in compact().
+    std::vector<uint8_t> active_mask_;
+    bool layer_active_ = true;
+    uint64_t topology_version_ = 0;
 
     // Cached values for backward pass
     Tensor<T> cached_input_;
