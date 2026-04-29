@@ -79,6 +79,14 @@ public:
     size_t num_layers() const { return network_.num_layers(); }
     size_t num_parameters() const { return network_.num_parameters(); }
 
+    /**
+     * Hard-remove all soft-pruned (dormant) nodes and layers from the
+     * underlying network. Returns the number of nodes physically erased.
+     * Intended to be called once after fit() finishes so the inference
+     * model is the lean compacted form.
+     */
+    size_t compact() { return network_.compact(); }
+
     void to(core::Device device) { network_.to(device); }
     core::Device device() const { return network_.device(); }
 
@@ -390,6 +398,9 @@ PYBIND11_MODULE(_dnn_core, m) {
         .def("predict", &PyNetwork<float>::predict)
         .def("num_layers", &PyNetwork<float>::num_layers)
         .def("num_parameters", &PyNetwork<float>::num_parameters)
+        .def("compact", &PyNetwork<float>::compact,
+             "Hard-remove dormant (soft-pruned) nodes and layers. "
+             "Call once after fit() to produce a lean inference model.")
         .def("efficiency_report", &PyNetwork<float>::efficiency_report,
              py::arg("include_nodes") = false)
         .def("to", &PyNetwork<float>::to, py::arg("device"),

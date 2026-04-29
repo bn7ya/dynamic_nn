@@ -799,6 +799,18 @@ class DynamicNetwork:
         # Train
         cpp_result = trainer.train(inputs, targets)
 
+        # Hard-remove dormant (soft-pruned) capacity from the underlying
+        # C++ network so the inference model is the lean compacted form.
+        # During training, "remove node" / "remove layer" only flipped an
+        # active mask; this is where they actually stop costing FLOPs.
+        try:
+            removed = self._network.compact()
+            if verbose and removed > 0:
+                print(f"  Compacted {removed} dormant nodes from final model.")
+        except AttributeError:
+            # Older C++ extension without compact(); harmless to skip.
+            pass
+
         return TrainingResult(
             success=cpp_result.success,
             epochs_completed=cpp_result.epochs_completed,

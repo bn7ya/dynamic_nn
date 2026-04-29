@@ -3,6 +3,7 @@
 // they're wired up.
 #include "dnn/training/runtime/adaptive_config.hpp"
 #include "dnn/training/runtime/metrics_bus.hpp"
+#include "dnn/training/runtime/stage_controller.hpp"
 #include "dnn/training/runtime/stage_worker.hpp"
 #include "dnn/training/runtime/topology_lock.hpp"
 
@@ -26,6 +27,12 @@ namespace {
     TopologyLock tl;
     auto rg = tl.read_lock();
     (void)rg;
+
+    StageController ctrl(bus, cfg, tl);
+    (void)ctrl.active_stage();
+    ctrl.publish_metric(StageId::Exploration, 0, 0.0, 0.0, 0.0, 0);
+    ctrl.request_rewind(StageId::Estimation);
+    ctrl.clear_rewind();
 }
 }  // namespace
 
