@@ -317,10 +317,26 @@ public:
     }
 
     /**
-     * Train with 3-phase approach:
-     * Phase 1: Exploration (10 epochs) - High LR, aggressive architecture changes
-     * Phase 2: Estimation (10 epochs) - Medium LR, estimate epochs needed
-     * Phase 3: Main training - Adaptive LR, perturbation, adaptive thresholds
+     * Train via the four-stage pipeline.
+     *
+     * Conceptually: Exploration → Estimation → Main → Standard. Under the
+     * concurrent design (see include/dnn/training/runtime/) each stage is
+     * a long-lived worker driven by a StageController; the Estimation
+     * worker runs in parallel with whichever stage currently owns the
+     * weights, watches its cost-trend on the MetricsBus, and signals the
+     * controller to rewind to an earlier stage if convergence stalls.
+     * Per-stage state (LR, emotional counters, epoch index) is preserved
+     * across suspend/resume so rewinds don't lose learning progress.
+     *
+     * Topology mutations that previously hard-erased weights now go
+     * through Layer<T>::remove_nodes / Network<T>::mark_layer_inactive
+     * (soft); physical erasure runs only in Network<T>::compact() at
+     * end-of-training.
+     *
+     * NOTE: as of this commit the body still runs the legacy sequential
+     * implementation. The runtime substrate (AdaptiveScalar, MetricsBus,
+     * TopologyLock, StageWorker) has landed and the body will be replaced
+     * with the StageController in a follow-up.
      */
     TrainingResult train_phased(const std::vector<Tensor<T>>& inputs,
                                 const std::vector<Tensor<T>>& targets) {
