@@ -177,10 +177,14 @@ private:
                 nodes_[i].record_activation(static_cast<float>(sum));
             }
         } else if (input.rank() == 2) {
-            // Batch: input is (batch_size, input_size)
+            // Batch: input is (batch_size, input_size). Each (b, i) cell
+            // is independent so we parallelise the outer batch loop.
             size_t batch_size = input.shape()[0];
             linear_output = Tensor<T>(std::vector<size_t>{batch_size, output_size_});
 
+#ifdef DNN_HAS_OPENMP
+            #pragma omp parallel for schedule(static) if (batch_size > 4)
+#endif
             for (size_t b = 0; b < batch_size; ++b) {
                 for (size_t i = 0; i < output_size_; ++i) {
                     if (!is_node_active(i)) {
@@ -377,8 +381,15 @@ private:
                 }
             }
 
-            // Compute input gradient
+            // Compute input gradient. Each (b, j) cell is independent
+            // (no cross-write), so the outer batch loop parallelises
+            // safely. Weight-gradient accumulation above stays serial
+            // over batch because rows of weight_gradients_ are written
+            // by every b.
             Tensor<T> grad_input(std::vector<size_t>{batch_size, input_size_});
+#ifdef DNN_HAS_OPENMP
+            #pragma omp parallel for schedule(static) if (batch_size > 4)
+#endif
             for (size_t b = 0; b < batch_size; ++b) {
                 for (size_t j = 0; j < input_size_; ++j) {
                     T sum = T(0);

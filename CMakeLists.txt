@@ -219,6 +219,17 @@ endif()
 find_package(Threads REQUIRED)
 target_link_libraries(dnn_core PUBLIC Threads::Threads)
 
+# OpenMP for the CPU SIMD / batch loops. Optional: if not found, the
+# #pragma omp directives below degrade silently to serial loops.
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(dnn_core PUBLIC OpenMP::OpenMP_CXX)
+    target_compile_definitions(dnn_core PUBLIC DNN_HAS_OPENMP=1)
+    message(STATUS "OpenMP enabled for CPU parallelism")
+else()
+    message(STATUS "OpenMP not found; CPU loops will run serially")
+endif()
+
 # Python bindings
 if(DNN_BUILD_PYTHON)
     find_package(Python3 COMPONENTS Interpreter Development)
