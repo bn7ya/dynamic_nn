@@ -132,6 +132,7 @@ set(DNN_TRAINING_SOURCES
     src/training/early_stopping.cpp
     src/training/optimizer.cpp
     src/training/trainer.cpp
+    src/training/runtime/runtime_compile_check.cpp
 )
 
 set(DNN_DYNAMICS_SOURCES
