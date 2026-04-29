@@ -479,7 +479,8 @@ class DynamicNetwork:
                  perturbation: Optional[PerturbationConfig] = None,
                  early_stopping: Optional[EarlyStoppingConfig] = None,
                  reward_penalty: Optional[RewardPenaltyConfig] = None,
-                 normalization: Optional[NormalizationConfig] = None):
+                 normalization: Optional[NormalizationConfig] = None,
+                 runtime_enabled: bool = False):
         """
         Initialize a Dynamic Neural Network.
 
@@ -499,7 +500,12 @@ class DynamicNetwork:
             early_stopping: Configuration for early stopping criteria
             reward_penalty: Configuration for the reward/penalty system
             normalization: Configuration for automatic data normalization
+            runtime_enabled: Opt into the concurrent StageController
+                pipeline (parallel Estimation observer + soft topology +
+                adaptive scalars). C++ backend only; the pure-Python
+                fallback ignores this flag. Default False.
         """
+        self.runtime_enabled = runtime_enabled
         # Validate device
         device = device.lower()
         if device not in ("cpu", "cuda", "gpu"):
@@ -790,8 +796,24 @@ class DynamicNetwork:
         inputs = [_dnn_core.Tensor(x) for x in X]
         targets = [_dnn_core.Tensor(t) for t in y]
 
-        # Create trainer
-        trainer = _dnn_core.Trainer(self._network)
+        # Build a TrainerConfig that opts into the concurrent runtime
+        # if the user requested it. Other fields keep their C++ defaults.
+        trainer_config = _dnn_core.TrainerConfig()
+        if self.runtime_enabled:
+            trainer_config.runtime_enabled = True
+            if verbose:
+                print("  [runtime] StageController + parallel Estimation observer enabled.")
+
+        # Create trainer with the config
+        try:
+            trainer = _dnn_core.Trainer(
+                self._network,
+                getattr(_dnn_core.CostFunction, self.cost_function),
+                trainer_config,
+            )
+        except (TypeError, AttributeError):
+            # Older binding without the 3-arg ctor; fall back to legacy.
+            trainer = _dnn_core.Trainer(self._network)
 
         if callback:
             trainer.set_epoch_callback(callback)

@@ -361,7 +361,11 @@ PYBIND11_MODULE(_dnn_core, m) {
         .def_readwrite("enable_gradient_clipping", &training::TrainerConfig::enable_gradient_clipping)
         .def_readwrite("gradient_clip_value", &training::TrainerConfig::gradient_clip_value)
         .def_readwrite("normalization", &training::TrainerConfig::normalization)
-        .def_readwrite("phase4_patience", &training::TrainerConfig::phase4_patience);
+        .def_readwrite("phase4_patience", &training::TrainerConfig::phase4_patience)
+        .def_readwrite("runtime_enabled", &training::TrainerConfig::runtime_enabled,
+                       "When true, route train_phased() through the concurrent "
+                       "StageController (parallel Estimation observer + soft "
+                       "topology + adaptive scalars). Default false.");
 
     // Training result
     py::class_<training::TrainingResult>(m, "TrainingResult")
