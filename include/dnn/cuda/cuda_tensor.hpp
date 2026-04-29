@@ -210,6 +210,19 @@ private:
 
     std::vector<size_t> shape_;
     size_t size_;
+#ifdef DNN_ENABLE_CUDA
+    // Stream this tensor is bound to. nullptr (the default CUDA stream)
+    // preserves legacy behaviour. Stage workers running on per-worker
+    // streams set this so kernel launches and async copies don't
+    // serialise on the default stream.
+    cudaStream_t stream_ = nullptr;
+public:
+    /** Bind this tensor to a CUDA stream. */
+    void set_stream(cudaStream_t stream) { stream_ = stream; }
+    /** The stream this tensor's ops will be launched on. */
+    cudaStream_t stream() const { return stream_; }
+private:
+#endif
     void* device_ptr_;
 };
 
