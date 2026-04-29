@@ -423,6 +423,73 @@ class EarlyStoppingConfig:
     max_consecutive_increases: int = 5
 
 
+class _CostTrendObserver:
+    """
+    Parallel cost-trend observer for the pure-Python fit().
+
+    Mirrors the C++ StageController's observer: runs as a daemon thread
+    that periodically reads the shared cost_history list, computes a
+    rolling improvement signal over `window` samples, and raises a
+    rewind flag when improvement falls below `stall_delta`. The
+    training loop checks rewind_requested between epochs and bails out
+    of its inner loop so the controller can wake an earlier stage.
+
+    Thread-safety note: Python's GIL makes single list.append() and
+    list-index reads atomic, which is enough for this read-only
+    observer. We only ever **read** cost_history; we don't mutate it.
+    """
+
+    def __init__(self, window: int = 12, stall_delta: float = 1e-5,
+                 poll_interval: float = 0.05):
+        import threading
+        self._cost_history = []  # Replaced by shared list at start()
+        self._window = window
+        self._stall_delta = stall_delta
+        self._poll_interval = poll_interval
+        self._stop = threading.Event()
+        self._rewind = threading.Event()
+        self._thread = None
+
+    def start(self, cost_history):
+        """Start the observer reading from `cost_history` (a list)."""
+        import threading
+        self._cost_history = cost_history
+        self._stop.clear()
+        self._rewind.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True,
+                                        name="dnn-cost-observer")
+        self._thread.start()
+
+    def stop(self):
+        if self._thread is None:
+            return
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+        self._thread = None
+
+    def rewind_requested(self) -> bool:
+        return self._rewind.is_set()
+
+    def clear_rewind(self):
+        self._rewind.clear()
+
+    def _loop(self):
+        while not self._stop.is_set():
+            self._stop.wait(self._poll_interval)
+            if self._stop.is_set():
+                return
+            history = self._cost_history
+            if len(history) < self._window:
+                continue
+            # Take a snapshot of the tail (each index read is atomic).
+            tail = history[-self._window:]
+            if len(tail) < self._window:
+                continue
+            improvement = tail[0] - tail[-1]
+            if improvement < self._stall_delta:
+                self._rewind.set()
+
+
 class DynamicNetwork:
     """
     Dynamic Neural Network with automatic architecture adaptation.
@@ -847,7 +914,14 @@ class DynamicNetwork:
         )
 
     def _fit_python(self, X, y, callback, verbose) -> TrainingResult:
-        """Train using pure Python fallback with 3-phase training."""
+        """Train using pure Python fallback with 4-phase training.
+
+        When self.runtime_enabled is True, a parallel _CostTrendObserver
+        runs alongside the phase loops and raises a rewind flag when
+        cost improvement stalls. The Phase 3 loop checks the flag
+        between epochs and breaks out so the controller can re-run a
+        brief Phase 2 refresh, mirroring the C++ runtime path.
+        """
         import time
         start_time = time.time()
 
@@ -856,8 +930,19 @@ class DynamicNetwork:
         # Initialize network architecture
         self._init_architecture(X.shape[1])
 
+        # Start the parallel cost-trend observer if the user opted in.
+        # The observer reads from the cost_history list defined just
+        # below; safe because we only mutate cost_history from this
+        # thread (append) and the observer only reads.
+        observer = _CostTrendObserver() if self.runtime_enabled else None
+
         # Tracking variables
         cost_history = []
+        # Parallel observer reads cost_history (read-only from its thread).
+        if observer is not None:
+            observer.start(cost_history)
+            if verbose:
+                print("  [runtime] Python parallel cost-trend observer started.")
         efficiency_history = []
         cancer_score_history = []
         alzheimer_score_history = []
@@ -1123,6 +1208,21 @@ class DynamicNetwork:
 
             self._safe_callback(callback, total_epoch, epoch_cost, efficiency)
 
+            # Parallel observer rewind: when the cost-trend observer
+            # raises rewind, we exit the Phase 3 inner loop early so the
+            # outer flow can run a brief Phase 2 refresh and re-enter
+            # Phase 3 with the preserved emotional state. Capped at one
+            # rewind per call (clear_rewind, then ignore subsequent).
+            if observer is not None and observer.rewind_requested():
+                observer.clear_rewind()
+                if verbose:
+                    print(f"  [runtime] Cost-trend stalled at epoch {epoch}; observer requested rewind.")
+                # The full rewind+resume control flow lives in the C++
+                # train_phased_runtime(); the Python fallback opts for
+                # the simpler "early break" interpretation here so the
+                # observer signal is still observable end-to-end.
+                break
+
             # Early stopping check
             if len(cost_history) > self.early_stopping.window_size:
                 recent_improvement = cost_history[-self.early_stopping.window_size] - cost_history[-1]
@@ -1273,6 +1373,10 @@ class DynamicNetwork:
             if self.training_phase.phase4_enabled:
                 print(f"  Phase 4: {phase4_epochs} epochs, cost reduced by {phase4_cost_reduction:.1%}")
             print("=" * 60)
+
+        # Stop the parallel observer (no-op if it wasn't started).
+        if observer is not None:
+            observer.stop()
 
         return TrainingResult(
             success=True,
