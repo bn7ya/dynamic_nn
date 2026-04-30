@@ -12,6 +12,7 @@ build_*/
 nul
 python/pydnn/__pycache__/*.pyc
 python/pydnn/*.pyd
+python/pydnn/*.so
 notebooks/text_to_image/models/*.pth
 examples/
 notebooks/beanchmark/mnist_data/
