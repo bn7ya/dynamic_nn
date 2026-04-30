@@ -548,7 +548,8 @@ class DynamicNetwork:
                  early_stopping: Optional[EarlyStoppingConfig] = None,
                  reward_penalty: Optional[RewardPenaltyConfig] = None,
                  normalization: Optional[NormalizationConfig] = None,
-                 runtime_enabled: bool = False):
+                 runtime_enabled: bool = False,
+                 dynamic_thresholds: bool = True):
         """
         Initialize a Dynamic Neural Network.
 
@@ -572,8 +573,18 @@ class DynamicNetwork:
                 pipeline (parallel Estimation observer + soft topology +
                 adaptive scalars). C++ backend only; the pure-Python
                 fallback ignores this flag. Default False.
+            dynamic_thresholds: Derive cancer/alzheimer/patience/etc.
+                from the training dataset's variance and complexity
+                instead of using static defaults. C++ backend only;
+                the pure-Python fallback ignores this flag. Default
+                True. Set to False to reproduce legacy static-default
+                behaviour bit-for-bit. The derived signals and final
+                threshold dict are stashed on
+                ``self._last_data_signals`` after each fit().
         """
         self.runtime_enabled = runtime_enabled
+        self.dynamic_thresholds = dynamic_thresholds
+        self._last_data_signals = None
         # Validate device
         device = device.lower()
         if device not in ("cpu", "cuda", "gpu"):
@@ -874,6 +885,37 @@ class DynamicNetwork:
             trainer_config.runtime_enabled = True
             if verbose:
                 print("  [runtime] StageController + parallel Estimation observer enabled.")
+
+        # Tier 1: derive thresholds from dataset variance + complexity.
+        # When False, leave trainer_config at its C++ defaults so behaviour
+        # matches the legacy static-default path bit-for-bit.
+        if self.dynamic_thresholds:
+            try:
+                from .dynamic_thresholds import (
+                    apply_to_trainer_config,
+                    compute_data_signals,
+                    derive_thresholds,
+                )
+                signals = compute_data_signals(inputs, targets)
+                derived = derive_thresholds(signals)
+                if derived:
+                    apply_to_trainer_config(trainer_config, derived)
+                self._last_data_signals = signals
+                if verbose:
+                    print("  [dynamic_thresholds] variance=%.3f complexity=%.3f%s" % (
+                        signals.variance_score,
+                        signals.complexity_score,
+                        " (fallback)" if signals.fallback_used else "",
+                    ))
+                    if derived:
+                        for key, value in derived.items():
+                            print(f"    {key} = {value}")
+            except Exception as exc:  # noqa: BLE001
+                # Never let signal computation break training. Fall back
+                # to static defaults and surface the issue in verbose mode.
+                self._last_data_signals = None
+                if verbose:
+                    print(f"  [dynamic_thresholds] disabled due to error: {exc!r}")
 
         # Create trainer with the config
         try:

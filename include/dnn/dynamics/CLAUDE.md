@@ -54,6 +54,16 @@ modify weights directly — they only call into `Layer<T>` /
   [runtime CLAUDE.md](../training/runtime/CLAUDE.md)). Until the
   runtime is wired into the legacy path, the static config values
   in `TrainerConfig` are still read directly.
+- `LayerManager` now has a 3-arg constructor accepting a
+  `LayerManagerConfig` (efficiency / saturation / redundancy
+  thresholds). The 2-arg constructor delegates to the 3-arg one with
+  defaults so existing call sites stay byte-identical. The dynamic-
+  thresholds Python layer writes derived values into
+  `TrainerConfig::layer_manager_config`, which `Trainer::Trainer`
+  forwards into the LayerManager. Sigmoid shape constants
+  (`sigmoid_k_`, `sigmoid_base_`, `sigmoid_range_`) intentionally
+  remain hardcoded — they're functional-form parameters, not
+  decision thresholds.
 - `TrainableScheduler` schedules trainable fractions across layers
   but doesn't yet co-ordinate with `active_mask_` from
   [core](../core/CLAUDE.md). A node can be both inactive (mask=0)

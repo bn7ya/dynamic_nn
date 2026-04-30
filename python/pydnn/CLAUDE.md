@@ -16,6 +16,7 @@ observer, and `ThreeModelGenerator` for spawning multiple variants.
 | `__init__.py` | Public exports; tries to import `_dnn_core`, falls back to pure-Python types if unavailable. |
 | `_bindings.cpp` | pybind11 wrappers for `Tensor`, `Network`, `Trainer`, `TrainerConfig`, `NetworkConfig`, cost functions, etc. `[invariant]` external surface. |
 | `network.py` | `DynamicNetwork` (the user-facing class), `TrainingResult`, all `*Config` dataclasses, `_fit_cpp`, `_fit_python`, `_CostTrendObserver`. `[hot]` `[invariant]` |
+| `dynamic_thresholds.py` | `compute_data_signals(X, y)` + `derive_thresholds(...)` + `MAPPING_TABLE`. Engine for the `dynamic_thresholds=True` path. |
 | `model_generator.py` | `ThreeModelGenerator`: builds efficient / balanced / accurate variants from one template. |
 | `visualization.py` | Matplotlib-based reports (cost curves, architecture history, health). Optional. |
 
@@ -48,6 +49,20 @@ observer, and `ThreeModelGenerator` for spawning multiple variants.
   `runtime_enabled=True`; the pure-Python fallback starts a
   `_CostTrendObserver`. Don't flip the default without flagging it
   in the root [`CLAUDE.md`](../../CLAUDE.md). (`network.py:482-501`.)
+- **`dynamic_thresholds` is a constructor kwarg, default `True`.**
+  This is the documented exception to the root CLAUDE.md "defaults
+  are sticky" rule. When true, `_fit_cpp` calls
+  `dynamic_thresholds.compute_data_signals(X, y)` once before
+  building TrainerConfig and writes the derived values into the
+  matching fields (cancer/alzheimer/patience/etc., plus the new
+  `LayerManagerConfig`, `RewardPenaltyConfig`, `BatchConfig`).
+  The signals dataclass is stashed on
+  `self._last_data_signals` so callers can introspect what the
+  variance and complexity scores were and which thresholds they
+  produced. Setting `dynamic_thresholds=False` reproduces the
+  legacy static-default path **bit-for-bit** — that's the
+  regression baseline. C++ backend only; the pure-Python fallback
+  ignores the flag.
 - **GIL released in the binding around long C++ calls.**
   `PyTrainer::train` does `py::gil_scoped_release release` before
   calling `trainer_.train(...)` (`_bindings.cpp:164`). Preserve

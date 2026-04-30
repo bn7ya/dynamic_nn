@@ -20,7 +20,7 @@ The legacy sequential body in `trainer.hpp` is preserved for
 
 | File | Role |
 |---|---|
-| `adaptive_config.hpp` | `AdaptiveScalar` (atomic, clamped) + `RuntimeAdaptiveConfig` aggregating ~30 formerly-static learning constants. `[invariant]` defaults. |
+| `adaptive_config.hpp` | `AdaptiveScalar` (atomic, clamped) + `RuntimeAdaptiveConfig` aggregating ~30 formerly-static learning constants. Also `apply_static_config(TrainerConfig)` (defined inline in `../trainer.hpp`) so caller-set values seed the adaptive scalars. `[invariant]` defaults. |
 | `metrics_bus.hpp` | `MetricsBus`: bounded ring buffer of `MetricSample` published per-epoch by stages, drained by the controller / observer. Mutex-guarded. |
 | `topology_lock.hpp` | `TopologyLock`: thin wrapper over `std::shared_mutex`. `read_lock()` for forward/backward; `write_lock()` for soft mutations. `[invariant]` |
 | `stage_worker.hpp` | `StageWorker` long-lived-thread base with Standby/Active/Finished state machine. Used by the parallel observer; reserved for richer multi-thread futures. |
@@ -65,6 +65,21 @@ instantiation so latent type errors surface at link time.
   Replacing with Welford / Page–Hinkley / a learned change-point
   detector should drop into `observer_loop()` without touching
   callers — that's the design goal.
+- The Tier-3 dynamic-thresholds nudges (also in `observer_loop`,
+  guarded by `kTrendWindow=8`) refine the dataset-derived seeds set
+  by `apply_static_config`. They only see the cost/efficiency stream
+  on the bus — the controller stays type-agnostic, no Network
+  reference. Per-iteration nudge magnitude is bounded (~1% of each
+  scalar's range); `AdaptiveScalar::nudge`/`scale` clamp the result.
+- `RuntimeAdaptiveConfig::apply_static_config(const TrainerConfig&)`
+  is declared in `adaptive_config.hpp` (with `TrainerConfig`
+  forward-declared) and defined inline in `../trainer.hpp` where
+  `TrainerConfig` is fully visible. It first calls
+  `reset_to_defaults()` and then overrides each scalar that has a
+  matching field in `TrainerConfig` (cancer/alzheimer/patience/
+  min_improvement/gradient_clip/batch/reward_penalty). With unmodified
+  TrainerConfig defaults this produces the same scalar values as
+  `reset_to_defaults()` did — that's the regression baseline.
 - `AdaptiveScalar` is non-copyable / non-movable (atomic field).
   Don't add value-style assignment to `RuntimeAdaptiveConfig`; use
   per-field `set()` like `reset_to_defaults()` does.

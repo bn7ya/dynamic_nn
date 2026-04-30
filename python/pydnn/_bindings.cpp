@@ -345,23 +345,62 @@ PYBIND11_MODULE(_dnn_core, m) {
         .def_readwrite("method", &training::NormalizationConfig::method)
         .def_readwrite("epsilon", &training::NormalizationConfig::epsilon);
 
+    // Layer-mutation thresholds (was hardcoded inside LayerManager)
+    py::class_<dynamics::LayerManagerConfig>(m, "LayerManagerConfig")
+        .def(py::init<>())
+        .def_readwrite("efficiency_threshold", &dynamics::LayerManagerConfig::efficiency_threshold)
+        .def_readwrite("saturation_threshold", &dynamics::LayerManagerConfig::saturation_threshold)
+        .def_readwrite("redundancy_threshold", &dynamics::LayerManagerConfig::redundancy_threshold);
+
+    // Reward / penalty + emotional-state thresholds (was constructed locally in Phase 3)
+    py::class_<training::RewardPenaltyConfig>(m, "RewardPenaltyConfig")
+        .def(py::init<>())
+        .def_readwrite("cost_improvement_threshold", &training::RewardPenaltyConfig::cost_improvement_threshold)
+        .def_readwrite("efficiency_improvement_threshold", &training::RewardPenaltyConfig::efficiency_improvement_threshold)
+        .def_readwrite("min_learning_rate", &training::RewardPenaltyConfig::min_learning_rate)
+        .def_readwrite("max_learning_rate", &training::RewardPenaltyConfig::max_learning_rate)
+        .def_readwrite("baseline_learning_rate", &training::RewardPenaltyConfig::baseline_learning_rate)
+        .def_readwrite("max_adjustment_factor", &training::RewardPenaltyConfig::max_adjustment_factor)
+        .def_readwrite("min_adjustment_factor", &training::RewardPenaltyConfig::min_adjustment_factor)
+        .def_readwrite("extreme_threshold", &training::RewardPenaltyConfig::extreme_threshold)
+        .def_readwrite("moderate_threshold", &training::RewardPenaltyConfig::moderate_threshold)
+        .def_readwrite("window_size", &training::RewardPenaltyConfig::window_size);
+
+    // Adaptive batch sizing
+    py::class_<training::BatchConfig>(m, "BatchConfig")
+        .def(py::init<>())
+        .def_readwrite("min_batch_size", &training::BatchConfig::min_batch_size)
+        .def_readwrite("max_batch_size", &training::BatchConfig::max_batch_size)
+        .def_readwrite("growth_rate", &training::BatchConfig::growth_rate)
+        .def_readwrite("growth_interval_epochs", &training::BatchConfig::growth_interval_epochs)
+        .def_readwrite("shuffle", &training::BatchConfig::shuffle)
+        .def_readwrite("power_of_two", &training::BatchConfig::power_of_two);
+
     // Trainer config
     py::class_<training::TrainerConfig>(m, "TrainerConfig")
         .def(py::init<>())
         .def_readwrite("initial_learning_rate", &training::TrainerConfig::initial_learning_rate)
         .def_readwrite("min_learning_rate", &training::TrainerConfig::min_learning_rate)
         .def_readwrite("learning_rate_decay", &training::TrainerConfig::learning_rate_decay)
+        .def_readwrite("decay_interval", &training::TrainerConfig::decay_interval)
         .def_readwrite("max_epochs", &training::TrainerConfig::max_epochs)
         .def_readwrite("enable_dynamic_layers", &training::TrainerConfig::enable_dynamic_layers)
+        .def_readwrite("layer_adjustment_interval", &training::TrainerConfig::layer_adjustment_interval)
         .def_readwrite("enable_trainable_scheduling", &training::TrainerConfig::enable_trainable_scheduling)
         .def_readwrite("enable_early_stopping", &training::TrainerConfig::enable_early_stopping)
         .def_readwrite("patience", &training::TrainerConfig::patience)
+        .def_readwrite("min_improvement", &training::TrainerConfig::min_improvement)
+        .def_readwrite("min_epochs_for_early_stop", &training::TrainerConfig::min_epochs_for_early_stop)
+        .def_readwrite("batch_config", &training::TrainerConfig::batch_config)
+        .def_readwrite("layer_manager_config", &training::TrainerConfig::layer_manager_config)
+        .def_readwrite("reward_penalty_config", &training::TrainerConfig::reward_penalty_config)
         .def_readwrite("cancer_threshold", &training::TrainerConfig::cancer_threshold)
         .def_readwrite("alzheimer_threshold", &training::TrainerConfig::alzheimer_threshold)
         .def_readwrite("enable_gradient_clipping", &training::TrainerConfig::enable_gradient_clipping)
         .def_readwrite("gradient_clip_value", &training::TrainerConfig::gradient_clip_value)
         .def_readwrite("normalization", &training::TrainerConfig::normalization)
         .def_readwrite("phase4_patience", &training::TrainerConfig::phase4_patience)
+        .def_readwrite("phase4_min_improvement", &training::TrainerConfig::phase4_min_improvement)
         .def_readwrite("runtime_enabled", &training::TrainerConfig::runtime_enabled,
                        "When true, route train_phased() through the concurrent "
                        "StageController (parallel Estimation observer + soft "

@@ -44,7 +44,15 @@ sequential body and the helpers shared between both paths.
   updating both `train_phased` and `train_phased_runtime`.
 - **`TrainerConfig` is a public surface.** All fields are bound to
   Python via `_bindings.cpp:349`. Adding a field is fine; renaming
-  or removing one is a breaking change.
+  or removing one is a breaking change. New nested config sub-structs
+  (`LayerManagerConfig`, `RewardPenaltyConfig`, `BatchConfig`) are
+  also bound and writable from Python; the dynamic-thresholds Python
+  layer (`python/pydnn/dynamic_thresholds.py`) writes into them
+  before `Trainer` construction.
+- **`min_epochs_for_early_stop` is a TrainerConfig field**
+  (default 10). It used to be a hardcoded literal at the
+  `EarlyStopping` constructor call site (`trainer.hpp:208`); it is
+  now threaded through. Don't reintroduce the literal.
 - **`TrainingResult` field set is contractual.** Python's
   `_fit_cpp` reads specific attributes (`success`, `epochs_completed`,
   `final_cost`, `final_efficiency`, `best_cost`, `best_efficiency`,
