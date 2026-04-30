@@ -501,7 +501,7 @@ Every experiment follows the same template:
 
 Results accumulate into the global `RESULTS` dict, which Section 7 reads to produce the master summary table.
 
-> **Note on the pydnn code path.** The current `pydnn==0.0.1` release has a known issue in `DynamicNetwork._fit_cpp` (list-of-Tensor passed where a NumPy array is expected by the C++ trainer); the notebook forces the pure-Python fallback via `net._use_cpp = False` before every `.fit()`. All dynamic mutation, health scoring, and efficiency logic still runs — it is just orchestrated in Python rather than C++. Training-time numbers for pydnn are therefore *pessimistic relative to what the C++ backend would report*; the accuracy / parameter-count comparisons are unaffected.
+> **Note on the pydnn code path.** This benchmark forces the pure-Python training backend via `net._use_cpp = False`. The C++ binding is functional (the old Tensor-vs-array drift was fixed in commit `dd8ba30`), but the C++ `TrainingResult` does not yet expose `nodes_added`, `nodes_removed`, `cancer_score_history`, or `architecture_history` — diagnostic fields that the experiments below rely on. Once those fields are surfaced through the binding, remove the `_use_cpp = False` override and the timing comparison becomes representative. All dynamic mutation, health scoring, and efficiency logic still runs — it is just orchestrated from Python rather than C++.
 """),
         code(r"""
 import time, gc, json, math
@@ -523,19 +523,18 @@ def count_params_torch(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 def count_params_pydnn(net):
-    ah = getattr(net._training_result, 'architecture_history', None)
-    if ah:
-        layers = [net.input_shape[0]] + list(ah[-1])
-    else:
-        # Fallback: use live net state
-        layers = [net.input_shape[0]] + [32] * 2 + [net.output_size]
-    total = 0
-    prev = layers[0]
-    for w in layers[1:]:
-        total += prev * w + w     # W + b
-        prev = w
-    total += prev * net.output_size + net.output_size  # output head
-    return total
+    # Use live layer weights when the Python backend is active.
+    # The old approach read architecture_history[-1] = (n_layers, total_nodes)
+    # and misinterpreted those as layer widths, producing incorrect counts.
+    if getattr(net, '_layers', None):
+        total = 0
+        prev = net.input_shape[0]
+        for layer in net._layers:
+            out = layer["W"].shape[0]
+            total += prev * out + out   # W + b
+            prev = out
+        return total
+    return 0  # C++ path: detailed layer info not yet exposed
 
 def time_infer_torch(model, X, n_reps=3, batch=256):
     model.eval()
@@ -579,7 +578,7 @@ def fit_pydnn(X, y, seed, cost, max_layers=4, hidden=32, budget=30):
         seed=seed, cost_function=cost, device='cpu',
         training_phase=tp, architecture=arch,
     )
-    net._use_cpp = False
+    net._use_cpp = False  # keep Python path; C++ result lacks mutation/health fields
     t0 = time.perf_counter()
     res = net.fit(X, y, verbose=False)
     train_time = time.perf_counter() - t0
@@ -669,8 +668,12 @@ def run_regression(seed):
         metric=rmse_dnn, params=p_dnn, train_time=t_train_dnn, infer_time=t_inf_dnn,
         nodes_added=res.nodes_added, nodes_removed=res.nodes_removed,
         layers_added=res.layers_added, layers_removed=res.layers_removed,
-        final_efficiency=res.final_efficiency, arch_final=res.architecture_history[-1]
-                           if res.architecture_history else None, label='pydnn',
+        final_efficiency=res.final_efficiency,
+        arch_final=res.architecture_history[-1] if res.architecture_history else None,
+        final_cancer=res.cancer_score_history[-1] if res.cancer_score_history else 0.0,
+        final_alzheimer=res.alzheimer_score_history[-1] if res.alzheimer_score_history else 0.0,
+        eff_history=res.efficiency_history[::max(1, len(res.efficiency_history)//20)] if res.efficiency_history else [],
+        label='pydnn',
     ))
     RESULTS['regression_torch'].append(dict(
         metric=rmse_torch, params=p_torch, train_time=t_train_torch, infer_time=t_inf_torch,
@@ -747,6 +750,9 @@ def run_classification(seed):
         layers_added=res.layers_added, layers_removed=res.layers_removed,
         final_efficiency=res.final_efficiency,
         arch_final=res.architecture_history[-1] if res.architecture_history else None,
+        final_cancer=res.cancer_score_history[-1] if res.cancer_score_history else 0.0,
+        final_alzheimer=res.alzheimer_score_history[-1] if res.alzheimer_score_history else 0.0,
+        eff_history=res.efficiency_history[::max(1, len(res.efficiency_history)//20)] if res.efficiency_history else [],
         label='pydnn',
     ))
     RESULTS['classification_torch'].append(dict(
@@ -827,6 +833,9 @@ def run_autoencoder(seed):
         layers_added=res.layers_added, layers_removed=res.layers_removed,
         final_efficiency=res.final_efficiency,
         arch_final=res.architecture_history[-1] if res.architecture_history else None,
+        final_cancer=res.cancer_score_history[-1] if res.cancer_score_history else 0.0,
+        final_alzheimer=res.alzheimer_score_history[-1] if res.alzheimer_score_history else 0.0,
+        eff_history=res.efficiency_history[::max(1, len(res.efficiency_history)//20)] if res.efficiency_history else [],
         label='pydnn-AE',
     ))
     RESULTS['autoencoder_torch'].append(dict(
@@ -991,6 +1000,9 @@ def run_transformer_dynamic(seed):
         layers_added=res.layers_added, layers_removed=res.layers_removed,
         final_efficiency=res.final_efficiency,
         arch_final=res.architecture_history[-1] if res.architecture_history else None,
+        final_cancer=res.cancer_score_history[-1] if res.cancer_score_history else 0.0,
+        final_alzheimer=res.alzheimer_score_history[-1] if res.alzheimer_score_history else 0.0,
+        eff_history=res.efficiency_history[::max(1, len(res.efficiency_history)//20)] if res.efficiency_history else [],
         label='pydnn-as-FFN',
     ))
     print(f'seed {seed}:  pydnn-FFN fit-MSE={fit_mse:.4f}  params={p}  '
@@ -1096,6 +1108,9 @@ def run_mnist(seed):
         layers_added=res.layers_added, layers_removed=res.layers_removed,
         final_efficiency=res.final_efficiency,
         arch_final=res.architecture_history[-1] if res.architecture_history else None,
+        final_cancer=res.cancer_score_history[-1] if res.cancer_score_history else 0.0,
+        final_alzheimer=res.alzheimer_score_history[-1] if res.alzheimer_score_history else 0.0,
+        eff_history=res.efficiency_history[::max(1, len(res.efficiency_history)//20)] if res.efficiency_history else [],
         label='pydnn',
     ))
     RESULTS['mnist_torch_mlp'].append(dict(
@@ -1222,7 +1237,11 @@ def run_moe(seed):
         nodes_added=res_single.nodes_added, nodes_removed=res_single.nodes_removed,
         layers_added=res_single.layers_added, layers_removed=res_single.layers_removed,
         final_efficiency=res_single.final_efficiency,
-        arch_final=None, label='single pydnn',
+        arch_final=None,
+        final_cancer=res_single.cancer_score_history[-1] if res_single.cancer_score_history else 0.0,
+        final_alzheimer=res_single.alzheimer_score_history[-1] if res_single.alzheimer_score_history else 0.0,
+        eff_history=res_single.efficiency_history[::max(1, len(res_single.efficiency_history)//20)] if res_single.efficiency_history else [],
+        label='single pydnn',
     ))
     RESULTS['moe_pydnn_experts'].append(dict(
         metric=mse_moe, params=p_total, train_time=None, infer_time=None,
@@ -1279,26 +1298,34 @@ ROWS = [
     ('MoE  (MSE ↓)',                'lower',  'torch-MLP',     'moe_torch_mlp'),
 ]
 
+pd.set_option('display.max_colwidth', None)
+pd.set_option('display.width', 220)
+
 def _fmt(pair, d=4):
     if pair is None: return ''
     if isinstance(pair, tuple): return f'{pair[0]:.{d}f} ± {pair[1]:.{d}f}'
     return str(pair)
 
 def _build_row(task, direction, label, key):
-    a = aggregate(key, keys + ['active_params', 'gate_acc'])
+    a = aggregate(key, keys + ['active_params', 'gate_acc', 'final_cancer', 'final_alzheimer'])
     if a is None: return None
     row = dict(task=task, contestant=label)
-    row['metric']      = _fmt(a.get('metric'))
-    row['params']      = _fmt(a.get('params'), d=0) if a.get('params') else ''
+    row['metric']       = _fmt(a.get('metric'))
+    row['params']       = _fmt(a.get('params'), d=0) if a.get('params') else ''
     row['train_time_s'] = _fmt(a.get('train_time'), d=2) if a.get('train_time') else ''
-    row['infer_time_ms'] = _fmt(tuple(x*1000 for x in a['infer_time']) if isinstance(a.get('infer_time'), tuple) else a.get('infer_time'), d=2) \
-        if a.get('infer_time') else ''
+    row['infer_ms']     = _fmt(
+        tuple(x*1000 for x in a['infer_time']) if isinstance(a.get('infer_time'), tuple) else a.get('infer_time'),
+        d=2) if a.get('infer_time') else ''
     gp = []
     for g_k in ['nodes_added', 'nodes_removed', 'layers_added', 'layers_removed']:
         v = a.get(g_k)
         if isinstance(v, tuple):
             gp.append(f'{g_k[:4]}={v[0]:.1f}')
-    row['pydnn_mutation'] = ', '.join(gp) if gp else ''
+    row['mutation'] = ', '.join(gp) if gp else ''
+    fc = a.get('final_cancer')
+    fa = a.get('final_alzheimer')
+    row['cancer']    = f'{fc[0]:.2%}' if isinstance(fc, tuple) else ''
+    row['alzheimer'] = f'{fa[0]:.2%}' if isinstance(fa, tuple) else ''
     if a.get('active_params'):
         row['active_params'] = _fmt(a['active_params'], d=0)
     return row
@@ -1351,20 +1378,39 @@ for ax, task_dict, ylabel, title in [
 plt.tight_layout(); plt.show()
 """),
         code(r"""
-# Architecture-evolution plots for the last pydnn run of each task
+# --- Efficiency evolution: one subplot per task, one line per seed ---
+def _eff_evo(key, ax, title):
+    pts = RESULTS.get(key, [])
+    if not pts: return
+    for i, p in enumerate(pts):
+        eh = p.get('eff_history', [])
+        if eh:
+            ax.plot(eh, label=f'seed {i}', linewidth=1.2)
+    ax.axhline(0.5, color='grey', linestyle='--', linewidth=0.8, label='0.5 baseline')
+    ax.set_ylim(0, 1.05); ax.set_xlabel('checkpoint'); ax.set_ylabel('efficiency')
+    ax.set_title(title); ax.legend(fontsize=7)
+
+fig, axs = plt.subplots(2, 3, figsize=(14, 6))
+_eff_evo('regression_pydnn',     axs[0,0], 'Regression — efficiency')
+_eff_evo('classification_pydnn', axs[0,1], 'Classification — efficiency')
+_eff_evo('autoencoder_pydnn',    axs[0,2], 'Autoencoder — efficiency')
+_eff_evo('transformer_dyn_ffn',  axs[1,0], 'Transformer FFN — efficiency')
+_eff_evo('mnist_pydnn',          axs[1,1], 'MNIST — efficiency')
+_eff_evo('moe_single_pydnn',     axs[1,2], 'MoE single — efficiency')
+plt.tight_layout(); plt.show()
+"""),
+        code(r"""
+# --- Grow/prune mutation bar chart ---
 def _evo(key, ax, title):
     pts = RESULTS.get(key, [])
     if not pts: return
     for i, p in enumerate(pts):
-        res = p.get('arch_final')
-        # We don't have full history here (stored only final arch); fall back to grow/prune magnitude.
         heights = [p.get('nodes_added', 0) or 0, p.get('nodes_removed', 0) or 0,
                    p.get('layers_added', 0) or 0, p.get('layers_removed', 0) or 0]
         ax.bar(np.arange(4) + i*0.25, heights, width=0.2, label=f'seed {i}')
     ax.set_xticks(np.arange(4) + 0.25)
     ax.set_xticklabels(['nodes+', 'nodes-', 'layers+', 'layers-'])
-    ax.set_title(title)
-    ax.legend(fontsize=7)
+    ax.set_title(title); ax.legend(fontsize=7)
 
 fig, axs = plt.subplots(2, 3, figsize=(14, 6))
 _evo('regression_pydnn',     axs[0,0], 'Regression — mutations')
@@ -1375,15 +1421,39 @@ _evo('mnist_pydnn',          axs[1,1], 'MNIST — mutations')
 _evo('moe_single_pydnn',     axs[1,2], 'MoE single — mutations')
 plt.tight_layout(); plt.show()
 """),
+        code(r"""
+# --- Health scores: final cancer & alzheimer per task per seed ---
+health_keys = ['regression_pydnn', 'classification_pydnn', 'autoencoder_pydnn',
+               'transformer_dyn_ffn', 'mnist_pydnn', 'moe_single_pydnn']
+short_names = ['Reg', 'Cls', 'AE', 'TFN-FFN', 'MNIST', 'MoE']
+n_tasks = len(health_keys)
+
+fig, axs = plt.subplots(1, 2, figsize=(13, 4))
+for ax, score_key, title in [
+    (axs[0], 'final_cancer',    'Final Cancer score per task'),
+    (axs[1], 'final_alzheimer', 'Final Alzheimer score per task'),
+]:
+    for ti, (key, name) in enumerate(zip(health_keys, short_names)):
+        pts = RESULTS.get(key, [])
+        vals = [p.get(score_key, 0) for p in pts]
+        xs = [ti + (i - 1)*0.25 for i in range(len(vals))]
+        ax.scatter(xs, vals, s=60, zorder=3, label=name if ti == 0 else '')
+    ax.axhline(0.7, color='red', linestyle='--', linewidth=0.9, label='threshold 0.7')
+    ax.set_xticks(range(n_tasks)); ax.set_xticklabels(short_names, rotation=20, ha='right')
+    ax.set_ylabel('score'); ax.set_ylim(0, 1.1); ax.set_title(title)
+    ax.legend(fontsize=7)
+
+plt.tight_layout(); plt.show()
+"""),
         md(r"""
 ### 7.1  What the experiments say — reading the table honestly
 
 The numbers above are from three seeds per experiment on the hardware configuration reported in §3.5 (CPU pydnn + GPU PyTorch). Reading them as data rather than as marketing, five patterns emerge:
 
-1. **pydnn converges to *radically* smaller architectures.** On regression the dynamic net settles on **~91 parameters** vs the static baseline's **~4 900**, a 54× compression. On classification it's **~215 vs ~5 800**. On MNIST it's **~1 900 vs ~110 000** for the MLP baseline (57× smaller) — and still reaches 91.4 % accuracy. Across every task where grow/prune was permitted, the dynamic net found an order-of-magnitude-smaller representation. This is the single strongest result in the study.
+1. **pydnn converges to smaller architectures.** On regression the dynamic net settles on **~193 parameters** vs the static baseline's **~4 900**, a 25× compression. On classification it's **~420 vs ~5 800** (14× smaller) — at identical 100 % accuracy. On MNIST the story is more nuanced: after pruning 72 of its initial 88 hidden nodes, pydnn settles on **~12 700 parameters vs the MLP's ~110 000** (8.6× smaller), but this is *larger* than the CNN's 9 100 parameters (see point 4). These numbers use corrected parameter counting that reads actual layer-weight shapes; earlier drafts of this notebook used an index-based approximation that underreported counts by 2–7×.
 2. **Smaller does not mean better.** On regression the smaller pydnn has RMSE **0.39 vs 0.16** for the static baseline — roughly 2.4× worse loss. On the autoencoder, pydnn MSE is **0.018 vs 0.003** for the static AE. These are real quality gaps, not noise. The dynamic network is doing what it was asked to do (find the smallest architecture that satisfies its efficiency targets), and the efficiency targets clearly do not imply "match the loss of an overparameterised baseline."
-3. **Classification is the clean win.** Both models reach **100 % accuracy** on the synthetic 5-blob task, and pydnn does it with 27× fewer parameters. When the task is intrinsically easy, dynamic sizing discovers that and stops there, while the static net allocates a default capacity anyway.
-4. **MNIST is a nuanced loss.** pydnn reaches **91.4 % ± 0.6 %** on MNIST with **1 918 parameters**, versus 93.97 % for the MLP (110 k params) and 95.80 % for the CNN (9 k params). The CNN wins on accuracy-per-parameter because its convolutional prior matches image structure — a prior pydnn does not currently have. **Dynamic sizing and the right inductive bias are orthogonal axes**, and the table shows clearly that missing the prior cannot be compensated by re-sizing.
+3. **Classification is the clean win.** Both models reach **100 % accuracy** on the synthetic 5-blob task, and pydnn does it with 14× fewer parameters. When the task is intrinsically easy, dynamic sizing discovers that and stops there, while the static net allocates a default capacity anyway.
+4. **MNIST is a nuanced loss.** pydnn reaches **91.4 % ± 0.6 %** on MNIST with **~12 700 parameters** (after pruning 72 of its 88 initial hidden nodes down to 16 remaining), versus 93.97 % for the MLP (110 k params) and 95.80 % for the CNN (9.1 k params). The CNN is *more* parameter-efficient than pydnn on this task — it achieves higher accuracy with fewer parameters — because its convolutional prior matches image structure, a prior pydnn does not currently have. **Dynamic sizing and the right inductive bias are orthogonal axes**, and the table shows clearly that missing the prior cannot be compensated by re-sizing.
 5. **The MoE prototype under-performs.** The K=3 dynamic-expert MoE reaches MSE **0.72 ± 0.09**, *worse* than a single pydnn (0.44) and the static MLP (0.63). The cause is the gate: its test-set routing accuracy is only **~32 %**, essentially chance on a 3-way problem. The experts each learned a clean regime-specific function on their oracle-assigned training subset, but the gate, trained only on inputs (no loss signal from expert outputs), could not recover the regime labels. This is an **honest negative result for the prototype as built** and a precise pointer at the missing piece: the gate must be trained jointly with the experts through the downstream loss, not supervised on oracle labels.
 6. **The transformer hybrid is a plumbing check, not a competition.** The "pydnn-as-FFN" fit-MSE (0.034) is against the static transformer's own FFN output — it says the dynamic network can be trained to reproduce a transformer FFN, at roughly **12 % of the FFN's parameters**. It does not say pydnn can replace an FFN trained end-to-end. That is §8's headline future-work item.
 7. **Grow is rare, prune is frequent.** In the current hyperparameter settings, pydnn prunes **16–72 nodes** per task but adds none except on the autoencoder (where it added 10 nodes and 1 layer on top of the prune). This asymmetry is consistent with the adaptive-threshold algorithm: the initial architecture tends to be over-provisioned, efficiency scores quickly drop below the prune threshold, and the sigmoid-adaptive saturation threshold is not crossed often enough to trigger additions. Whether that is the *right* behaviour depends on whether the initial default size is generous (prune-heavy is correct) or conservative (grow-heavy would be correct).
@@ -1397,7 +1467,7 @@ The numbers above are from three seeds per experiment on the hardware configurat
 
 ### 7.3  Where the dynamic NN wins in this study
 
-- **Parameter efficiency on easy tasks.** 27–57× smaller at matched (classification) or within-a-few-points (MNIST) accuracy.
+- **Parameter efficiency on easy tasks.** 8–25× smaller at matched (classification) or within-a-few-points (MNIST vs MLP) accuracy.
 - **Architecture discovery without a-priori guessing.** No hidden-size was specified by hand; the final width/depth came from the data.
 - **Pruning behaved.** Cancer and alzheimer scores stayed sub-threshold throughout — the structural mutation mechanism did not spiral. This is non-trivial; many naive grow/prune schemes do.
 
@@ -1414,7 +1484,7 @@ def section_8_conclusion():
 ### 8.1  What this study established
 
 - A *principled* dynamic network — health-gated grow/prune with a sigmoid-adaptive saturation threshold — trains **stably** across regression, classification, reconstruction, language modelling (as a block-level component), digit recognition, and MoE routing. Cancer and alzheimer scores stayed sub-threshold throughout; the structural-mutation mechanism does not spiral.
-- Dynamic sizing yields **radical parameter compression**: 27–57× smaller than a sensible static baseline on the tabular and MNIST tasks.
+- Dynamic sizing yields **significant parameter compression**: 8–25× smaller than a sensible static baseline on the tabular and MNIST tasks (vs-MLP comparison; the CNN on MNIST is more parameter-efficient than the flat pydnn).
 - On **easy tasks** (the 5-blob classification) the compression is **free** — both models reach 100 % accuracy and the dynamic net simply stops allocating.
 - Dynamic adaptation is **compositional**: a dynamic feed-forward network trains on the shape signature required by a transformer FFN and by an MoE expert. The plumbing is verified even where the joint-training loss story is not.
 
@@ -1428,7 +1498,7 @@ def section_8_conclusion():
 
 ### 8.3  Improvements, in rough priority order
 
-1. **Fix `_fit_cpp` Tensor-vs-array binding** (`python/pydnn/network.py:790–800`) so the C++ trainer is actually used from Python. This is a 5-line fix but removes the CPU/Python fallback penalty and makes all timing numbers above representative.
+1. **Expose mutation/health fields in the C++ `TrainingResult` binding** (`python/pydnn/_bindings.cpp`). The Tensor-vs-array bug in `_fit_cpp` was fixed in commit `dd8ba30`; the C++ trainer now runs correctly from Python. The remaining blocker is that `nodes_added`, `nodes_removed`, `cancer_score_history`, and `architecture_history` are not yet bound. Once they are, remove `net._use_cpp = False` from the harness and all timing comparisons become representative.
 2. **Ship a working CUDA build** on machines without `nvcc` via binary wheels or a conda recipe. Today the source build depends on a local CUDA toolkit.
 3. **Convolutional grow-ops.** Extend `LayerManager` to manipulate Conv2D filter counts, channel splits, and kernel sizes. This is the single biggest step toward closing the gap with static CNNs on image data.
 4. **Attention-aware grow-ops.** Per-head efficiency scoring and per-head growth/pruning inside a transformer block. Plug this into §6.4's hybrid and train end-to-end.
@@ -1439,7 +1509,7 @@ def section_8_conclusion():
 
 ### 8.4  Closing remark
 
-The strongest claim this study actually supports is narrower than the one the motivation section promised: **dynamic architecture discovery reliably produces order-of-magnitude smaller networks, at a quality cost that ranges from zero (easy classification) to significant (fine-grained regression and reconstruction)**. That is a useful primitive — for deployment, for MoE experts, for compute-constrained on-device inference — but it is not a drop-in replacement for a well-tuned static baseline on a problem where the baseline already fits. The path forward is to close that quality gap by letting the pruned parameter budget be *redeployed* (deeper architectures, attention-aware grow-ops, joint MoE training) rather than simply *saved*. The claim "stop guessing the architecture" survives this study. The claim "and get better accuracy for free" does not, and the findings above are clear about why.
+The strongest claim this study actually supports is narrower than the one the motivation section promised: **dynamic architecture discovery reliably produces significantly smaller networks (8–25× vs a static MLP baseline), at a quality cost that ranges from zero (easy classification) to significant (fine-grained regression and reconstruction)**. That is a useful primitive — for deployment, for MoE experts, for compute-constrained on-device inference — but it is not a drop-in replacement for a well-tuned static baseline on a problem where the baseline already fits. The path forward is to close that quality gap by letting the pruned parameter budget be *redeployed* (deeper architectures, attention-aware grow-ops, joint MoE training) rather than simply *saved*. The claim "stop guessing the architecture" survives this study. The claim "and get better accuracy for free" does not, and the findings above are clear about why.
 """),
     ]
 

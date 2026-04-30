@@ -6,6 +6,8 @@
 python/pydnn/__pycache__/network.cpython-314.pyc
 
 build/
+build_*/
+.venv/
 *.egg-info/
 nul
 python/pydnn/__pycache__/*.pyc
