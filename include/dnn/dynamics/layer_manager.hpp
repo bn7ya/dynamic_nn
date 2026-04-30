@@ -12,6 +12,21 @@ using core::Network;
 using core::ActivationType;
 
 /**
+ * Tunable thresholds that gate node/layer add and remove decisions.
+ * Surfaced through TrainerConfig so callers (and the dynamic-thresholds
+ * Python layer) can override the defaults before training starts.
+ *
+ * Defaults match the historical hardcoded LayerManager constructor body
+ * so the 2-arg constructor and (network, health_monitor, LayerManagerConfig{})
+ * are bit-identical.
+ */
+struct LayerManagerConfig {
+    double efficiency_threshold = 0.5;   // Below this, nodes are "inefficient"
+    double saturation_threshold = 0.7;   // Above this, layer is saturated
+    double redundancy_threshold = 0.01;  // Below this, a layer is redundant
+};
+
+/**
  * Decision made by the layer manager.
  */
 struct LayerDecision {
@@ -40,15 +55,20 @@ template<typename T = float>
 class LayerManager {
 public:
     LayerManager(Network<T>& network, HealthMonitor<T>& health_monitor)
+        : LayerManager(network, health_monitor, LayerManagerConfig{}) {}
+
+    LayerManager(Network<T>& network,
+                 HealthMonitor<T>& health_monitor,
+                 const LayerManagerConfig& config)
         : network_(network)
         , health_monitor_(health_monitor)
         , min_layers_(2)
         , max_layers_(100)
         , min_nodes_per_layer_(4)
         , max_nodes_per_layer_(10000)
-        , efficiency_threshold_(0.5)
-        , saturation_threshold_(0.7)
-        , redundancy_threshold_(0.01)
+        , efficiency_threshold_(config.efficiency_threshold)
+        , saturation_threshold_(config.saturation_threshold)
+        , redundancy_threshold_(config.redundancy_threshold)
         , adaptive_threshold_enabled_(true)
         , sigmoid_k_(5.0)
         , sigmoid_base_(0.3)

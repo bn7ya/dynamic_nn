@@ -8,6 +8,9 @@
 
 namespace dnn {
 namespace training {
+
+struct TrainerConfig;  // forward decl; full def in ../trainer.hpp
+
 namespace runtime {
 
 /**
@@ -193,6 +196,20 @@ struct RuntimeAdaptiveConfig {
         cancer_threshold.set(0.7);
         alzheimer_threshold.set(0.7);
     }
+
+    /**
+     * Seed every scalar that has a counterpart in TrainerConfig from the
+     * caller-provided static config. Defined inline in trainer.hpp where
+     * TrainerConfig is fully visible. Useful when the dynamic-thresholds
+     * Python layer has rewritten TrainerConfig fields and we want those
+     * derived values to flow through into the runtime adaptive scalars
+     * (which the observer can then continue to nudge per epoch).
+     *
+     * Calls reset_to_defaults() first; only the fields with a TrainerConfig
+     * counterpart are overwritten. Safe to invoke at the start of
+     * train_phased_runtime.
+     */
+    void apply_static_config(const TrainerConfig& cfg);
 };
 
 }  // namespace runtime

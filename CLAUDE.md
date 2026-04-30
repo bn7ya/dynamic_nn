@@ -51,6 +51,11 @@ CLAUDE.md sub-file refers back here.
 - **Defaults are sticky.** `runtime_enabled=False` keeps the legacy
   sequential `train_phased` body. Don't flip a default without
   flagging it in the relevant CLAUDE.md and the commit message.
+  - **Documented exception:** `dynamic_thresholds=True` is the
+    default for `DynamicNetwork`. The dataset-derived thresholds
+    are computed once before training; setting `dynamic_thresholds=False`
+    reproduces the legacy static-default path bit-for-bit. See
+    `python/pydnn/CLAUDE.md` and the feature row below.
 - **Branch convention:** all work lands on
   `claude/<topic>-<id>` — never push directly to `main`.
 
@@ -124,6 +129,7 @@ how to engage it.
 | ThreeModelGenerator (efficient/balanced/accurate) | [`python/pydnn/`](python/pydnn/CLAUDE.md) | `from pydnn import ThreeModelGenerator` |
 | CPU/GPU device dispatch | [`include/dnn/core/`](include/dnn/core/CLAUDE.md) | `device="cpu"\|"cuda"` |
 | Python parallel cost-trend observer | [`python/pydnn/`](python/pydnn/CLAUDE.md) | `runtime_enabled=True` (Python fallback path) |
+| Dynamic data-driven thresholds (variance + complexity) | [`python/pydnn/`](python/pydnn/CLAUDE.md) | **On by default**; `DynamicNetwork(dynamic_thresholds=False)` to opt out |
 
 ## Build & smoke-test recipe
 
@@ -158,10 +164,20 @@ X = rng.standard_normal((64, 16)).astype(np.float32)
 y = np.eye(4)[rng.integers(0, 4, size=64)].astype(np.float32)
 net = DynamicNetwork(input_shape=(16,), output_size=4, seed=42,
                     cost_function='CrossEntropy', runtime_enabled=True)
+# dynamic_thresholds=True is the default; pass False to reproduce
+# the legacy static-default path bit-for-bit.
 result = net.fit(X, y, verbose=True)
 preds = net.predict(X[:4])
 print('OK', result.epochs_completed, preds.shape)
+print('signals:', net._last_data_signals.variance_score,
+      net._last_data_signals.complexity_score)
 "
+```
+
+Run the unit tests for the dynamic-threshold module:
+
+```bash
+python3 python/tests/test_dynamic_thresholds.py
 ```
 
 If the smoke test stops working, the most likely break points are:

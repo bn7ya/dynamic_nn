@@ -228,6 +228,35 @@ private:
                 sample.efficiency < cfg_.target_efficiency.current() * 0.5) {
                 cfg_.exploration_saturation_threshold.nudge(-0.005);
             }
+
+            // ---- Tier-3 dynamic-thresholds refinement ----------------
+            // These nudges refine the dataset-derived seeds set by
+            // RuntimeAdaptiveConfig::apply_static_config when training
+            // signals deviate from what the seeded thresholds predicted.
+            // Bounded per-iteration magnitude (<= 1% of each scalar's
+            // range) and AdaptiveScalar::nudge clamps to [min, max].
+            constexpr size_t kTrendWindow = 8;
+            if (cost_window.size() >= kTrendWindow) {
+                double trend_start = *(cost_window.end() - kTrendWindow);
+                double trend_end   = cost_window.back();
+                double trend_slope = (trend_end - trend_start) /
+                                     (kTrendWindow * std::max(trend_start, 1e-12));
+
+                if (trend_slope > 0.0) {
+                    // Cost drifting up over a recent window: relax the
+                    // reward/penalty improvement bar so we don't overreact
+                    // to shallow regressions, and tighten min_improvement
+                    // so early stop notices real plateaus sooner.
+                    cfg_.cost_improvement_threshold.nudge(+1e-4);
+                    cfg_.min_improvement.scale(0.95);
+                } else if (trend_slope < -0.001) {
+                    // Strong improvement: we can afford a stricter reward
+                    // gate (less LR thrash) and a slightly looser
+                    // min_improvement (don't early-stop on small dips).
+                    cfg_.cost_improvement_threshold.nudge(-5e-5);
+                    cfg_.min_improvement.scale(1.02);
+                }
+            }
         }
     }
 

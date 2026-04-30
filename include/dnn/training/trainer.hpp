@@ -140,9 +140,16 @@ struct TrainerConfig {
     bool enable_early_stopping = true;
     size_t patience = 30;                         // Increased from 20 for less aggressive stopping
     double min_improvement = 0.0001;              // Reduced from 0.001 for less sensitivity
+    size_t min_epochs_for_early_stop = 10;        // Was hardcoded as the 3rd EarlyStopping ctor arg
 
     // Batch management
     BatchConfig batch_config;
+
+    // Layer-mutation thresholds (previously hardcoded inside LayerManager)
+    dynamics::LayerManagerConfig layer_manager_config;
+
+    // Reward/penalty machinery for Phase 3 (previously constructed locally)
+    RewardPenaltyConfig reward_penalty_config;
 
     // Health monitoring
     double cancer_threshold = 0.7;
@@ -203,9 +210,10 @@ public:
         , cost_function_(CostFunction<T>::create(cost_type))
         , batch_manager_(config.batch_config)
         , health_monitor_(network, config.cancer_threshold, config.alzheimer_threshold)
-        , layer_manager_(network, health_monitor_)
+        , layer_manager_(network, health_monitor_, config.layer_manager_config)
         , trainable_scheduler_(network, config.trainable_config)
-        , early_stopping_(config.patience, config.min_improvement, 10)
+        , early_stopping_(config.patience, config.min_improvement,
+                          config.min_epochs_for_early_stop)
         , learning_rate_(config.initial_learning_rate) {
         // Initialize normalization params
         norm_params_.method = config.normalization.method;
@@ -482,7 +490,7 @@ public:
 
         // Initialize emotional learning state
         EmotionalState emotional_state;
-        RewardPenaltyConfig reward_penalty_config;
+        RewardPenaltyConfig reward_penalty_config = config_.reward_penalty_config;
         reward_penalty_config.baseline_learning_rate = main_lr;
 
         for (size_t epoch = 0; epoch < result.estimated_epochs; ++epoch) {
@@ -727,6 +735,11 @@ public:
         rt::MetricsBus bus(2048);
         rt::TopologyLock topo_lock;
         rt::RuntimeAdaptiveConfig adaptive_cfg;
+        // Seed adaptive scalars from caller-set TrainerConfig fields so
+        // values derived by the dynamic-thresholds Python layer flow into
+        // the runtime path. With unmodified TrainerConfig defaults this
+        // produces the same scalar values as reset_to_defaults() did.
+        adaptive_cfg.apply_static_config(config_);
         rt::StageController controller(bus, adaptive_cfg, topo_lock);
         controller.start_observer();
 
@@ -838,7 +851,7 @@ public:
         // ============ PHASE 3: MAIN (with rewind handling) ============
         auto phase3_start = std::chrono::high_resolution_clock::now();
         EmotionalState emotional_state;
-        RewardPenaltyConfig rp_config;
+        RewardPenaltyConfig rp_config = config_.reward_penalty_config;
         rp_config.baseline_learning_rate = adaptive_cfg.main_lr.current();
         rp_config.min_learning_rate = adaptive_cfg.reward_lr_floor.current();
         rp_config.max_learning_rate = adaptive_cfg.reward_lr_ceiling.current();
@@ -1456,6 +1469,42 @@ private:
     EpochCallback<T> epoch_callback_;
     NormalizationParams<T> norm_params_;
 };
+
+// Out-of-line definition of RuntimeAdaptiveConfig::apply_static_config.
+// Lives here so TrainerConfig is fully visible; the declaration sits in
+// runtime/adaptive_config.hpp.
+inline void runtime::RuntimeAdaptiveConfig::apply_static_config(
+    const TrainerConfig& cfg) {
+    reset_to_defaults();
+
+    gradient_clip.set(cfg.gradient_clip_value);
+
+    patience.set(static_cast<double>(cfg.patience));
+    min_improvement.set(cfg.min_improvement);
+    phase4_patience.set(static_cast<double>(cfg.phase4_patience));
+    phase4_min_improvement.set(cfg.phase4_min_improvement);
+    phase4_target_reduction.set(cfg.phase4_target_cost_reduction);
+
+    min_batch_size.set(static_cast<double>(cfg.batch_config.min_batch_size));
+    max_batch_size.set(static_cast<double>(cfg.batch_config.max_batch_size));
+    batch_growth.set(cfg.batch_config.growth_rate);
+    batch_growth_int.set(
+        static_cast<double>(cfg.batch_config.growth_interval_epochs));
+
+    cancer_threshold.set(cfg.cancer_threshold);
+    alzheimer_threshold.set(cfg.alzheimer_threshold);
+
+    const auto& rp = cfg.reward_penalty_config;
+    cost_improvement_threshold.set(rp.cost_improvement_threshold);
+    efficiency_improvement_threshold.set(rp.efficiency_improvement_threshold);
+    reward_lr_floor.set(rp.min_learning_rate);
+    reward_lr_ceiling.set(rp.max_learning_rate);
+    reward_max_factor.set(rp.max_adjustment_factor);
+    reward_min_factor.set(rp.min_adjustment_factor);
+    extreme_threshold.set(rp.extreme_threshold);
+    moderate_threshold.set(rp.moderate_threshold);
+    emotion_window.set(static_cast<double>(rp.window_size));
+}
 
 } // namespace training
 } // namespace dnn
