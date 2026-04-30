@@ -304,6 +304,7 @@ class EfficiencyConfig:
     efficiency_decay: float = 0.9
     efficiency_update_scale: float = 0.1
     efficiency_gradient_multiplier: float = 10.0
+    max_removal_fraction_per_epoch: float = 0.25  # max 25% of layer removed per epoch
 
 
 @dataclass
@@ -385,7 +386,7 @@ class HealthScoreConfig:
     """Configuration for cancer/alzheimer health score computation."""
     # Denominators for normalization (rate-based)
     cancer_denominator: float = 5.0
-    alzheimer_denominator: float = 5.0
+    alzheimer_denominator: float = 10.0
 
     # Layer weight in scoring
     layer_weight: int = 10
@@ -396,7 +397,7 @@ class HealthScoreConfig:
 
     # Ratio-based thresholds (percentage of initial nodes)
     # If more than this ratio of nodes are removed, trigger high Alzheimer score
-    alzheimer_ratio_threshold: float = 0.5  # 50% node removal triggers concern
+    alzheimer_ratio_threshold: float = 0.8  # 80% node removal triggers concern
     # If more than this ratio of nodes are added, trigger high Cancer score
     cancer_ratio_threshold: float = 2.0  # 200% growth (3x original size) triggers concern
 
@@ -1468,6 +1469,10 @@ class DynamicNetwork:
 
         # Store initial node count for health scoring
         self._initial_node_count = self._count_nodes()
+        # Hidden-only count (output layer excluded; it can never be pruned)
+        self._initial_hidden_count = sum(
+            self._layers[i]["W"].shape[0] for i in range(len(self._layers) - 1)
+        )
 
     def _normalize_data(self, X: np.ndarray, y: np.ndarray, verbose: bool = False) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -1884,8 +1889,9 @@ class DynamicNetwork:
         cancer_ratio = 0.0
         alzheimer_ratio = 0.0
 
-        if self._initial_node_count is not None and self._initial_node_count > 0:
-            initial = self._initial_node_count
+        initial_hidden = getattr(self, '_initial_hidden_count', None)
+        initial = initial_hidden if initial_hidden else self._initial_node_count
+        if initial is not None and initial > 0:
 
             # What percentage of initial nodes were removed?
             removal_percentage = nodes_removed / initial
@@ -2295,7 +2301,8 @@ class DynamicNetwork:
             # Remove inefficient nodes
             inefficient_mask = layer["efficiency"] < efficiency_threshold * removal_mult
             if np.sum(inefficient_mask) > 0 and layer["W"].shape[0] > min_nodes:
-                num_to_remove = min(np.sum(inefficient_mask), layer["W"].shape[0] - min_nodes)
+                max_this_epoch = max(1, int(layer["W"].shape[0] * self.efficiency.max_removal_fraction_per_epoch))
+                num_to_remove = min(np.sum(inefficient_mask), layer["W"].shape[0] - min_nodes, max_this_epoch)
                 if num_to_remove > 0:
                     self._remove_nodes_from_layer(i, int(num_to_remove))
                     nodes_removed += int(num_to_remove)
