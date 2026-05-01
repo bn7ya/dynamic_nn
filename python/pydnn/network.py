@@ -12,6 +12,23 @@ import glob
 import numpy as np
 
 
+# Per-fit Python-side history lists (cost, efficiency, cancer/alzheimer
+# scores, architecture, learning rate, emotional state) are capped at this
+# length. Matches the C++ Trainer::kDefaultHistoryReserve and
+# EmotionalState::kHistoryWindow so the two backends report comparable
+# windows. Older entries are dropped from the front; the most recent
+# MAX_HISTORY epochs are always retained.
+MAX_HISTORY = 500
+
+
+def _append_capped(history: list, value, cap: int = MAX_HISTORY) -> None:
+    """Append *value* to *history*, trimming the front to keep len <= cap."""
+    history.append(value)
+    if len(history) > cap:
+        # Drop the oldest entries in one slice rather than repeated pop(0).
+        del history[: len(history) - cap]
+
+
 class CppLoadError:
     """Diagnostic error types for C++ extension loading failures."""
     MISSING_BINARY = "missing_binary"
@@ -435,9 +452,12 @@ class _CostTrendObserver:
     training loop checks rewind_requested between epochs and bails out
     of its inner loop so the controller can wake an earlier stage.
 
-    Thread-safety note: Python's GIL makes single list.append() and
-    list-index reads atomic, which is enough for this read-only
-    observer. We only ever **read** cost_history; we don't mutate it.
+    Thread-safety note: under the GIL, ``list.append`` and a slice
+    expression like ``history[-window:]`` are each atomic — the slice
+    creates a fresh list snapshot before any other thread can run.
+    Combined with this observer being **read-only** on cost_history
+    (only the fit loop appends), no explicit lock is needed. If you
+    add a writer in another thread, introduce a Lock here first.
     """
 
     def __init__(self, window: int = 12, stall_delta: float = 1e-5,
@@ -1063,7 +1083,7 @@ class DynamicNetwork:
         for epoch in phase1_iter:
             epoch_cost = self._train_epoch(X, y, learning_rate, batch_size)
             exploration_costs.append(epoch_cost)
-            cost_history.append(epoch_cost)
+            _append_capped(cost_history, epoch_cost)
 
             # Aggressive architecture exploration
             added, removed, layer_change = self._aggressive_layer_adjustment(
@@ -1084,11 +1104,11 @@ class DynamicNetwork:
 
             # Compute metrics
             efficiency = self._compute_efficiency(cost_history)
-            efficiency_history.append(efficiency)
+            _append_capped(efficiency_history, efficiency)
             cancer, alzheimer = self._compute_health_scores(nodes_added, nodes_removed, layers_added, layers_removed, epoch + 1)
-            cancer_score_history.append(cancer)
-            alzheimer_score_history.append(alzheimer)
-            architecture_history.append((len(self._layers), self._count_nodes()))
+            _append_capped(cancer_score_history, cancer)
+            _append_capped(alzheimer_score_history, alzheimer)
+            _append_capped(architecture_history, (len(self._layers), self._count_nodes()))
 
             if verbose and TQDM_AVAILABLE:
                 phase1_iter.set_postfix({
@@ -1129,14 +1149,14 @@ class DynamicNetwork:
         for epoch in phase2_iter:
             epoch_cost = self._train_epoch(X, y, learning_rate, batch_size)
             estimation_costs.append(epoch_cost)
-            cost_history.append(epoch_cost)
+            _append_capped(cost_history, epoch_cost)
 
             efficiency = self._compute_efficiency(cost_history)
-            efficiency_history.append(efficiency)
+            _append_capped(efficiency_history, efficiency)
             cancer, alzheimer = self._compute_health_scores(nodes_added, nodes_removed, layers_added, layers_removed, len(cost_history))
-            cancer_score_history.append(cancer)
-            alzheimer_score_history.append(alzheimer)
-            architecture_history.append((len(self._layers), self._count_nodes()))
+            _append_capped(cancer_score_history, cancer)
+            _append_capped(alzheimer_score_history, alzheimer)
+            _append_capped(architecture_history, (len(self._layers), self._count_nodes()))
 
             # Adapt efficiency weights based on gradient statistics
             self._adapt_node_weights()
@@ -1200,7 +1220,7 @@ class DynamicNetwork:
 
             # Train one epoch
             epoch_cost = self._train_epoch(X, y, learning_rate, batch_size)
-            cost_history.append(epoch_cost)
+            _append_capped(cost_history, epoch_cost)
 
             # Track best cost
             if epoch_cost < best_cost:
@@ -1220,11 +1240,11 @@ class DynamicNetwork:
 
             # Compute metrics
             efficiency = self._compute_efficiency(cost_history)
-            efficiency_history.append(efficiency)
+            _append_capped(efficiency_history, efficiency)
             cancer, alzheimer = self._compute_health_scores(nodes_added, nodes_removed, layers_added, layers_removed, len(cost_history))
-            cancer_score_history.append(cancer)
-            alzheimer_score_history.append(alzheimer)
-            architecture_history.append((len(self._layers), self._count_nodes()))
+            _append_capped(cancer_score_history, cancer)
+            _append_capped(alzheimer_score_history, alzheimer)
+            _append_capped(architecture_history, (len(self._layers), self._count_nodes()))
 
             # Apply reward/penalty system (replaces fixed LR decay)
             learning_rate, action = self._apply_reward_penalty_system(
@@ -1233,7 +1253,7 @@ class DynamicNetwork:
             # Cap learning rate for MSE (regression is more sensitive)
             if self.cost_function == "MSE":
                 learning_rate = min(learning_rate, 0.01)
-            learning_rate_history.append(learning_rate)
+            _append_capped(learning_rate_history, learning_rate)
             emotional_state_actions.append(action)
 
             # Adapt efficiency weights based on gradient statistics
@@ -1330,17 +1350,17 @@ class DynamicNetwork:
 
                 # Train one epoch (NO architecture modifications - frozen)
                 epoch_cost = self._train_epoch(X, y, phase4_learning_rate, batch_size)
-                cost_history.append(epoch_cost)
+                _append_capped(cost_history, epoch_cost)
 
                 # Track metrics (architecture is frozen, but we still track)
                 efficiency = self._compute_efficiency(cost_history)
-                efficiency_history.append(efficiency)
+                _append_capped(efficiency_history, efficiency)
                 cancer, alzheimer = self._compute_health_scores(
                     nodes_added, nodes_removed, layers_added, layers_removed, len(cost_history)
                 )
-                cancer_score_history.append(cancer)
-                alzheimer_score_history.append(alzheimer)
-                architecture_history.append((len(self._layers), self._count_nodes()))
+                _append_capped(cancer_score_history, cancer)
+                _append_capped(alzheimer_score_history, alzheimer)
+                _append_capped(architecture_history, (len(self._layers), self._count_nodes()))
 
                 # Track best cost
                 if epoch_cost < best_cost:
@@ -2154,7 +2174,7 @@ class DynamicNetwork:
 
         # Update emotional state
         emotional_state.total_rewards += 1
-        emotional_state.reward_history.append(magnitude)
+        _append_capped(emotional_state.reward_history, magnitude)
 
         return new_lr
 
@@ -2192,7 +2212,7 @@ class DynamicNetwork:
 
         # Update emotional state
         emotional_state.total_penalties += 1
-        emotional_state.penalty_history.append(magnitude)
+        _append_capped(emotional_state.penalty_history, magnitude)
 
         return new_lr
 
@@ -2234,8 +2254,8 @@ class DynamicNetwork:
             state = "excited"
 
         # Record history
-        emotional_state.depression_history.append(depression)
-        emotional_state.excitement_history.append(excitement)
+        _append_capped(emotional_state.depression_history, depression)
+        _append_capped(emotional_state.excitement_history, excitement)
 
         return learning_rate, state
 
@@ -2572,15 +2592,20 @@ class DynamicNetwork:
 
         if self._use_cpp:
             from . import _dnn_core
-            outputs = []
-            for x in X:
-                # PyNetwork::predict accepts a numpy array directly
-                # and returns a numpy array (not a Tensor).
-                output = self._network.predict(
-                    np.ascontiguousarray(x.flatten(), dtype=np.float32)
-                )
-                outputs.append(np.asarray(output))
-            output = np.array(outputs)
+            # Prefer the vectorised batch path when the binding exposes it.
+            # Falls back to the per-sample loop for older `.so` builds.
+            X2 = X if X.ndim >= 2 else X.reshape(1, -1)
+            X2 = np.ascontiguousarray(X2, dtype=np.float32)
+            if hasattr(self._network, "predict_batch"):
+                output = np.asarray(self._network.predict_batch(X2))
+            else:
+                outputs = []
+                for x in X2:
+                    output = self._network.predict(
+                        np.ascontiguousarray(x.flatten(), dtype=np.float32)
+                    )
+                    outputs.append(np.asarray(output))
+                output = np.array(outputs)
         else:
             # Python fallback - works with multi-layer dynamic architecture
             a = X.reshape(len(X), -1)

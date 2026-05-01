@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../core/network.hpp"
+#include "../exceptions/dnn_exception.hpp"
 #include "health_monitor.hpp"
 #include <memory>
 #include <vector>
@@ -70,9 +71,41 @@ public:
         , saturation_threshold_(config.saturation_threshold)
         , redundancy_threshold_(config.redundancy_threshold)
         , adaptive_threshold_enabled_(true)
+        // sigmoid_{k,base,range}: shape parameters of the saturation-curve
+        // mapping efficiency in [0,1] to the per-epoch saturation threshold.
+        // Tuned to keep the curve gentle around 0.5 efficiency (the typical
+        // operating point) while still bottoming out near base=0.3 and topping
+        // out near base+range=0.8 at the extremes. These are functional-form
+        // parameters; user-overridable thresholds live in LayerManagerConfig.
         , sigmoid_k_(5.0)
         , sigmoid_base_(0.3)
-        , sigmoid_range_(0.5) {}
+        , sigmoid_range_(0.5) {
+        // Validate config consistency. The decision logic in
+        // analyze_with_efficiency() compares against efficiency_threshold and
+        // saturation_threshold; inverting them silently breaks add-vs-remove
+        // routing.
+        if (!(config.efficiency_threshold >= 0.0 &&
+              config.efficiency_threshold <= 1.0)) {
+            throw exceptions::InvalidArgumentException("efficiency_threshold",
+                "efficiency_threshold must be in [0, 1]");
+        }
+        if (!(config.saturation_threshold >= 0.0 &&
+              config.saturation_threshold <= 1.0)) {
+            throw exceptions::InvalidArgumentException("saturation_threshold",
+                "saturation_threshold must be in [0, 1]");
+        }
+        if (config.efficiency_threshold >= config.saturation_threshold) {
+            throw exceptions::InvalidArgumentException("LayerManagerConfig",
+                "efficiency_threshold must be strictly less than "
+                "saturation_threshold; otherwise the add-vs-remove decision "
+                "logic collapses.");
+        }
+        if (!(config.redundancy_threshold >= 0.0 &&
+              config.redundancy_threshold <= 1.0)) {
+            throw exceptions::InvalidArgumentException("redundancy_threshold",
+                "redundancy_threshold must be in [0, 1]");
+        }
+    }
 
     /**
      * Compute adaptive saturation threshold using sigmoid function.

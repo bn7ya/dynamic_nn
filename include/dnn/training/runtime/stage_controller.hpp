@@ -87,7 +87,7 @@ public:
         while (true) {
             if (max_epochs != 0 && executed >= max_epochs) break;
             if (!should_continue()) break;
-            if (rewind_.load() && id != StageId::Estimation) break;
+            if (rewind_requested() && id != StageId::Estimation) break;
 
             // Topology shared-lock around the step body. The body may take
             // the write lock internally for soft mutations; that upgrade
@@ -137,15 +137,23 @@ public:
 
     /**
      * Has the observer asked the controller to rewind to an earlier stage?
+     *
+     * `rewind_requested()` uses acquire ordering paired with the
+     * release-store inside `request_rewind()`, so any reader that sees
+     * the flag set is guaranteed to also see the matching `rewind_target_`
+     * value written before it.
      */
-    bool rewind_requested() const { return rewind_.load(); }
-    StageId rewind_target() const { return rewind_target_.load(); }
+    bool rewind_requested() const { return rewind_.load(std::memory_order_acquire); }
+    StageId rewind_target() const { return rewind_target_.load(std::memory_order_acquire); }
     void clear_rewind() {
-        rewind_.store(false);
+        rewind_.store(false, std::memory_order_release);
     }
     void request_rewind(StageId target) {
-        rewind_target_.store(target);
-        rewind_.store(true);
+        // Publish the target first with release ordering, then flip the
+        // flag with another release. A reader that sees the flag (via
+        // acquire) is guaranteed to also see this target store.
+        rewind_target_.store(target, std::memory_order_release);
+        rewind_.store(true, std::memory_order_release);
     }
 
     /**

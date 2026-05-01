@@ -58,8 +58,14 @@ instantiations for `float` and `double`; behaviour lives in the headers.
   the active-mask gating when you do.
 - `Network<T>::compact()` includes a fan-in repair pass that **resets
   the rebuilt layer's weights**. This is acceptable because compaction
-  is end-of-training, but if compaction is ever called mid-training
-  this becomes a regression vector — add a precondition check.
+  is end-of-training; calling it mid-training would silently regress
+  weights. Guarded by `Network<T>::training_in_progress_`: the
+  trainer's `TrainingInProgressGuard` (RAII in
+  `include/dnn/training/trainer.hpp`) flips the flag for the duration
+  of `train_phased{,_runtime}`, and `compact()` throws
+  `InvalidArgumentException` if called while the flag is set. Tests
+  that need to exercise compaction in isolation can pass
+  `compact(/*allow_unsafe=*/true)`.
 - `Layer<T>::clone()` copies `active_mask_`, `layer_active_`,
   `topology_version_`. New per-layer state must be added here too or
   inherit-based features (`Network::inherit_from`) lose state.

@@ -54,7 +54,10 @@ class DataSignals:
 
     variance_score: float
     complexity_score: float
-    raw_stats: Dict[str, float] = field(default_factory=dict)
+    # Values are floats except for fields that are intentionally undefined
+    # (e.g. fisher_ratio for regression / single-class inputs), which are
+    # represented as None rather than NaN so the dict stays JSON-serialisable.
+    raw_stats: Dict[str, Optional[float]] = field(default_factory=dict)
     derived_thresholds: Dict[str, Any] = field(default_factory=dict)
     fallback_used: bool = False
     notes: str = ""
@@ -218,7 +221,10 @@ def _compute_complexity_signal(
         "label_entropy": entropy,
         "task_kind": 1.0 if task_kind == "classification" else 0.0,
         "effective_rank_norm": float(eff_rank_norm),
-        "fisher_ratio": float(fisher) if fisher is not None else float("nan"),
+        # None (not NaN) signals "undefined" so the dict stays JSON-serialisable
+        # and downstream numeric ops can branch cleanly. Fisher is undefined for
+        # regression and single-class inputs.
+        "fisher_ratio": float(fisher) if fisher is not None else None,
         "separability_score": sep_score,
         "dim_ratio": float(dim_ratio),
     }

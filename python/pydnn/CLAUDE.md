@@ -41,6 +41,16 @@ observer, and `ThreeModelGenerator` for spawning multiple variants.
   numpy array. Don't wrap inputs in `Tensor` or call `.numpy()` on
   the return. (`network.py:2528-2535` and the binding at
   `_bindings.cpp:69-77`.)
+- **`predict_batch()` is the vectorised batch path.**
+  `PyNetwork::predict_batch` accepts a 2-D `(N, F)` numpy array
+  (any C-castable view; the binding force-casts to contiguous
+  float32) and returns `(N, output)` in one call, with the GIL
+  released around the per-row forward loop.
+  `DynamicNetwork.predict()` prefers it via `hasattr(...)`, falling
+  back to the per-sample loop if the binding is too old. Don't
+  remove the fallback while older `.so` artefacts are still
+  in circulation. (`network.py:2573-2594`,
+  `_bindings.cpp` `predict_batch`.)
 - **`fit()` calls `network.compact()` after `_fit_cpp` returns.**
   This is what makes soft-pruning actually save FLOPs at inference.
   Don't drop the call. (`network.py:892-901`.)
@@ -72,10 +82,12 @@ observer, and `ThreeModelGenerator` for spawning multiple variants.
 ## Maintenance notes
 
 - `_CostTrendObserver` (`network.py:425-489`) is a daemon thread that
-  reads `cost_history` (a regular list). The GIL makes individual
-  `list.append` and index reads atomic, which is enough since the
-  observer only reads. Don't try to optimise away the GIL with
-  shared memory unless you also add explicit locking.
+  reads `cost_history` (a regular list). Under the GIL both
+  `list.append` and the slice `history[-window:]` are atomic — the
+  slice creates a fresh list snapshot before any other thread runs —
+  so the observer (read-only) and the fit loop (sole writer) need no
+  explicit lock. If you ever add a second writer thread, introduce a
+  `threading.Lock` in this class first.
 - The observer raises `rewind_requested()` once and is cleared by the
   Phase 3 loop; the Python fallback then uses a simple "early break"
   rather than the C++ runtime's rewind-into-Estimation. Keep that
@@ -95,9 +107,13 @@ observer, and `ThreeModelGenerator` for spawning multiple variants.
 ## Memory & reliability notes
 
 - `TrainingResult.cost_history` and friends mirror the C++ histories.
-  Each is a Python list; growth is bounded by epoch count. If you
-  enable very long-running modes, surface an option to truncate /
-  downsample before storing.
+  Each is a Python list, capped at module-level `MAX_HISTORY = 500`
+  via the `_append_capped(history, value)` helper. Older entries
+  drop off the front; the most recent 500 epochs are retained. The
+  C++ `Trainer::kDefaultHistoryReserve` and
+  `EmotionalState::kHistoryWindow` use the same value so the two
+  backends report comparable windows. If you raise the cap, raise
+  both sides.
 - The pure-Python `_fit_python` allocates fresh numpy arrays per
   epoch in `_train_epoch` for shuffles and gradients. Don't try to
   micro-optimise this — the C++ path is the perf path.
