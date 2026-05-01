@@ -468,9 +468,22 @@ public:
      * Intended to be called once at end of training to produce a lean
      * inference-ready model.
      *
+     * Soft-delete contract: the fan-in repair pass at the end **resets
+     * the rebuilt layer's weights**, which is only safe end-of-training.
+     * Throws InvalidArgumentException if called while a Trainer has
+     * marked training as in-progress, unless `allow_unsafe = true` is
+     * passed (intended for tests that exercise compact() in isolation).
+     *
      * Returns the total number of nodes physically removed.
      */
-    size_t compact() {
+    size_t compact(bool allow_unsafe = false) {
+        if (training_in_progress_ && !allow_unsafe) {
+            throw exceptions::InvalidArgumentException("compact",
+                "compact() called while training is in progress; "
+                "this would silently reset rebuilt layers' weights. "
+                "Call only after Trainer::train_phased() returns, or "
+                "pass allow_unsafe=true if you know what you're doing.");
+        }
         size_t total_nodes_removed = 0;
 
         // Pass 1: compact each layer's dormant nodes.
@@ -515,6 +528,19 @@ public:
     }
 
     uint64_t topology_version() const { return topology_version_; }
+
+    /**
+     * Mark the network as currently being trained.
+     *
+     * Trainer<T>::train_phased{,_runtime}() set this for the duration of
+     * the call so that compact() refuses to run mid-training (its
+     * fan-in repair pass resets weights). Cleared at the end of training
+     * via RAII or explicit set_training_in_progress(false).
+     */
+    void set_training_in_progress(bool in_progress) {
+        training_in_progress_ = in_progress;
+    }
+    bool is_training_in_progress() const { return training_in_progress_; }
 
     /**
      * Check for numerical issues.
@@ -568,6 +594,10 @@ private:
     // detect that topology has shifted under them by comparing a cached
     // version.
     uint64_t topology_version_ = 0;
+    // Set by Trainer<T>::train_phased{,_runtime}() while training runs.
+    // Guards compact() against being called mid-training (which would
+    // silently reset rebuilt-layer weights via the fan-in repair pass).
+    bool training_in_progress_ = false;
 };
 
 // Type aliases

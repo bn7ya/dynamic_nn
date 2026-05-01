@@ -16,6 +16,12 @@ namespace training {
  * Matches Python implementation exactly.
  */
 struct EmotionalState {
+    // Sliding-window cap for the four history deques. Bounded so long
+    // Phase-3 runs don't grow memory linearly with epoch count. The
+    // ratio fields (depression/excitement_ratio) use the running totals,
+    // not the histories, so they're unaffected by the cap.
+    static constexpr size_t kHistoryWindow = 500;
+
     int total_rewards = 0;
     int total_penalties = 0;
     std::deque<double> reward_history;
@@ -55,6 +61,16 @@ struct EmotionalState {
         lr_reset_count = 0;
     }
 };
+
+// Push a value onto a history deque, popping the front if it exceeds
+// the EmotionalState::kHistoryWindow cap. Keeps the four reward/penalty
+// histories bounded under indefinite Phase-3 epoch counts.
+inline void push_capped(std::deque<double>& history, double value) {
+    history.push_back(value);
+    if (history.size() > EmotionalState::kHistoryWindow) {
+        history.pop_front();
+    }
+}
 
 /**
  * Configuration for reward/penalty system.
@@ -256,7 +272,7 @@ inline double apply_reward(
 
     // Update emotional state
     state.total_rewards++;
-    state.reward_history.push_back(magnitude);
+    push_capped(state.reward_history, magnitude);
 
     return new_lr;
 }
@@ -296,7 +312,7 @@ inline double apply_penalty(
 
     // Update emotional state
     state.total_penalties++;
-    state.penalty_history.push_back(magnitude);
+    push_capped(state.penalty_history, magnitude);
 
     return new_lr;
 }
@@ -342,8 +358,8 @@ inline std::pair<double, std::string> check_extreme_states(
     }
 
     // Record history
-    state.depression_history.push_back(depression);
-    state.excitement_history.push_back(excitement);
+    push_capped(state.depression_history, depression);
+    push_capped(state.excitement_history, excitement);
 
     return {lr, state_str};
 }

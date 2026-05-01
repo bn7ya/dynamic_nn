@@ -8,6 +8,7 @@
 #include <pybind11/numpy.h>
 #include <pybind11/functional.h>
 #include <pybind11/chrono.h>
+#include <cstring>
 
 #include "dnn/core/tensor.hpp"
 #include "dnn/core/network.hpp"
@@ -76,6 +77,75 @@ public:
         return forward(input);
     }
 
+    /**
+     * Vectorised predict over a batch of N samples.
+     *
+     * Accepts a 2-D `(N, F)` numpy array (or any contiguous-castable view),
+     * runs `network_.forward` on each row inside C++ with the GIL released,
+     * and returns a single `(N, output)` numpy array. This bypasses the
+     * Python per-sample loop in `DynamicNetwork.predict()` and the per-call
+     * binding overhead that came with it.
+     */
+    py::array_t<T> predict_batch(py::array_t<T> input) {
+        auto input_c = py::array::ensure(input,
+            py::array::c_style | py::array::forcecast);
+        if (!input_c) {
+            throw std::runtime_error("predict_batch: input must be convertible "
+                                     "to a C-contiguous float array");
+        }
+        py::buffer_info buf = input_c.request();
+        if (buf.ndim < 2) {
+            throw std::runtime_error("predict_batch: expected at least a 2-D "
+                                     "array shaped (N, F)");
+        }
+
+        size_t n_samples = static_cast<size_t>(buf.shape[0]);
+        size_t input_size = 1;
+        for (py::ssize_t d = 1; d < buf.ndim; ++d) {
+            input_size *= static_cast<size_t>(buf.shape[d]);
+        }
+
+        const T* src = static_cast<const T*>(buf.ptr);
+
+        // Pre-allocate the output buffer once we know the network's output
+        // size. Run the first sample under the GIL so we can size the array
+        // from its result, then release the GIL for the remaining rows.
+        size_t output_size = 0;
+        std::vector<T> flat;
+        {
+            core::Tensor<T> first_in(std::vector<size_t>{input_size});
+            std::memcpy(first_in.data(), src, input_size * sizeof(T));
+            core::Tensor<T> first_out = network_.forward(first_in);
+            output_size = first_out.size();
+            flat.resize(n_samples * output_size);
+            std::memcpy(flat.data(), first_out.data(), output_size * sizeof(T));
+        }
+
+        if (n_samples > 1) {
+            py::gil_scoped_release release;
+            for (size_t i = 1; i < n_samples; ++i) {
+                core::Tensor<T> inp(std::vector<size_t>{input_size});
+                std::memcpy(inp.data(), src + i * input_size,
+                            input_size * sizeof(T));
+                core::Tensor<T> out = network_.forward(inp);
+                if (out.size() != output_size) {
+                    // Should not happen unless the network mutates between
+                    // rows; surface it loudly rather than corrupting output.
+                    throw std::runtime_error(
+                        "predict_batch: output size changed between samples");
+                }
+                std::memcpy(flat.data() + i * output_size,
+                            out.data(), output_size * sizeof(T));
+            }
+        }
+
+        std::vector<py::ssize_t> shape{
+            static_cast<py::ssize_t>(n_samples),
+            static_cast<py::ssize_t>(output_size)
+        };
+        return py::array_t<T>(shape, flat.data());
+    }
+
     size_t num_layers() const { return network_.num_layers(); }
     size_t num_parameters() const { return network_.num_parameters(); }
 
@@ -134,37 +204,53 @@ public:
         : trainer_(network.network(), cost_type, config) {}
 
     training::TrainingResult train(py::array_t<T> inputs, py::array_t<T> targets) {
-        py::buffer_info input_buf = inputs.request();
-        py::buffer_info target_buf = targets.request();
+        // Force C-contiguous, casting if needed. Without this, a strided or
+        // transposed numpy view would silently copy garbage into Tensor::data().
+        auto inputs_c  = py::array::ensure(inputs,
+            py::array::c_style | py::array::forcecast);
+        auto targets_c = py::array::ensure(targets,
+            py::array::c_style | py::array::forcecast);
+        if (!inputs_c || !targets_c) {
+            throw std::runtime_error("Inputs and targets must be convertible to "
+                                     "a C-contiguous float array");
+        }
+        py::buffer_info input_buf  = inputs_c.request();
+        py::buffer_info target_buf = targets_c.request();
 
         if (input_buf.ndim < 2 || target_buf.ndim < 2) {
             throw std::runtime_error("Inputs and targets must have at least 2 dimensions");
         }
-
-        size_t n_samples = input_buf.shape[0];
-        size_t input_size = 1;
-        for (size_t i = 1; i < input_buf.ndim; ++i) {
-            input_size *= input_buf.shape[i];
+        if (input_buf.shape[0] != target_buf.shape[0]) {
+            throw std::runtime_error("Inputs and targets must have the same n_samples");
         }
-        size_t target_size = target_buf.shape[1];
+
+        size_t n_samples = static_cast<size_t>(input_buf.shape[0]);
+        size_t input_size = 1;
+        for (py::ssize_t i = 1; i < input_buf.ndim; ++i) {
+            input_size *= static_cast<size_t>(input_buf.shape[i]);
+        }
+        size_t target_size = static_cast<size_t>(target_buf.shape[1]);
 
         std::vector<core::Tensor<T>> input_tensors;
         std::vector<core::Tensor<T>> target_tensors;
+        input_tensors.reserve(n_samples);
+        target_tensors.reserve(n_samples);
 
-        T* input_ptr = static_cast<T*>(input_buf.ptr);
-        T* target_ptr = static_cast<T*>(target_buf.ptr);
+        const T* input_ptr  = static_cast<const T*>(input_buf.ptr);
+        const T* target_ptr = static_cast<const T*>(target_buf.ptr);
 
+        // Bulk-copy each sample's contiguous row into a fresh Tensor; cheaper
+        // than std::copy element-by-element and faithful to Tensor's owning
+        // semantics (Trainer reorders / stores samples).
         for (size_t i = 0; i < n_samples; ++i) {
             core::Tensor<T> inp(std::vector<size_t>{input_size});
-            std::copy(input_ptr + i * input_size,
-                     input_ptr + (i + 1) * input_size,
-                     inp.data());
+            std::memcpy(inp.data(), input_ptr + i * input_size,
+                        input_size * sizeof(T));
             input_tensors.push_back(std::move(inp));
 
             core::Tensor<T> tgt(std::vector<size_t>{target_size});
-            std::copy(target_ptr + i * target_size,
-                     target_ptr + (i + 1) * target_size,
-                     tgt.data());
+            std::memcpy(tgt.data(), target_ptr + i * target_size,
+                        target_size * sizeof(T));
             target_tensors.push_back(std::move(tgt));
         }
 
@@ -439,6 +525,9 @@ PYBIND11_MODULE(_dnn_core, m) {
         .def(py::init<const core::NetworkConfig&>())
         .def("forward", &PyNetwork<float>::forward)
         .def("predict", &PyNetwork<float>::predict)
+        .def("predict_batch", &PyNetwork<float>::predict_batch,
+             py::arg("input"),
+             "Vectorised predict over a 2-D (N, F) batch; returns (N, output).")
         .def("num_layers", &PyNetwork<float>::num_layers)
         .def("num_parameters", &PyNetwork<float>::num_parameters)
         .def("compact", &PyNetwork<float>::compact,

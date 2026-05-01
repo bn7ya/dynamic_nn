@@ -87,10 +87,16 @@ CLAUDE.md sub-file refers back here.
 - **Bounded histories.** `cost_history`, `efficiency_history`,
   `cancer_score_history`, `alzheimer_score_history`,
   `architecture_history`, `learning_rate_history`,
-  `emotional_state_history` all grow per epoch. They have an
-  implicit `reserve(500)` and currently no cap. If you add
-  long-running modes, **add a window cap** rather than letting them
-  grow without bound.
+  `emotional_state_history` all grow per epoch and are now capped:
+  the C++ trainer reserves `Trainer::kDefaultHistoryReserve = 500`
+  (and bumps to `max(500, max_epochs)` on the runtime path), and
+  the Python fallback trims to `MAX_HISTORY = 500` via
+  `_append_capped`. The four `EmotionalState` deques cap at
+  `EmotionalState::kHistoryWindow = 500` via `push_capped`. Older
+  entries fall off the front; the most recent 500 are kept. If you
+  raise `max_epochs` past 500 expect the earliest entries to be
+  dropped — bump `kDefaultHistoryReserve`/`MAX_HISTORY` in lockstep
+  if you need a longer window.
 - **GIL released around long C++ work.**
   `python/pydnn/_bindings.cpp` does this in `PyTrainer::train` via
   `py::gil_scoped_release`. Preserve this on any new long-running

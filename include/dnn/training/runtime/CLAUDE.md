@@ -37,6 +37,12 @@ instantiation so latent type errors surface at link time.
   `rewind_target_`. Don't introduce paths where the observer
   reaches into worker state directly. (`stage_controller.hpp`
   `observer_loop`.)
+- **`request_rewind` is publish-safe.** `rewind_target_` is stored
+  with `memory_order_release` *before* `rewind_` is flipped (also
+  release). Readers that see `rewind_requested()` true via
+  `memory_order_acquire` are guaranteed to also see the matching
+  target. Don't reorder the stores or downgrade the orderings —
+  observers spinning on `rewind_` can otherwise read a stale target.
 - **`AdaptiveScalar` writes come from a single controller thread.**
   Reads can come from any stage worker via `current()` (atomic).
   Don't write from multiple threads — the type intentionally allows

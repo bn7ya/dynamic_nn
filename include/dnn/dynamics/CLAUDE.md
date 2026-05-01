@@ -60,10 +60,14 @@ modify weights directly — they only call into `Layer<T>` /
   defaults so existing call sites stay byte-identical. The dynamic-
   thresholds Python layer writes derived values into
   `TrainerConfig::layer_manager_config`, which `Trainer::Trainer`
-  forwards into the LayerManager. Sigmoid shape constants
-  (`sigmoid_k_`, `sigmoid_base_`, `sigmoid_range_`) intentionally
-  remain hardcoded — they're functional-form parameters, not
-  decision thresholds.
+  forwards into the LayerManager. The 3-arg constructor validates the
+  config: each threshold must lie in `[0, 1]` and
+  `efficiency_threshold` must be strictly less than
+  `saturation_threshold` (otherwise the add-vs-remove decision logic
+  collapses); violations throw `InvalidArgumentException`. Sigmoid
+  shape constants (`sigmoid_k_`, `sigmoid_base_`, `sigmoid_range_`)
+  intentionally remain hardcoded — they're functional-form parameters
+  documented inline, not decision thresholds.
 - `TrainableScheduler` schedules trainable fractions across layers
   but doesn't yet co-ordinate with `active_mask_` from
   [core](../core/CLAUDE.md). A node can be both inactive (mask=0)

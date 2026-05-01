@@ -55,6 +55,11 @@ struct LayerMetrics {
 template<typename T = float>
 class Layer {
 public:
+    // Minimum batch size before the OpenMP team-spawn cost is worth paying.
+    // Single source of truth referenced by both forward_cpu and backward_cpu;
+    // changing it here updates both per-batch parallel-for guards.
+    static constexpr size_t kOpenMpBatchThreshold = 4;
+
     /**
      * Construct a dense layer.
      * @param input_size Number of inputs
@@ -183,7 +188,7 @@ private:
             linear_output = Tensor<T>(std::vector<size_t>{batch_size, output_size_});
 
 #ifdef DNN_HAS_OPENMP
-            #pragma omp parallel for schedule(static) if (batch_size > 4)
+            #pragma omp parallel for schedule(static) if (batch_size > kOpenMpBatchThreshold)
 #endif
             for (size_t b = 0; b < batch_size; ++b) {
                 for (size_t i = 0; i < output_size_; ++i) {
@@ -388,7 +393,7 @@ private:
             // by every b.
             Tensor<T> grad_input(std::vector<size_t>{batch_size, input_size_});
 #ifdef DNN_HAS_OPENMP
-            #pragma omp parallel for schedule(static) if (batch_size > 4)
+            #pragma omp parallel for schedule(static) if (batch_size > kOpenMpBatchThreshold)
 #endif
             for (size_t b = 0; b < batch_size; ++b) {
                 for (size_t j = 0; j < input_size_; ++j) {

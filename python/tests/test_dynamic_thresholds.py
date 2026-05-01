@@ -85,6 +85,35 @@ def test_regression_targets_handled():
     assert derived  # not empty
 
 
+def test_regression_fisher_ratio_is_none_not_nan():
+    """Fisher is undefined for regression — raw_stats must store None
+    (JSON-serialisable) rather than NaN (which poisons downstream ops)."""
+    rng = np.random.default_rng(11)
+    X = rng.standard_normal((300, 6)).astype(np.float32)
+    y = rng.standard_normal((300,)).astype(np.float32)
+    sig = compute_data_signals(X, y)
+    # Aggregator prefixes complexity-keys with "comp_".
+    assert "comp_fisher_ratio" in sig.raw_stats
+    assert sig.raw_stats["comp_fisher_ratio"] is None
+    # Regression-style raw_stats must remain JSON-encodable.
+    import json
+    json.dumps(sig.raw_stats)  # would raise on NaN
+
+
+def test_single_class_classification_fisher_is_none():
+    """Single-class one-hot inputs collapse Fisher (no between-class
+    variance). The signal must surface this as None and never as NaN."""
+    rng = np.random.default_rng(12)
+    X = rng.standard_normal((100, 4)).astype(np.float32)
+    # Every row labelled class 0 — only one class present.
+    y = np.zeros((100, 3), dtype=np.float32)
+    y[:, 0] = 1.0
+    sig = compute_data_signals(X, y)
+    assert sig.raw_stats.get("comp_fisher_ratio") is None
+    import json
+    json.dumps(sig.raw_stats)  # JSON-safe
+
+
 # ---------------------------------------------------------------------------
 # derive_thresholds clamping & mapping coverage
 # ---------------------------------------------------------------------------

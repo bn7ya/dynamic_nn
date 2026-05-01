@@ -201,6 +201,22 @@ using EpochCallback = std::function<void(uint64_t epoch, double cost, double eff
 template<typename T = float>
 class Trainer {
 public:
+    /**
+     * RAII guard that flips Network<T>::training_in_progress_ to true
+     * for the duration of a train_phased{,_runtime} call. Ensures
+     * compact() refuses to run mid-training even if the call exits via
+     * exception.
+     */
+    struct TrainingInProgressGuard {
+        Network<T>& net;
+        explicit TrainingInProgressGuard(Network<T>& n) : net(n) {
+            net.set_training_in_progress(true);
+        }
+        ~TrainingInProgressGuard() { net.set_training_in_progress(false); }
+        TrainingInProgressGuard(const TrainingInProgressGuard&) = delete;
+        TrainingInProgressGuard& operator=(const TrainingInProgressGuard&) = delete;
+    };
+
     Trainer(Network<T>& network,
             CostFunctionType cost_type = CostFunctionType::MeanSquaredError,
             const TrainerConfig& config = TrainerConfig())
@@ -225,6 +241,8 @@ public:
      */
     TrainingResult train(const std::vector<Tensor<T>>& inputs,
                          const std::vector<Tensor<T>>& targets) {
+        TrainingInProgressGuard tip_guard(network_);
+
         auto start_time = std::chrono::high_resolution_clock::now();
 
         TrainingResult result;
@@ -368,14 +386,12 @@ public:
             return train_phased_runtime(inputs, targets);
         }
 
+        TrainingInProgressGuard tip_guard(network_);
+
         auto total_start = std::chrono::high_resolution_clock::now();
 
         TrainingResult result;
-        result.cost_history.reserve(500);
-        result.efficiency_history.reserve(500);
-        result.cancer_score_history.reserve(500);
-        result.alzheimer_score_history.reserve(500);
-        result.architecture_history.reserve(500);
+        reserve_histories(result, kDefaultHistoryReserve);
 
         // Compute normalization parameters and normalize data
         compute_normalization_params(inputs, targets);
@@ -705,14 +721,13 @@ public:
                                         const std::vector<Tensor<T>>& targets) {
         namespace rt = dnn::training::runtime;
 
+        TrainingInProgressGuard tip_guard(network_);
+
         auto total_start = std::chrono::high_resolution_clock::now();
 
         TrainingResult result;
-        result.cost_history.reserve(500);
-        result.efficiency_history.reserve(500);
-        result.cancer_score_history.reserve(500);
-        result.alzheimer_score_history.reserve(500);
-        result.architecture_history.reserve(500);
+        reserve_histories(result, std::max(kDefaultHistoryReserve,
+                                           static_cast<size_t>(config_.max_epochs)));
 
         // Normalize data (same as legacy).
         compute_normalization_params(inputs, targets);
@@ -1315,6 +1330,19 @@ public:
     }
 
 private:
+    // Per-epoch history vectors are reserved up-front so they don't realloc
+    // mid-training. 500 covers every default-config run; train_phased_runtime
+    // bumps this to max(500, max_epochs) for opt-in long runs.
+    static constexpr size_t kDefaultHistoryReserve = 500;
+
+    static void reserve_histories(TrainingResult& result, size_t cap) {
+        result.cost_history.reserve(cap);
+        result.efficiency_history.reserve(cap);
+        result.cancer_score_history.reserve(cap);
+        result.alzheimer_score_history.reserve(cap);
+        result.architecture_history.reserve(cap);
+    }
+
     void clip_gradients() {
         // Simple gradient clipping by value
         // In a full implementation, we'd access the accumulated gradients

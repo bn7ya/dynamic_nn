@@ -78,19 +78,30 @@ sequential body and the helpers shared between both paths.
   runtime path embeds an inline early-stop check inside
   `train_phased_runtime`'s should-continue lambda. Keep them in sync;
   diverging them silently is a recipe for confusing regressions.
+- Both training entry points (`train_phased` and
+  `train_phased_runtime`) construct a `TrainingInProgressGuard`
+  (defined as a private struct on `Trainer<T>`) at scope start.
+  The guard flips `Network<T>::training_in_progress_` and clears it
+  via RAII so `Network<T>::compact()` refuses to run mid-training
+  even on exception paths. Mirror this guard in any new top-level
+  training entry point.
 
 ## Memory & reliability notes
 
 - Every `result.<name>_history` push happens inside the per-epoch
-  step; with `reserve(500)` they grow but don't reallocate up to 500
-  epochs. If you uncap the runtime's main-stage epoch budget,
-  reservation should grow to match or you'll thrash the heap.
-  `trainer.hpp:357-361`.
+  step. Reservation goes through `Trainer::reserve_histories` with
+  `Trainer::kDefaultHistoryReserve = 500`; the runtime path bumps
+  the cap to `max(500, max_epochs)` so long opt-in runs don't thrash
+  the heap. If you raise `max_epochs` past 500 on the legacy path,
+  push the same change here.
 - `EmotionalState::reward_history` / `penalty_history` /
-  `depression_history` / `excitement_history` are `std::deque`s.
-  They're appended every epoch in Phase 3. If you allow indefinite
-  Phase 3 epochs, add a `pop_front()` cap or memory will grow
-  linearly with epoch count. (`emotional_state.hpp:18-56`.)
+  `depression_history` / `excitement_history` are `std::deque`s
+  capped at `EmotionalState::kHistoryWindow = 500` via the
+  `push_capped` helper. They're appended every epoch in Phase 3 and
+  drop oldest-first when full, so memory stays bounded under
+  indefinite Phase 3 epochs. The ratios use the running totals
+  (`total_rewards` / `total_penalties`), not the histories, so they
+  remain stable across the cap. (`emotional_state.hpp:18-56`.)
 - The optimizer holds momentum / Adam state proportional to the
   number of parameters. Architecture growth means re-allocating that
   state. The current code recreates it lazily; if you add a new
