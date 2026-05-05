@@ -133,6 +133,23 @@ from .model_generator import (
     generate_models,
 )
 
+# Transformer / MoE / LLM building blocks (pure-Python, NumPy-backed).
+# Importing the submodule also makes it accessible as ``pydnn.transformer``.
+from . import transformer
+from .transformer import (
+    TransformerConfig,
+    EncoderOnlyModel,
+    DecoderOnlyModel,
+    Seq2SeqModel,
+    Transformer,
+    DynamicTransformer,
+    MultiHeadAttention,
+    GroupedQueryAttention,
+    MixtureOfExperts,
+    CausalLMTrainer,
+    AdamW,
+)
+
 # Available cost functions
 COST_FUNCTIONS = [
     "MSE",
@@ -169,6 +186,19 @@ __all__ = [
     "ModelStrategy",
     "GeneratorConfig",
     "generate_models",
+    # Transformer / MoE
+    "transformer",
+    "TransformerConfig",
+    "EncoderOnlyModel",
+    "DecoderOnlyModel",
+    "Seq2SeqModel",
+    "Transformer",
+    "DynamicTransformer",
+    "MultiHeadAttention",
+    "GroupedQueryAttention",
+    "MixtureOfExperts",
+    "CausalLMTrainer",
+    "AdamW",
     # Constants
     "COST_FUNCTIONS",
     # Version

@@ -19,6 +19,7 @@ observer, and `ThreeModelGenerator` for spawning multiple variants.
 | `dynamic_thresholds.py` | `compute_data_signals(X, y)` + `derive_thresholds(...)` + `MAPPING_TABLE`. Engine for the `dynamic_thresholds=True` path. |
 | `model_generator.py` | `ThreeModelGenerator`: builds efficient / balanced / accurate variants from one template. |
 | `visualization.py` | Matplotlib-based reports (cost curves, architecture history, health). Optional. |
+| `transformer/` | Modern Transformer / MoE / LLM building blocks (own autograd, own Module base, own trainer). See [`transformer/CLAUDE.md`](transformer/CLAUDE.md). Pure-Python; does not touch `_dnn_core`. |
 
 ## Invariants
 
