@@ -9,6 +9,7 @@ from typing import Optional
 
 import numpy as np
 
+from . import _backend as _bk
 from . import autograd as A
 from .autograd import Parameter, Tensor
 from .module import Module
@@ -52,28 +53,18 @@ class LayerNorm(Module):
         self.bias = Parameter(np.zeros((dim,), dtype=np.float32))
 
     def forward(self, x: Tensor) -> Tensor:
-        mean = x.data.mean(axis=-1, keepdims=True)
-        var = x.data.var(axis=-1, keepdims=True)
-        inv = 1.0 / np.sqrt(var + self.eps)
-        normed = (x.data - mean) * inv
-        out_data = normed * self.weight.data + self.bias.data
+        out_data, mean, inv_std = _bk.layernorm_forward(
+            x.data, self.weight.data, self.bias.data, self.eps)
         out = Tensor(out_data, _children=(x, self.weight, self.bias), _op="layernorm")
 
-        d = self.dim
+        x_ref = x  # captured for closure
 
         def _bw():
-            g = out.grad
-            # grad through gain/bias is straightforward
-            gw = (g * normed).reshape(-1, d).sum(axis=0)
-            gb = g.reshape(-1, d).sum(axis=0)
+            dx, gw, gb = _bk.layernorm_backward(
+                x_ref.data, self.weight.data, mean, inv_std, out.grad)
             self.weight.grad = gw if self.weight.grad is None else self.weight.grad + gw
             self.bias.grad = gb if self.bias.grad is None else self.bias.grad + gb
-            # grad wrt x — standard layernorm derivation
-            g_norm = g * self.weight.data
-            mean_g = g_norm.mean(axis=-1, keepdims=True)
-            mean_gn = (g_norm * normed).mean(axis=-1, keepdims=True)
-            gx = (g_norm - mean_g - normed * mean_gn) * inv
-            x.grad = gx if x.grad is None else x.grad + gx
+            x_ref.grad = dx if x_ref.grad is None else x_ref.grad + dx
 
         out._backward = _bw
         return out
@@ -92,22 +83,16 @@ class RMSNorm(Module):
         self.weight = Parameter(np.ones((dim,), dtype=np.float32))
 
     def forward(self, x: Tensor) -> Tensor:
-        rms = np.sqrt((x.data ** 2).mean(axis=-1, keepdims=True) + self.eps)
-        normed = x.data / rms
-        out_data = normed * self.weight.data
+        out_data, inv_rms = _bk.rmsnorm_forward(x.data, self.weight.data, self.eps)
         out = Tensor(out_data, _children=(x, self.weight), _op="rmsnorm")
 
-        d = self.dim
+        x_ref = x
 
         def _bw():
-            g = out.grad
-            gw = (g * normed).reshape(-1, d).sum(axis=0)
+            dx, gw = _bk.rmsnorm_backward(
+                x_ref.data, self.weight.data, inv_rms, out.grad)
             self.weight.grad = gw if self.weight.grad is None else self.weight.grad + gw
-            g_norm = g * self.weight.data
-            # d/dx_i [x_i / rms] = (1/rms) * (delta_ij - x_i x_j / (d * rms^2))
-            mean_gn_x = (g_norm * x.data).mean(axis=-1, keepdims=True)
-            gx = (g_norm - x.data * mean_gn_x / (rms ** 2)) / rms
-            x.grad = gx if x.grad is None else x.grad + gx
+            x_ref.grad = dx if x_ref.grad is None else x_ref.grad + dx
 
         out._backward = _bw
         return out

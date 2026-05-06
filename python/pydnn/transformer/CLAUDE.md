@@ -8,7 +8,17 @@ is **pure Python on top of NumPy** — no torch / jax / tf dependency —
 and ships its own minimal reverse-mode autograd engine so the models
 can actually train end-to-end. It composes with the rest of `pydnn`
 in spirit (numpy in / numpy out, soft topology mutations, end-of-
-training compaction) but does *not* touch the C++ `_dnn_core`.
+training compaction).
+
+**Optional native backend.** When the C++ extension is built, the hot
+ops (matmul, softmax, gelu, silu, layernorm, rmsnorm, embedding,
+cross_entropy) transparently route through `_dnn_core.transformer_ops`
+via the `_backend` dispatcher. The numpy reference is preserved as a
+fallback (and selectable via `PYDNN_TRANSFORMER_BACKEND=numpy`); the
+public Tensor / Module / `DynamicTransformer` API does not change.
+The kernels *back* the existing dynamic transformer — they don't
+replace it. Grow/prune logic, parameter discovery, and compact
+semantics are unchanged.
 
 ## Files
 
@@ -25,6 +35,7 @@ training compaction) but does *not* touch the C++ `_dnn_core`.
 | `tokenizer.py` | `WhitespaceTokenizer`, `CharTokenizer`, tiny `BPETokenizer`. |
 | `training.py` | `AdamW`, `SGD`, `cosine_with_warmup`, `linear_with_warmup`, `clip_grad_norm`, `CausalLMTrainer`. |
 | `dynamic.py` | `DynamicTransformer` + `AdaptiveDecoderBlock` + `TransformerHealth` — the dnn-flavoured grow/prune wrapper. |
+| `_backend.py` | Op dispatcher: routes `matmul / softmax / gelu / silu / layernorm / rmsnorm / embedding / xent` through `_dnn_core.transformer_ops` (cpu/cuda) when available, with a NumPy fallback. `set_backend("numpy"\|"cpu"\|"cuda")` and `PYDNN_TRANSFORMER_BACKEND` for testing parity. |
 
 ## Invariants
 

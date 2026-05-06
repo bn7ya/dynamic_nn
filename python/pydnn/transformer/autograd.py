@@ -31,6 +31,8 @@ from typing import Iterable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
+from . import _backend as _bk
+
 
 ArrayLike = Union[np.ndarray, "Tensor", float, int, list]
 
@@ -287,14 +289,21 @@ def _grad_required(t: Tensor) -> bool:
 
 
 def matmul(a: Tensor, b: Tensor) -> Tensor:
-    """Batched matmul. Supports broadcasting on leading dims."""
-    out = Tensor(a.data @ b.data, _children=(a, b), _op="matmul")
+    """Batched matmul. Supports broadcasting on leading dims.
+
+    Forward and the two backward gemms route through
+    :mod:`pydnn.transformer._backend`, so the cpu / cuda kernels in
+    ``_dnn_core.transformer_ops`` are used when available. The pure
+    NumPy semantics are preserved bit-equivalently to within fp32 noise.
+    """
+    out = Tensor(_bk.matmul(a.data, b.data), _children=(a, b), _op="matmul")
 
     def _bw():
         g = out.grad
-        # g shape == a.data @ b.data shape; gradient wrt a is g @ b.T (last two dims).
-        ga = g @ np.swapaxes(b.data, -1, -2)
-        gb = np.swapaxes(a.data, -1, -2) @ g
+        # ga = g @ b^T  (along the matrix dims)
+        ga = _bk.matmul(g, b.data, transpose_b=True)
+        # gb = a^T @ g
+        gb = _bk.matmul(a.data, g, transpose_a=True)
         ga = _unbroadcast(ga, a.shape)
         gb = _unbroadcast(gb, b.shape)
         a.grad = ga if a.grad is None else a.grad + ga
@@ -329,17 +338,11 @@ def log(x: Tensor, eps: float = 1e-12) -> Tensor:
 
 def softmax(x: Tensor, axis: int = -1) -> Tensor:
     """Numerically stable softmax with autograd."""
-    shifted = x.data - x.data.max(axis=axis, keepdims=True)
-    e = np.exp(shifted)
-    s = e.sum(axis=axis, keepdims=True)
-    out_data = e / s
+    out_data = _bk.softmax(x.data, axis=axis)
     out = Tensor(out_data, _children=(x,), _op="softmax")
 
     def _bw():
-        # dL/dx_i = y_i * (dL/dy_i - sum_j(dL/dy_j * y_j))
-        g = out.grad
-        dot = (g * out_data).sum(axis=axis, keepdims=True)
-        gx = out_data * (g - dot)
+        gx = _bk.softmax_backward(out_data, out.grad, axis=axis)
         x.grad = gx if x.grad is None else x.grad + gx
 
     out._backward = _bw
@@ -365,19 +368,10 @@ def log_softmax(x: Tensor, axis: int = -1) -> Tensor:
 
 def gelu(x: Tensor) -> Tensor:
     """Approximate GELU (tanh formulation)."""
-    c = np.float32(np.sqrt(2.0 / np.pi))
-    a = np.float32(0.044715)
-    inner = c * (x.data + a * x.data ** 3)
-    t = np.tanh(inner)
-    out_data = 0.5 * x.data * (1.0 + t)
-    out = Tensor(out_data, _children=(x,), _op="gelu")
+    out = Tensor(_bk.gelu(x.data), _children=(x,), _op="gelu")
 
     def _bw():
-        # d/dx [0.5 x (1 + tanh(inner))]
-        sech2 = 1.0 - t ** 2
-        d_inner = c * (1.0 + 3.0 * a * x.data ** 2)
-        gx = 0.5 * (1.0 + t) + 0.5 * x.data * sech2 * d_inner
-        gx = out.grad * gx
+        gx = _bk.gelu_backward(x.data, out.grad)
         x.grad = gx if x.grad is None else x.grad + gx
 
     out._backward = _bw
@@ -386,12 +380,10 @@ def gelu(x: Tensor) -> Tensor:
 
 def silu(x: Tensor) -> Tensor:
     """SiLU / Swish: x * sigmoid(x). Used in SwiGLU FFN."""
-    s = 1.0 / (1.0 + np.exp(-x.data))
-    out_data = x.data * s
-    out = Tensor(out_data, _children=(x,), _op="silu")
+    out = Tensor(_bk.silu(x.data), _children=(x,), _op="silu")
 
     def _bw():
-        gx = out.grad * (s + x.data * s * (1.0 - s))
+        gx = _bk.silu_backward(x.data, out.grad)
         x.grad = gx if x.grad is None else x.grad + gx
 
     out._backward = _bw
@@ -432,13 +424,12 @@ def embedding(ids: np.ndarray, weight: Tensor) -> Tensor:
     ``ids.shape + (weight.shape[-1],)``.
     """
     ids = np.asarray(ids, dtype=np.int64)
-    out_data = weight.data[ids]
+    out_data = _bk.embedding_forward(weight.data, ids)
     out = Tensor(out_data, _children=(weight,), _op="embedding")
 
     def _bw():
-        g = out.grad
-        gw = np.zeros_like(weight.data)
-        np.add.at(gw, ids, g)
+        gw = _bk.embedding_backward(out.grad, ids,
+                                    weight.shape[0], weight.shape[1])
         weight.grad = gw if weight.grad is None else weight.grad + gw
 
     out._backward = _bw
@@ -498,29 +489,15 @@ def cross_entropy(logits: Tensor, targets: np.ndarray,
     Positions where ``targets == ignore_index`` are excluded from the mean.
     """
     targets = np.asarray(targets, dtype=np.int64)
-    flat_logits = logits.data.reshape(-1, logits.shape[-1])
-    flat_targets = targets.reshape(-1)
-
-    # Numerically stable log-softmax
-    shifted = flat_logits - flat_logits.max(axis=-1, keepdims=True)
-    log_z = np.log(np.exp(shifted).sum(axis=-1, keepdims=True))
-    log_probs = shifted - log_z
-
-    valid = flat_targets != ignore_index
-    n = max(int(valid.sum()), 1)
-    safe_targets = np.where(valid, flat_targets, 0)
-    nll = -log_probs[np.arange(flat_logits.shape[0]), safe_targets]
-    nll = np.where(valid, nll, 0.0)
-    loss_val = nll.sum() / n
+    loss_val, log_probs, valid_count = _bk.xent_forward(
+        logits.data, targets, int(ignore_index))
 
     out = Tensor(np.float32(loss_val), _children=(logits,), _op="cross_entropy")
 
     def _bw():
-        sm = np.exp(log_probs)
-        sm[np.arange(flat_logits.shape[0]), safe_targets] -= 1.0
-        sm = sm * valid[:, None]
-        g = (out.grad / n) * sm
-        g = g.reshape(logits.shape)
+        g = _bk.xent_backward(log_probs, targets,
+                              float(out.grad), int(valid_count),
+                              int(ignore_index))
         logits.grad = g if logits.grad is None else logits.grad + g
 
     out._backward = _bw
