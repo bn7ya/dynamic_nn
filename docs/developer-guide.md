@@ -25,6 +25,14 @@ Read the sections in order the first time. After that, use it as a reference.
 7. [Architecture Changes Since Training](#7-architecture-changes-since-training)
 8. [Function Reference](#8-function-reference)
 9. [Technical Details](#9-technical-details)
+   - [The four training phases](#the-four-training-phases)
+   - [Dynamic thresholds](#dynamic-thresholds)
+   - [Cost functions](#cost-functions)
+   - [Optimizers](#optimizers)
+   - [CUDA and GPU acceleration](#cuda-and-gpu-acceleration)
+   - [CPU acceleration with SIMD](#cpu-acceleration-with-simd)
+   - [Concurrent training pipeline (`runtime_enabled=True`)](#concurrent-training-pipeline-runtime_enabledtrue)
+   - [Transformer subpackage and native backend](#transformer-subpackage-and-native-backend)
 10. [Configuration Reference](#10-configuration-reference)
 
 ---
@@ -1503,6 +1511,111 @@ training thread. This design means no locks are needed on the history list.
 All topology mutations (add/remove node/layer) under `runtime_enabled=True` go
 through `TopologyLock` in write mode. Read-only forward and backward passes hold
 the same lock in shared mode.
+
+---
+
+### Transformer subpackage and native backend
+
+`pydnn.transformer` is a self-contained subpackage of building blocks for
+LLM-style models — encoder, decoder, multi-head attention, grouped-query
+attention, RoPE, SwiGLU, mixture-of-experts, a small `AdamW` and a
+`CausalLMTrainer`. It ships its own minimal reverse-mode autograd engine on
+top of NumPy (in `transformer/autograd.py`), so the models train end-to-end
+without pulling in PyTorch / JAX / TF.
+
+`pydnn.DynamicTransformer` is the dnn-flavoured wrapper over that stack: it
+applies the same soft grow/prune principles that `DynamicNetwork` uses
+(active masks mid-training, end-of-training compaction) to a stack of
+`AdaptiveDecoderBlock`s. Calling `model.adapt(loss_history=...)` between
+training steps inspects block utilisation and the loss plateau, then either
+soft-prunes a low-utilisation block, grows a near-identity new block, or
+re-initialises a dead expert in any MoE layer. `model.compact()` mirrors
+`Network::compact()`: it physically drops blocks marked `active=False`
+once training is finished. Use it the same way — call it after the last
+training step, before saving or serving.
+
+```python
+import numpy as np
+from pydnn import DynamicTransformer
+from pydnn import transformer as T
+
+cfg = T.TransformerConfig(
+    vocab_size=2048, dim=128, num_heads=4,
+    num_decoder_layers=4, ffn_type="swiglu",
+    pos_encoding="rope", norm_type="rmsnorm",
+    max_seq_len=256,
+)
+model = DynamicTransformer(cfg)
+ids = np.random.randint(0, cfg.vocab_size, size=(8, 64))
+logits = model(ids)               # autograd Tensor, shape (8, 64, 2048)
+loss = T.cross_entropy(logits, ids)
+loss.backward()
+# After training:
+model.compact()                   # drop blocks marked inactive
+```
+
+#### Native CPU and CUDA backend
+
+The hot ops (`matmul`, `softmax`, `gelu`, `silu`, `LayerNorm`, `RMSNorm`,
+`embedding`, fused softmax + cross-entropy) inside the transformer
+subpackage transparently route through the C++ and CUDA kernels in
+`include/dnn/transformer/ops.hpp` (sources under `src/transformer/cpu_ops.cpp`
+and `src/cuda/transformer_ops.cu`). The kernels are exposed to Python as the
+`_dnn_core.transformer_ops` pybind submodule and selected by the dispatcher
+in `python/pydnn/transformer/_backend.py`.
+
+- The kernels **back the existing `DynamicTransformer`** — they do not
+  introduce a parallel implementation. The public `Tensor` / `Module` /
+  `parameters()` / `adapt()` / `compact()` API is unchanged. Grow/prune
+  logic stays in Python; only the inner numerics are accelerated.
+- The CPU path uses OpenMP across the row dimension where it helps
+  (norms, softmax, GELU/SiLU, embedding gather, batched matmul outer
+  loop). The CUDA path uses cuBLAS for batched matmul and custom kernels
+  with shared-memory reductions for the per-row ops; the `LayerNorm`
+  and `RMSNorm` backwards reduce per-row scratch into the parameter
+  gradients with a separate column-sum kernel.
+- The dispatcher is automatic. If `_dnn_core` was built and a CUDA
+  device is visible, the default backend is `cuda`; otherwise it is
+  `cpu`; if `_dnn_core` is unavailable it falls back to `numpy`. The
+  numpy path is preserved as the regression baseline.
+- Override the choice with the `PYDNN_TRANSFORMER_BACKEND` environment
+  variable (`numpy`, `cpu`, or `cuda`) or programmatically:
+
+  ```python
+  from pydnn.transformer import _backend as B
+  B.available_backends()    # ('numpy', 'cpu') or ('numpy', 'cpu', 'cuda')
+  B.current_backend()
+  B.set_backend("numpy")    # for parity testing or determinism
+  ```
+
+- Numerics match the NumPy reference within fp32 noise. Per-op parity
+  (max abs diff < 1e-4) and an end-to-end `DecoderOnlyModel` forward +
+  backward parity check live in
+  `python/tests/test_transformer_backend.py`. The same test exercises
+  a `DynamicTransformer` grow → soft-prune → `compact()` cycle on the
+  `cpu` backend, so the dynamic-NN integration stays under regression
+  coverage.
+
+When you build the Python extension, the transformer ops link into the
+same `_dnn_core` shared module as the rest of the bindings. The static
+`dnn_core` archive is compiled with `POSITION_INDEPENDENT_CODE` so the
+shared-module link succeeds with or without CUDA. No separate package
+or wheel is needed.
+
+#### When to use which backend
+
+- **`numpy`** — debugging numerical issues, comparing against a known
+  reference, reproducing legacy behaviour bit-for-bit.
+- **`cpu`** — default on a GPU-less machine. Faster than `numpy` for
+  any non-trivial model size; OpenMP parallelism scales with the row
+  count of the operation.
+- **`cuda`** — default when a GPU is present and the library was built
+  with `DNN_ENABLE_CUDA=ON`. Best when batch × sequence × hidden_dim is
+  large enough to overcome the host↔device copy overhead; the host-side
+  wrappers currently round-trip each tensor through `cudaMalloc` /
+  `cudaMemcpy`, which is fine for typical training sizes but is the
+  obvious target for a follow-up that keeps tensors resident on device
+  across ops.
 
 ---
 
