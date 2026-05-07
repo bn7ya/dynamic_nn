@@ -153,6 +153,18 @@ set(DNN_IO_SOURCES
     src/io/model_serializer.cpp
 )
 
+# Transformer ops (CPU). Powers pydnn.transformer's optional native
+# backend. Header at include/dnn/transformer/ops.hpp. The CUDA twin
+# lives in src/cuda/transformer_ops.cu (only built when CUDA is on);
+# src/transformer/cuda_stubs.cpp supplies the *_cuda symbols when CUDA
+# is off so transformer code can link unchanged in either config.
+set(DNN_TRANSFORMER_SOURCES
+    src/transformer/cpu_ops.cpp
+)
+if(NOT DNN_HAS_CUDA)
+    list(APPEND DNN_TRANSFORMER_SOURCES src/transformer/cuda_stubs.cpp)
+endif()
+
 # CUDA sources (only if CUDA is available)
 if(DNN_HAS_CUDA)
     set(DNN_CUDA_SOURCES
@@ -163,6 +175,7 @@ if(DNN_HAS_CUDA)
         src/cuda/cuda_reductions.cu
         src/cuda/cuda_memory_pool.cu
         src/cuda/cuda_optimizers.cu
+        src/cuda/transformer_ops.cu
     )
     set_source_files_properties(${DNN_CUDA_SOURCES} PROPERTIES LANGUAGE CUDA)
 endif()
@@ -177,6 +190,7 @@ if(DNN_HAS_CUDA)
         ${DNN_DYNAMICS_SOURCES}
         ${DNN_CQRS_SOURCES}
         ${DNN_IO_SOURCES}
+        ${DNN_TRANSFORMER_SOURCES}
         ${DNN_CUDA_SOURCES}
     )
 else()
@@ -188,6 +202,7 @@ else()
         ${DNN_DYNAMICS_SOURCES}
         ${DNN_CQRS_SOURCES}
         ${DNN_IO_SOURCES}
+        ${DNN_TRANSFORMER_SOURCES}
     )
 endif()
 
@@ -195,6 +210,13 @@ target_include_directories(dnn_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>
 )
+
+# dnn_core is a static archive that gets linked into the _dnn_core
+# Python shared module, so its translation units must be position-
+# independent. Without this, throw-statements in cuda_stubs.cpp emit
+# absolute relocations against std::runtime_error's typeinfo and the
+# shared-module link fails.
+set_target_properties(dnn_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # Add compile definitions for SIMD detection
 target_compile_definitions(dnn_core PRIVATE
@@ -237,7 +259,10 @@ if(DNN_BUILD_PYTHON)
         # Try to find pybind11
         find_package(pybind11 CONFIG QUIET)
         if(pybind11_FOUND)
-            pybind11_add_module(_dnn_core python/pydnn/_bindings.cpp)
+            pybind11_add_module(_dnn_core
+                python/pydnn/_bindings.cpp
+                python/pydnn/_bindings_transformer.cpp
+            )
             target_link_libraries(_dnn_core PRIVATE dnn_core)
 
             # Install Python module

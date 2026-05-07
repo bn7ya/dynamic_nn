@@ -136,6 +136,8 @@ how to engage it.
 | CPU/GPU device dispatch | [`include/dnn/core/`](include/dnn/core/CLAUDE.md) | `device="cpu"\|"cuda"` |
 | Python parallel cost-trend observer | [`python/pydnn/`](python/pydnn/CLAUDE.md) | `runtime_enabled=True` (Python fallback path) |
 | Dynamic data-driven thresholds (variance + complexity) | [`python/pydnn/`](python/pydnn/CLAUDE.md) | **On by default**; `DynamicNetwork(dynamic_thresholds=False)` to opt out |
+| Transformer / MoE / LLM building blocks | [`python/pydnn/transformer/`](python/pydnn/transformer/CLAUDE.md) | `from pydnn import transformer` (or `pydnn.DecoderOnlyModel`, `pydnn.Transformer`, `pydnn.MixtureOfExperts`, …) |
+| Dynamic (grow/prune) Transformer | [`python/pydnn/transformer/`](python/pydnn/transformer/CLAUDE.md) | `from pydnn import DynamicTransformer` |
 
 ## Build & smoke-test recipe
 

@@ -22,6 +22,10 @@
 namespace py = pybind11;
 using namespace dnn;
 
+// Defined in _bindings_transformer.cpp — registers the
+// `_dnn_core.transformer_ops` submodule.
+void register_transformer_ops(py::module_& m);
+
 // Helper to convert NumPy array to Tensor
 template<typename T>
 core::Tensor<T> numpy_to_tensor(py::array_t<T> arr) {
@@ -330,6 +334,9 @@ std::unique_ptr<core::Network<T>> load_model(const std::string& path) {
 
 PYBIND11_MODULE(_dnn_core, m) {
     m.doc() = "Dynamic Neural Network C++ Core";
+
+    // Transformer ops submodule (matmul, softmax, layernorm, gelu, ...)
+    register_transformer_ops(m);
 
     // Normalization method enum
     py::enum_<training::NormalizationMethod>(m, "NormalizationMethod")
