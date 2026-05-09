@@ -212,24 +212,21 @@ public:
                 "Adjacent layer sizes don't match");
         }
 
-        // Create new layer
+        // Create new layer (device_ matters: without it, the layer defaults
+        // to CPU and the network silently splits across devices on CUDA).
         auto new_layer = std::make_unique<Layer<T>>(
             prev_output, num_nodes, config_.hidden_activation,
-            rng_->seed() + layers_.size());
-
-        // Need to adjust the next layer's input size
-        // This is complex - we'd need to create a new layer with different input
-        // For now, just insert with matching size
+            rng_->seed() + layers_.size(), device_);
 
         layers_.insert(layers_.begin() + index, std::move(new_layer));
 
-        // Adjust the following layer
+        // Adjust the following layer — rebuild with new input_size_ and
+        // the same device_ as the rest of the network.
         auto& next_layer = layers_[index + 1];
-        // We need to rebuild this layer with new input size
         auto rebuilt = std::make_unique<Layer<T>>(
             num_nodes, next_layer->output_size(),
             next_layer->activation_type(),
-            rng_->seed() + index);
+            rng_->seed() + index, device_);
         layers_[index + 1] = std::move(rebuilt);
 
         update_state();
@@ -255,12 +252,14 @@ public:
         // Remove the layer
         layers_.erase(layers_.begin() + index);
 
-        // Rebuild the layer that was after the removed one
+        // Rebuild the layer that was after the removed one (preserve device_;
+        // see insert_layer for why a missing device_ silently splits the
+        // network across CPU/GPU on CUDA builds).
         auto& layer_after = layers_[index];
         auto rebuilt = std::make_unique<Layer<T>>(
             prev_output, next_output,
             layer_after->activation_type(),
-            rng_->seed() + index);
+            rng_->seed() + index, device_);
         layers_[index] = std::move(rebuilt);
 
         update_state();

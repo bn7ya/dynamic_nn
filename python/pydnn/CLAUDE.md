@@ -80,6 +80,17 @@ observer, and `ThreeModelGenerator` for spawning multiple variants.
   this on any new long-running binding so Python threads can
   observe progress.
 
+- **`set_cuda_memory_mode("device" | "managed")`** is a module-level
+  function in `__init__.py` that toggles the `CudaMemoryPool` between
+  `cudaMalloc` (default) and `cudaMallocManaged` (Unified Memory). The
+  managed mode pages cold tensors out of VRAM to host RAM
+  transparently; the OS page cache extends that to disk on RAM
+  pressure. Call it *before* constructing a CUDA network so the
+  network's GPU tensors are allocated in the chosen mode. Both
+  `set_cuda_memory_mode` and `get_cuda_memory_mode` no-op gracefully
+  when the loaded `_dnn_core.so` was built without CUDA, or is too
+  old to expose those bindings.
+
 ## Maintenance notes
 
 - `_CostTrendObserver` (`network.py:425-489`) is a daemon thread that

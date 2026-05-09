@@ -36,9 +36,35 @@ public:
     static constexpr size_t MAX_POOLED_SIZE = 256 * 1024 * 1024;  // 256MB
 
     /**
+     * How the pool obtains new device buffers from CUDA.
+     *
+     *  Device  — cudaMalloc. Pinned to VRAM. Hard OOM if VRAM is exhausted.
+     *  Managed — cudaMallocManaged (Unified Memory). The CUDA driver pages
+     *            cold pages out to host RAM when VRAM is under pressure.
+     *            The host page cache will, in turn, fall back to OS swap
+     *            (disk) if RAM is exhausted, giving a transparent
+     *            VRAM -> RAM -> disk fallback for models that don't fit.
+     *            Slower than Device when working-set exceeds VRAM.
+     *
+     * The mode applies to *future* pool allocations. Existing pooled
+     * blocks keep their original allocation type. To switch cleanly,
+     * set_alloc_mode() should be called before the first GPU tensor is
+     * created (or after a clear()).
+     */
+    enum class AllocMode { Device, Managed };
+
+    /**
      * Get singleton instance.
      */
     static CudaMemoryPool& instance();
+
+    /**
+     * Configure how new buffers are obtained from CUDA.
+     * Affects subsequent allocations only; pre-existing pooled blocks
+     * stay as they were.
+     */
+    void set_alloc_mode(AllocMode mode);
+    AllocMode alloc_mode() const;
 
     /**
      * Allocate GPU memory.
@@ -153,6 +179,11 @@ private:
     void* allocate_large(size_t size);
     void deallocate_large(void* ptr);
 
+    // Single source of truth for raw cuda{Malloc,MallocManaged}. Honours
+    // alloc_mode_. Returns the cudaError_t so callers can format the
+    // CUDA error string just like before.
+    cudaError_t device_alloc(void** ptr, size_t bytes);
+
     // Thread safety
     mutable std::mutex pool_mutex_;
     mutable std::mutex large_mutex_;
@@ -169,6 +200,10 @@ private:
     // Statistics
     std::atomic<size_t> total_allocated_{0};
     std::atomic<size_t> peak_allocated_{0};
+
+    // Allocation strategy. std::atomic so set_alloc_mode is safe to call
+    // from another thread; reads in the allocate hot path are relaxed.
+    std::atomic<AllocMode> alloc_mode_{AllocMode::Device};
 };
 
 /**

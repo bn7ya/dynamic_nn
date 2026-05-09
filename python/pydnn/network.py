@@ -605,6 +605,7 @@ class DynamicNetwork:
         self.runtime_enabled = runtime_enabled
         self.dynamic_thresholds = dynamic_thresholds
         self._last_data_signals = None
+        self._last_health_report = None
         # Validate device
         device = device.lower()
         if device not in ("cpu", "cuda", "gpu"):
@@ -953,6 +954,16 @@ class DynamicNetwork:
 
         # Train
         cpp_result = trainer.train(inputs, targets)
+
+        # Capture the trainer's health report before the trainer goes
+        # out of scope; health_status() reads it via self._last_health_report.
+        # The binding for health_report() lives on _dnn_core.Trainer (see
+        # _bindings.cpp), not on _dnn_core.Network, so stashing it here is
+        # the only way to surface it post-fit().
+        try:
+            self._last_health_report = trainer.health_report()
+        except AttributeError:
+            self._last_health_report = None
 
         # Hard-remove dormant (soft-pruned) capacity from the underlying
         # C++ network so the inference model is the lean compacted form.
@@ -2653,9 +2664,8 @@ class DynamicNetwork:
             elif excitement > 0.5:
                 emotional_state = "excited"
 
-        if self._use_cpp:
-            from . import _dnn_core
-            report = self._network.health_report()
+        if self._use_cpp and self._last_health_report is not None:
+            report = self._last_health_report
             return HealthReport(
                 state=str(report.state),
                 cancer_score=report.cancer_score,
