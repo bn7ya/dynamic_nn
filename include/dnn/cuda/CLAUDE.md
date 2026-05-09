@@ -36,6 +36,18 @@ The `.cu` files in `src/cuda/` implement the kernels:
   Don't `cudaMalloc` directly; the pool tracks size classes and
   prevents fragmentation. (`cuda_tensor.hpp:188-194`,
   `cuda_memory_pool.hpp`.)
+- **The pool has two allocation modes.**
+  `CudaMemoryPool::AllocMode::Device` (default) calls `cudaMalloc`
+  and pins memory to VRAM. `AllocMode::Managed` calls
+  `cudaMallocManaged` so the CUDA driver pages between VRAM and host
+  RAM transparently; if host RAM is also exhausted the OS pages out
+  to swap (disk). Switching is via `set_alloc_mode()` on the
+  singleton, or from Python via `pydnn.set_cuda_memory_mode("managed"
+  | "device")`. The mode applies to *future* allocations only —
+  existing pooled blocks keep their original allocation type. Set
+  the mode before constructing CUDA networks for it to apply
+  uniformly. (`cuda_memory_pool.hpp` `AllocMode`,
+  `cuda_memory_pool.cu` `device_alloc`.)
 - **`CudaMemoryPool` is a thread-safe singleton.** `pool_mutex_` and
   `large_mutex_` cover the free-lists and the large-allocation map.
   Concurrent stage workers are expected to share the pool. Don't

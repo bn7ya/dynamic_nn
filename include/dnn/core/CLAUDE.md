@@ -34,6 +34,27 @@ instantiations for `float` and `double`; behaviour lives in the headers.
   to run once at end-of-training. Code paths that bypass this are bugs.
   Reference: `layer.hpp` `add_nodes` / `remove_nodes` / `compact`,
   `network.hpp` `compact`.
+- **CUDA mirror invalidation runs on every host shape change.**
+  `Layer<T>::add_nodes` (in its allocate-new-rows branch) and
+  `Layer<T>::compact` reset `gpu_weights_` / `gpu_biases_` so
+  `forward_cuda` rebuilds the GPU buffers at the new size on the next
+  call. Without this, the rank-1 CUDA path's
+  `cuda_copy(*gpu_biases_, gpu_output)` mismatched sizes mid-training
+  (the original "dynamic_thresholds=True crashes on GPU" bug). Any
+  future code that mutates `weights_` / `biases_` shape on an
+  already-uploaded layer must follow the same pattern.
+- **CUDA forward honours the active mask.** `Layer<T>::forward_cuda`
+  zeros inactive-node columns of the pre-activation tensor (via
+  `zero_inactive_components`) and re-uploads the masked tensor to the
+  GPU before activation. This makes `remove_nodes` actually shrink the
+  network on CUDA — without the masking step the dense `gemv` / `gemm`
+  produces non-zero outputs for soft-removed neurons and the next
+  layer happily consumes them. CPU's per-node forward already gates on
+  `is_node_active(i)`; both paths now agree.
+- **`Network::insert_layer` / `remove_layer` propagate `device_`.**
+  Newly created and rebuilt layers inherit the network's device.
+  Earlier versions defaulted to `Device::CPU` here even when the
+  network was on CUDA, silently splitting compute across the boundary.
 - **Forward pass zeroes inactive outputs, backward zeroes their
   gradients.** `Layer<T>::forward_cpu`, `forward_cuda`, `backward_cpu`,
   `backward_cuda`, and `apply_gradients` all gate on

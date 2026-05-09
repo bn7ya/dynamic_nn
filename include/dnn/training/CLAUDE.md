@@ -53,6 +53,17 @@ sequential body and the helpers shared between both paths.
   (default 10). It used to be a hardcoded literal at the
   `EarlyStopping` constructor call site (`trainer.hpp:208`); it is
   now threaded through. Don't reintroduce the literal.
+- **`batched_train_forward` is a TrainerConfig field, default `true`.**
+  When true, `Trainer::train_epoch` issues one rank-2 forward and one
+  rank-2 backward per batch instead of the legacy B rank-1 calls.
+  The rank-2 path was already implemented in `Layer::forward` /
+  `backward` (CPU and CUDA). Numerical equivalence to the per-sample
+  loop holds modulo floating-point summation order. On CUDA the
+  difference is dramatic — one `cuda_gemm` per layer instead of B
+  `cuda_gemv`s collapses the per-sample CPU↔GPU round-trip cost.
+  Don't flip the default without flagging it in this file. The
+  legacy per-sample loop stays reachable via the same field for
+  benchmarking and regression bisection.
 - **`TrainingResult` field set is contractual.** Python's
   `_fit_cpp` reads specific attributes (`success`, `epochs_completed`,
   `final_cost`, `final_efficiency`, `best_cost`, `best_efficiency`,

@@ -69,10 +69,25 @@ try:
         save_model,
         load_model,
     )
+    # set_cuda_memory_mode / get_cuda_memory_mode were added alongside the
+    # CudaMemoryPool managed-memory mode (VRAM<->RAM<->disk paging). They
+    # are present on .so artefacts built after that change; if a caller has
+    # an older .so we degrade to no-ops so `pydnn.set_cuda_memory_mode(...)`
+    # doesn't break the import path.
+    try:
+        from ._dnn_core import (
+            set_cuda_memory_mode as _cpp_set_cuda_memory_mode,
+            get_cuda_memory_mode as _cpp_get_cuda_memory_mode,
+        )
+    except ImportError:
+        _cpp_set_cuda_memory_mode = None
+        _cpp_get_cuda_memory_mode = None
     _CPP_AVAILABLE = True
 except ImportError as e:
     _CPP_AVAILABLE = False
     _CPP_ERROR = str(e)
+    _cpp_set_cuda_memory_mode = None
+    _cpp_get_cuda_memory_mode = None
 
 
 def cuda_available() -> bool:
@@ -92,6 +107,52 @@ def cuda_available() -> bool:
     if not _CPP_AVAILABLE:
         return False
     return _cpp_cuda_available()
+
+
+def set_cuda_memory_mode(mode: str) -> None:
+    """
+    Configure how the CUDA memory pool obtains GPU buffers.
+
+    Args:
+        mode: Either ``"device"`` or ``"managed"``.
+
+            - ``"device"`` — ``cudaMalloc``. Pinned to VRAM. Hard OOM if
+              VRAM is exhausted. This is the default and matches the
+              behaviour of older builds.
+            - ``"managed"`` — ``cudaMallocManaged`` (Unified Memory).
+              The CUDA driver pages cold pages out to host RAM when VRAM
+              is under pressure, and the host page cache will fall back
+              to OS swap (disk) if RAM is exhausted. This gives a
+              transparent VRAM -> RAM -> disk fallback for models that
+              don't fit in VRAM, at the cost of slower memory access
+              when the working set exceeds VRAM.
+
+    The mode applies to *future* allocations only. Call this before
+    constructing a CUDA network so the network's GPU tensors are
+    allocated in the chosen mode.
+
+    No-op when CUDA isn't available (older .so build, or CPU-only build).
+
+    Example:
+        >>> import pydnn
+        >>> if pydnn.cuda_available():
+        ...     pydnn.set_cuda_memory_mode("managed")
+        ...     net = pydnn.DynamicNetwork(..., device="cuda")
+    """
+    if not _CPP_AVAILABLE or _cpp_set_cuda_memory_mode is None:
+        return
+    _cpp_set_cuda_memory_mode(mode)
+
+
+def get_cuda_memory_mode() -> str:
+    """Return the current CUDA memory pool allocation mode.
+
+    Returns ``"device"`` when CUDA is unavailable or the binding is too
+    old to expose this information.
+    """
+    if not _CPP_AVAILABLE or _cpp_get_cuda_memory_mode is None:
+        return "device"
+    return _cpp_get_cuda_memory_mode()
 
 # Pure Python components (always available)
 from .network import (
@@ -169,6 +230,8 @@ __all__ = [
     "HealthReport",
     # CUDA support
     "cuda_available",
+    "set_cuda_memory_mode",
+    "get_cuda_memory_mode",
     # Configuration classes for advanced ML engineers
     "TrainingPhaseConfig",
     "ArchitectureConfig",

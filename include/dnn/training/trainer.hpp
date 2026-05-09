@@ -185,6 +185,19 @@ struct TrainerConfig {
     // runs unchanged. This flag exists so the new path is opt-in until
     // it has stabilised.
     bool runtime_enabled = false;
+
+    // Batch the per-sample forward/backward inside train_epoch into a single
+    // rank-2 forward/backward. The rank-2 path is already implemented in
+    // Layer::forward/backward (CPU + CUDA), it just wasn't reached from the
+    // trainer. On CUDA this collapses B per-sample CPU<->GPU round-trips
+    // (one cuda_gemv per sample per layer) into a single cuda_gemm per layer
+    // per batch — typically the difference between GPU being slower than CPU
+    // and being meaningfully faster. On CPU it's numerically equivalent
+    // (modulo floating-point summation order).
+    //
+    // Default true. Set false to fall back to the legacy per-sample loop
+    // for benchmarking or to bisect a regression.
+    bool batched_train_forward = true;
 };
 
 /**
@@ -1184,22 +1197,70 @@ public:
             double batch_cost = 0.0;
             network_.zero_gradients();
 
-            for (size_t i = 0; i < batch_inputs.size(); ++i) {
-                // Forward pass
-                auto output = network_.forward(batch_inputs[i]);
+            const size_t B = batch_inputs.size();
+            if (config_.batched_train_forward && B > 0) {
+                // Batched path: one rank-2 forward + one rank-2 backward per
+                // batch instead of B rank-1 calls. The rank-2 path is wired
+                // in Layer::forward/backward for both CPU and CUDA.
+                //
+                // We deliberately call cost_function_->{compute,gradient}
+                // per row (rank-1) rather than once on the full rank-2
+                // tensor. Why: cost-function rank-2 gradients pre-divide by
+                // batch_size (see CrossEntropyCost::gradient at
+                // cost_functions.hpp:177-186), and the existing apply_gradients
+                // call below already divides the LR by B. Using rank-2 cost
+                // gradient would double-divide. Per-row cost is cheap (O(B *
+                // output_dim)) compared to the per-layer matmul work.
+                const size_t input_dim = batch_inputs[0].size();
+                const size_t target_dim = batch_targets[0].size();
 
-                // Compute cost
-                T sample_cost = cost_function_->compute(output, batch_targets[i]);
-                batch_cost += static_cast<double>(sample_cost);
+                Tensor<T> batch_input_2d(std::vector<size_t>{B, input_dim});
+                for (size_t b = 0; b < B; ++b) {
+                    for (size_t j = 0; j < input_dim; ++j) {
+                        batch_input_2d.at(b, j) = batch_inputs[b][j];
+                    }
+                }
 
-                // Compute gradient
-                auto grad = cost_function_->gradient(output, batch_targets[i]);
+                auto batch_output_2d = network_.forward(batch_input_2d);
+                if (batch_output_2d.rank() != 2) {
+                    throw exceptions::ShapeException("train_epoch",
+                        "batched forward did not return a rank-2 tensor");
+                }
+                const size_t output_dim = batch_output_2d.shape()[1];
 
-                // Backward pass
-                network_.backward(grad);
+                Tensor<T> batch_grad_2d(std::vector<size_t>{B, output_dim});
+                Tensor<T> output_row(std::vector<size_t>{output_dim});
+                Tensor<T> target_row(std::vector<size_t>{target_dim});
+                for (size_t b = 0; b < B; ++b) {
+                    for (size_t j = 0; j < output_dim; ++j) {
+                        output_row[j] = batch_output_2d.at(b, j);
+                    }
+                    for (size_t j = 0; j < target_dim; ++j) {
+                        target_row[j] = batch_targets[b][j];
+                    }
+                    T sample_cost = cost_function_->compute(output_row, target_row);
+                    batch_cost += static_cast<double>(sample_cost);
+                    auto grad_row = cost_function_->gradient(output_row, target_row);
+                    for (size_t j = 0; j < output_dim; ++j) {
+                        batch_grad_2d.at(b, j) = grad_row[j];
+                    }
+                }
+
+                network_.backward(batch_grad_2d);
+            } else {
+                // Legacy per-sample path. Kept reachable via
+                // config_.batched_train_forward = false for benchmarking
+                // and regression bisection.
+                for (size_t i = 0; i < B; ++i) {
+                    auto output = network_.forward(batch_inputs[i]);
+                    T sample_cost = cost_function_->compute(output, batch_targets[i]);
+                    batch_cost += static_cast<double>(sample_cost);
+                    auto grad = cost_function_->gradient(output, batch_targets[i]);
+                    network_.backward(grad);
+                }
             }
 
-            batch_cost /= batch_inputs.size();
+            batch_cost /= B;
             total_cost += batch_cost;
             num_batches++;
 

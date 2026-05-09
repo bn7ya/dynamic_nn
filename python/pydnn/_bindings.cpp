@@ -9,6 +9,7 @@
 #include <pybind11/functional.h>
 #include <pybind11/chrono.h>
 #include <cstring>
+#include <cctype>
 
 #include "dnn/core/tensor.hpp"
 #include "dnn/core/network.hpp"
@@ -18,6 +19,9 @@
 #include "dnn/training/cost_functions.hpp"
 #include "dnn/dynamics/health_monitor.hpp"
 #include "dnn/io/model_serializer.hpp"
+#ifdef DNN_ENABLE_CUDA
+#include "dnn/cuda/cuda_memory_pool.hpp"
+#endif
 
 namespace py = pybind11;
 using namespace dnn;
@@ -395,6 +399,42 @@ PYBIND11_MODULE(_dnn_core, m) {
 #endif
     }, "Check if CUDA is available");
 
+    // CudaMemoryPool allocation mode. "device" = cudaMalloc (default,
+    // VRAM-only, hard OOM). "managed" = cudaMallocManaged (Unified
+    // Memory; pages between VRAM, host RAM and OS swap as needed).
+    // No-op when the binding wasn't built with DNN_ENABLE_CUDA.
+    m.def("set_cuda_memory_mode", [](const std::string& mode) {
+#ifdef DNN_ENABLE_CUDA
+        std::string m_lower;
+        m_lower.reserve(mode.size());
+        for (char c : mode) m_lower.push_back(static_cast<char>(std::tolower(c)));
+        if (m_lower == "device") {
+            cuda::CudaMemoryPool::instance().set_alloc_mode(
+                cuda::CudaMemoryPool::AllocMode::Device);
+        } else if (m_lower == "managed") {
+            cuda::CudaMemoryPool::instance().set_alloc_mode(
+                cuda::CudaMemoryPool::AllocMode::Managed);
+        } else {
+            throw std::invalid_argument(
+                "set_cuda_memory_mode: expected 'device' or 'managed', got '"
+                + mode + "'");
+        }
+#else
+        (void)mode;
+#endif
+    }, "Configure CudaMemoryPool: 'device' (cudaMalloc, VRAM only) or "
+       "'managed' (cudaMallocManaged, transparent VRAM<->RAM<->disk paging). "
+       "Set this before constructing CUDA networks; affects future allocations only.");
+
+    m.def("get_cuda_memory_mode", []() -> std::string {
+#ifdef DNN_ENABLE_CUDA
+        auto mode = cuda::CudaMemoryPool::instance().alloc_mode();
+        return mode == cuda::CudaMemoryPool::AllocMode::Managed ? "managed" : "device";
+#else
+        return "device";
+#endif
+    }, "Return the current CudaMemoryPool allocation mode.");
+
     // Tensor class (float)
     py::class_<core::Tensor<float>>(m, "Tensor")
         .def(py::init<const std::vector<size_t>&>())
@@ -497,7 +537,15 @@ PYBIND11_MODULE(_dnn_core, m) {
         .def_readwrite("runtime_enabled", &training::TrainerConfig::runtime_enabled,
                        "When true, route train_phased() through the concurrent "
                        "StageController (parallel Estimation observer + soft "
-                       "topology + adaptive scalars). Default false.");
+                       "topology + adaptive scalars). Default false.")
+        .def_readwrite("batched_train_forward", &training::TrainerConfig::batched_train_forward,
+                       "When true, train_epoch issues one rank-2 forward and "
+                       "one rank-2 backward per batch instead of B rank-1 "
+                       "calls. On CUDA this collapses per-sample CPU<->GPU "
+                       "round-trips into one cuda_gemm per layer. Numerically "
+                       "equivalent on CPU modulo float summation order. "
+                       "Default true. Set false to fall back to the per-sample "
+                       "loop for benchmarking.");
 
     // Training result
     py::class_<training::TrainingResult>(m, "TrainingResult")

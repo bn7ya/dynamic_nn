@@ -272,8 +272,18 @@ private:
             cuda::cuda_add(gpu_output, gpu_bias_broadcast, gpu_output);
         }
 
-        // Copy result back to CPU for pre-activation cache
+        // Copy result back to CPU for pre-activation cache.
         Tensor<T> linear_output = gpu_output.to_host();
+
+        // Honor the active mask: zero out columns for soft-removed nodes so
+        // the activation and the next layer don't see stale outputs. The CPU
+        // forward already does this inside its per-node loop (see
+        // forward_cpu rank-1/rank-2). Without it, mid-training "remove node"
+        // had no effect on CUDA — the dense gemv/gemm path doesn't know
+        // about the mask. We re-upload the masked tensor so the on-GPU
+        // activation kernel reads the same values.
+        zero_inactive_components(linear_output);
+        gpu_output.to_device(linear_output);
         cached_pre_activation_ = linear_output.clone();
 
         // Apply activation on GPU
@@ -822,6 +832,16 @@ public:
         weight_gradients_ = Tensor<T>();
         bias_gradients_ = Tensor<T>();
 
+#ifdef DNN_ENABLE_CUDA
+        // weights_/biases_ shapes just changed (output_size_ grew). The GPU
+        // mirrors still reference the old sizes; if we left them in place
+        // the next forward_cuda() would call cuda_copy(*gpu_biases_,
+        // gpu_output) at a size mismatch. Drop them so forward_cuda()
+        // lazy-rebuilds at the new size.
+        gpu_weights_.reset();
+        gpu_biases_.reset();
+#endif
+
         ++topology_version_;
         return reactivated;
     }
@@ -974,24 +994,32 @@ public:
 
 private:
     /**
-     * Zero out grad_activation entries for inactive nodes.
-     * Used by both CPU and CUDA backward to ensure dormant nodes' params
-     * don't drift and no gradient flows upstream through them.
+     * Zero out the inactive-node columns of a tensor sized along output_size_.
+     * Used by:
+     *   - backward (gradients): so dormant nodes' params don't drift and no
+     *     gradient flows upstream through them.
+     *   - forward_cuda (pre-activation): so the dense gemv/gemm output gets
+     *     masked the same way forward_cpu's per-node loop does. Without this
+     *     mid-training "remove node" had no visible effect on CUDA.
      */
-    void zero_inactive_gradients(Tensor<T>& grad_activation) const {
+    void zero_inactive_components(Tensor<T>& tensor) const {
         if (active_mask_.empty()) return;
-        if (grad_activation.rank() == 1) {
+        if (tensor.rank() == 1) {
             for (size_t i = 0; i < output_size_; ++i) {
-                if (!is_node_active(i)) grad_activation[i] = T(0);
+                if (!is_node_active(i)) tensor[i] = T(0);
             }
-        } else if (grad_activation.rank() == 2) {
-            size_t batch_size = grad_activation.shape()[0];
+        } else if (tensor.rank() == 2) {
+            size_t batch_size = tensor.shape()[0];
             for (size_t b = 0; b < batch_size; ++b) {
                 for (size_t i = 0; i < output_size_; ++i) {
-                    if (!is_node_active(i)) grad_activation.at(b, i) = T(0);
+                    if (!is_node_active(i)) tensor.at(b, i) = T(0);
                 }
             }
         }
+    }
+    // Legacy alias kept so existing call sites compile unchanged.
+    void zero_inactive_gradients(Tensor<T>& grad_activation) const {
+        zero_inactive_components(grad_activation);
     }
 
     LayerType layer_type_;

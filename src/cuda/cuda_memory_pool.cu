@@ -71,6 +71,31 @@ size_t CudaMemoryPool::align_size(size_t size) {
 }
 
 // ============================================================================
+// Allocation Mode
+// ============================================================================
+
+void CudaMemoryPool::set_alloc_mode(AllocMode mode) {
+    alloc_mode_.store(mode, std::memory_order_release);
+}
+
+CudaMemoryPool::AllocMode CudaMemoryPool::alloc_mode() const {
+    return alloc_mode_.load(std::memory_order_acquire);
+}
+
+cudaError_t CudaMemoryPool::device_alloc(void** ptr, size_t bytes) {
+    AllocMode mode = alloc_mode_.load(std::memory_order_acquire);
+    if (mode == AllocMode::Managed) {
+        // cudaMallocManaged returns a pointer that's valid on both device
+        // and host; the CUDA driver pages between VRAM and host RAM as
+        // needed. cudaFree handles both kinds of allocations, so the rest
+        // of the pool's free path doesn't need to know which mode produced
+        // a given block.
+        return cudaMallocManaged(ptr, bytes, cudaMemAttachGlobal);
+    }
+    return cudaMalloc(ptr, bytes);
+}
+
+// ============================================================================
 // Allocation Methods
 // ============================================================================
 
@@ -111,9 +136,10 @@ void* CudaMemoryPool::allocate_from_pool(size_t size) {
         return ptr;
     }
 
-    // Allocate new block
+    // Allocate new block via the mode-aware helper (cudaMalloc or
+    // cudaMallocManaged depending on alloc_mode_).
     void* ptr = nullptr;
-    cudaError_t err = cudaMalloc(&ptr, block_size);
+    cudaError_t err = device_alloc(&ptr, block_size);
     if (err != cudaSuccess) {
         throw std::runtime_error("CUDA memory allocation failed: " +
                                  std::string(cudaGetErrorString(err)));
@@ -135,7 +161,7 @@ void* CudaMemoryPool::allocate_from_pool(size_t size) {
 
 void* CudaMemoryPool::allocate_large(size_t size) {
     void* ptr = nullptr;
-    cudaError_t err = cudaMalloc(&ptr, size);
+    cudaError_t err = device_alloc(&ptr, size);
     if (err != cudaSuccess) {
         throw std::runtime_error("CUDA memory allocation failed: " +
                                  std::string(cudaGetErrorString(err)));
@@ -241,7 +267,7 @@ void CudaMemoryPool::reserve(size_t bytes) {
 
         for (size_t j = 0; j < blocks_to_add; ++j) {
             void* block = nullptr;
-            cudaError_t err = cudaMalloc(&block, block_size);
+            cudaError_t err = device_alloc(&block, block_size);
             if (err == cudaSuccess) {
                 pools_[i].free_list.push_back(block);
                 pools_[i].blocks_allocated++;
