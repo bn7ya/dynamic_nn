@@ -83,26 +83,30 @@ void cuda_gemm<float>(const CudaTensor<float>& A, const CudaTensor<float>& B,
                       CudaTensor<float>& C,
                       float alpha, float beta,
                       bool transpose_A, bool transpose_B) {
-    // Get dimensions
-    // For row-major: A is (m x k), B is (k x n), C is (m x n)
+    // Row-major @ row-major using col-major cuBLAS via the standard trick:
+    //   C_rm = op_a(A_rm) @ op_b(B_rm)  ->  C_cm = op_b(B_rm)^T @ op_a(A_rm)^T
+    // Row-major bytes interpreted as col-major are the TRANSPOSE of the
+    // row-major matrix. So:
+    //   - To make cuBLAS see op_a(A_rm)^T from A_rm bytes:
+    //       transpose_A=false: want A_rm^T -> bytes already give A_rm^T -> op=N
+    //       transpose_A=true:  want A_rm   -> bytes give A_rm^T,  un-transpose -> op=T
+    //   - Same for the B operand with transpose_B.
+    // The cuBLAS A slot receives our B_rm pointer; the cuBLAS B slot
+    // receives our A_rm pointer (operand swap, see formula above).
     size_t m = transpose_A ? A.shape()[1] : A.shape()[0];
     size_t k = transpose_A ? A.shape()[0] : A.shape()[1];
     size_t n = transpose_B ? B.shape()[0] : B.shape()[1];
 
-    // Leading dimensions for row-major storage
-    int lda = static_cast<int>(A.shape()[1]);  // Columns of A
-    int ldb = static_cast<int>(B.shape()[1]);  // Columns of B
-    int ldc = static_cast<int>(C.shape()[1]);  // Columns of C
+    int lda = static_cast<int>(A.shape()[1]);  // row-major row stride of A
+    int ldb = static_cast<int>(B.shape()[1]);  // row-major row stride of B
+    int ldc = static_cast<int>(C.shape()[1]);  // row-major row stride of C
 
-    // For row-major, we need to swap the operation:
-    // C = A @ B becomes C^T = B^T @ A^T
-    // So we call cublas with swapped operands
-    cublasOperation_t op_A = transpose_A ? CUBLAS_OP_N : CUBLAS_OP_T;
-    cublasOperation_t op_B = transpose_B ? CUBLAS_OP_N : CUBLAS_OP_T;
+    cublasOperation_t op_for_A = transpose_A ? CUBLAS_OP_T : CUBLAS_OP_N;
+    cublasOperation_t op_for_B = transpose_B ? CUBLAS_OP_T : CUBLAS_OP_N;
 
     CUBLAS_CHECK(cublasSgemm(
         CublasContext::handle(),
-        op_B, op_A,
+        op_for_B, op_for_A,
         static_cast<int>(n), static_cast<int>(m), static_cast<int>(k),
         &alpha,
         static_cast<const float*>(B.device_data()), ldb,
@@ -128,12 +132,13 @@ void cuda_gemm<double>(const CudaTensor<double>& A, const CudaTensor<double>& B,
     int ldb = static_cast<int>(B.shape()[1]);
     int ldc = static_cast<int>(C.shape()[1]);
 
-    cublasOperation_t op_A = transpose_A ? CUBLAS_OP_N : CUBLAS_OP_T;
-    cublasOperation_t op_B = transpose_B ? CUBLAS_OP_N : CUBLAS_OP_T;
+    // See cuda_gemm<float> for the row-major-via-col-major derivation.
+    cublasOperation_t op_for_A = transpose_A ? CUBLAS_OP_T : CUBLAS_OP_N;
+    cublasOperation_t op_for_B = transpose_B ? CUBLAS_OP_T : CUBLAS_OP_N;
 
     CUBLAS_CHECK(cublasDgemm(
         CublasContext::handle(),
-        op_B, op_A,
+        op_for_B, op_for_A,
         static_cast<int>(n), static_cast<int>(m), static_cast<int>(k),
         &alpha,
         static_cast<const double*>(B.device_data()), ldb,

@@ -11,6 +11,10 @@
 #include <cstring>
 #include <cctype>
 
+#ifdef DNN_HAS_OPENMP
+#include <omp.h>
+#endif
+
 #include "dnn/core/tensor.hpp"
 #include "dnn/core/network.hpp"
 #include "dnn/core/activations.hpp"
@@ -434,6 +438,35 @@ PYBIND11_MODULE(_dnn_core, m) {
         return "device";
 #endif
     }, "Return the current CudaMemoryPool allocation mode.");
+
+    // OpenMP thread-count control. libgomp already honours OMP_NUM_THREADS at
+    // startup; these helpers let Python callers override it at runtime, e.g.
+    //   pydnn.set_num_threads(os.cpu_count())
+    // before fit() to ensure all cores are engaged. No-op when built without
+    // OpenMP.
+    m.def("set_num_threads", [](int n) {
+#ifdef DNN_HAS_OPENMP
+        if (n > 0) omp_set_num_threads(n);
+#else
+        (void)n;
+#endif
+    }, "Set the OpenMP thread count for CPU training. Pass a positive int.");
+
+    m.def("get_num_threads", []() -> int {
+#ifdef DNN_HAS_OPENMP
+        return omp_get_max_threads();
+#else
+        return 1;
+#endif
+    }, "Return the current OpenMP max thread count (1 when OpenMP is disabled).");
+
+    m.def("openmp_available", []() -> bool {
+#ifdef DNN_HAS_OPENMP
+        return true;
+#else
+        return false;
+#endif
+    }, "True iff the loaded _dnn_core was built with OpenMP.");
 
     // Tensor class (float)
     py::class_<core::Tensor<float>>(m, "Tensor")

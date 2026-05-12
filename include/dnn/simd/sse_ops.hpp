@@ -204,12 +204,16 @@ public:
     void matmul(const float* a, const float* b, float* c,
                size_t m, size_t k, size_t n,
                size_t lda, size_t ldb, size_t ldc) const override {
-        // Blocked matrix multiplication optimized for SSE
+        // Blocked matrix multiplication optimized for SSE. Outer i0 loop
+        // parallelisable (disjoint output rows).
         constexpr size_t BLOCK_M = 32;
         constexpr size_t BLOCK_N = 32;
         constexpr size_t BLOCK_K = 32;
 
-        // Zero output
+        // Zero output (rows disjoint - parallel safe).
+#ifdef DNN_HAS_OPENMP
+        #pragma omp parallel for schedule(static) if (m > 32)
+#endif
         for (size_t i = 0; i < m; ++i) {
             for (size_t j = 0; j < n; j += 4) {
                 if (j + 4 <= n) {
@@ -222,6 +226,9 @@ public:
             }
         }
 
+#ifdef DNN_HAS_OPENMP
+        #pragma omp parallel for schedule(static) if (m > 32)
+#endif
         for (size_t i0 = 0; i0 < m; i0 += BLOCK_M) {
             size_t i_end = std::min(i0 + BLOCK_M, m);
             for (size_t k0 = 0; k0 < k; k0 += BLOCK_K) {

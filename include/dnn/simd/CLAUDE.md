@@ -42,18 +42,27 @@ op via `Tensor`.
 
 ## Maintenance notes
 
-- The OpenMP-parallel loops live in `ScalarOps<T>::matmul`
-  (`simd_ops.hpp:133-180`). They use `if (m > 32)` guards to skip the
-  team-spawn cost on small matrices. AVX/SSE matmul implementations
-  do not currently parallelise — replicating the same guarded
-  `#pragma` there is a known follow-up.
-- `Layer::forward_cpu` and `Layer::backward_cpu` (in
-  [core](../core/CLAUDE.md)) **also** apply OpenMP to their batch
-  loops. That parallelism stacks: an OMP-parallel batch loop calling
-  an OMP-parallel matmul would oversubscribe. Right now the layer
-  loops use raw `Tensor` indexing rather than `SIMDOps::matmul`, so
-  there's no conflict — but if you migrate the layer to call
-  `ScalarOps::matmul`, drop one of the parallel-fors to avoid nesting.
+- **OpenMP is on every matmul.** `ScalarOps<T>::matmul`
+  (`simd_ops.hpp:133-180`), `AVXOps<float>::matmul`
+  (`avx_ops.hpp:206-275`) and `SSEOps<float>::matmul`
+  (`sse_ops.hpp:204-262`) all carry `#pragma omp parallel for
+  schedule(static) if (m > 32)` on both the zero-output loop and the
+  outer i0-block. Distinct i0 blocks write disjoint output rows, so
+  there's no race. The `if (m > 32)` guard skips the team-spawn cost
+  on small matrices.
+- **`Layer::forward_cpu` / `Layer::backward_cpu` (rank-2) now call
+  `SIMDOps::matmul` directly.** Layer-level batch-loop pragmas were
+  removed to avoid nesting OpenMP teams inside the matmul. The layer
+  is now the primary caller of `SIMDOps::matmul` from the trainer hot
+  path. Pre-existing layer-level OpenMP guards (`kOpenMpBatchThreshold
+  = 4`) are no longer wired in; see `include/dnn/core/CLAUDE.md`
+  maintenance notes.
+- **Thread count is controllable from Python.**
+  `python/pydnn/_bindings.cpp` exposes
+  `pydnn.set_num_threads(n)` / `pydnn.get_num_threads()` /
+  `pydnn.openmp_available()`, which route to `omp_set_num_threads` /
+  `omp_get_max_threads`. `OMP_NUM_THREADS` env var continues to work
+  via libgomp default.
 - `simd_detect.cpp` runs once at load time. Don't make it stateful
   per-thread.
 

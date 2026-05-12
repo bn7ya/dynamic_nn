@@ -7,6 +7,7 @@
 #include "random.hpp"
 #include "device.hpp"
 #include "../exceptions/dnn_exception.hpp"
+#include "../simd/simd_ops.hpp"
 #include <vector>
 #include <memory>
 #include <algorithm>
@@ -115,19 +116,18 @@ public:
 
 #ifdef DNN_ENABLE_CUDA
         if (device == Device::CUDA) {
-            // Move weights and biases to GPU
-            gpu_weights_ = std::make_unique<cuda::CudaTensor<T>>(weights_);
-            gpu_biases_ = std::make_unique<cuda::CudaTensor<T>>(biases_);
+            // Lazy: forward_cuda_dev rebuilds gpu_weights_ / gpu_biases_ on
+            // first use. We just drop any stale state here.
+            invalidate_gpu_mirrors_();
         } else {
             // Move back to CPU - weights/biases should already be updated
             if (gpu_weights_) {
                 weights_ = gpu_weights_->to_host();
-                gpu_weights_.reset();
             }
             if (gpu_biases_) {
                 biases_ = gpu_biases_->to_host();
-                gpu_biases_.reset();
             }
+            invalidate_gpu_mirrors_();
         }
 #else
         if (device == Device::CUDA) {
@@ -153,6 +153,252 @@ public:
         return forward_cpu(input);
     }
 
+#ifdef DNN_ENABLE_CUDA
+    /**
+     * Device-resident forward. Accepts a GPU tensor, returns a GPU tensor.
+     * Used by Network::forward when device_ == CUDA so the whole layer
+     * chain runs with only one host↔device transfer at the network
+     * boundary. Caches input/pre-activation/output on device for backward.
+     *
+     * Input is consumed (moved) into cached_input_gpu_. Caller must not
+     * reuse the passed tensor after this call.
+     */
+    cuda::CudaTensor<T> forward_cuda_dev(cuda::CudaTensor<T> gpu_input) {
+        // Lazy upload of weights/biases on first use or after invalidation.
+        if (!gpu_weights_) {
+            gpu_weights_ = std::make_unique<cuda::CudaTensor<T>>(weights_);
+        }
+        if (!gpu_biases_) {
+            gpu_biases_ = std::make_unique<cuda::CudaTensor<T>>(biases_);
+        }
+        ensure_gpu_active_mask_();
+
+        const size_t rank = gpu_input.ndim();
+        if (rank != 1 && rank != 2) {
+            throw exceptions::ShapeException("forward_cuda_dev",
+                "Input must be 1D or 2D");
+        }
+        const size_t batch_size = (rank == 2) ? gpu_input.shape()[0] : 1;
+        const size_t in_size = (rank == 2) ? gpu_input.shape()[1] : gpu_input.shape()[0];
+        // The CPU forward_cpu silently truncates when the upstream layer
+        // grew its output_size_ past this layer's input_size_ (architecture
+        // mutations don't update adjacent layers — see
+        // include/dnn/dynamics/CLAUDE.md, fan-in repair happens only at
+        // compact() time). Match that on GPU by slicing the input to the
+        // first input_size_ columns when in_size > input_size_. For
+        // in_size < input_size_ we error (same as CPU's OOB UB).
+        if (in_size < input_size_) {
+            throw exceptions::ShapeException("forward_cuda_dev",
+                "Input width " + std::to_string(in_size) +
+                " < layer input_size_ " + std::to_string(input_size_));
+        }
+        if (in_size > input_size_) {
+            cuda::CudaTensor<T> sliced(rank == 2
+                ? std::vector<size_t>{batch_size, input_size_}
+                : std::vector<size_t>{input_size_});
+            // strided device-to-device copy: take the first input_size_ floats
+            // of each "row" (or just the head for rank-1).
+            cudaMemcpy2D(sliced.device_data(),
+                         input_size_ * sizeof(T),       // dst pitch
+                         gpu_input.device_data(),
+                         in_size * sizeof(T),           // src pitch
+                         input_size_ * sizeof(T),       // bytes per row
+                         batch_size,                    // num rows
+                         cudaMemcpyDeviceToDevice);
+            gpu_input = std::move(sliced);
+        }
+
+        std::vector<size_t> output_shape = (rank == 2)
+            ? std::vector<size_t>{batch_size, output_size_}
+            : std::vector<size_t>{output_size_};
+
+        // Cache the input by taking ownership.
+        cached_input_gpu_ = std::make_unique<cuda::CudaTensor<T>>(std::move(gpu_input));
+
+        // Compute pre-activation: pre = X @ W^T + b   (or W @ x + b for rank-1)
+        cuda::CudaTensor<T> pre_act(output_shape);
+        if (rank == 1) {
+            // y = W @ x  (gemv with bias added via broadcast below)
+            cuda::cuda_gemv(*gpu_weights_, *cached_input_gpu_, pre_act,
+                            T(1), T(0), /*transpose=*/false);
+            // y += b
+            cuda::cuda_add(pre_act, *gpu_biases_, pre_act);
+        } else {
+            // Y = X @ W^T
+            cuda::cuda_gemm(*cached_input_gpu_, *gpu_weights_, pre_act,
+                            T(1), T(0),
+                            /*transpose_A=*/false, /*transpose_B=*/true);
+            // Y[b, o] += biases[o] — on-device broadcast, no host loop.
+            cuda::cuda_add_bias_broadcast(pre_act, *gpu_biases_);
+        }
+
+        // Apply active mask (zeroes inactive output columns). On-device,
+        // replaces the old D2H→zero→H2D triplet.
+        cuda::cuda_apply_mask_broadcast(pre_act, *gpu_active_mask_);
+
+        // Record per-node activation metrics from the first batch row.
+        // One D2H of output_size_ floats per layer per step, not the full
+        // batch tensor — see CLAUDE.md "Cheap per-node metric recording".
+        record_first_row_activation_gpu_(pre_act);
+
+        // Apply activation on device.
+        cuda::CudaTensor<T> activated(output_shape);
+        if (!apply_activation_gpu_(pre_act, activated)) {
+            // Activation has no GPU kernel (e.g. legacy fallthrough). D2H,
+            // apply on host, H2D. Slow path used only when missing kernel.
+            Tensor<T> pre_host = pre_act.to_host();
+            Tensor<T> act_host = activation_->forward(pre_host);
+            activated.to_device(act_host);
+        }
+
+        // Cache for backward.
+        cached_pre_activation_gpu_ = std::make_unique<cuda::CudaTensor<T>>(
+            std::move(pre_act));
+        // We need cached_output_gpu_ AND to return a separate tensor (since
+        // CudaTensor is move-only and the caller takes ownership). Allocate
+        // a copy via cuda_copy.
+        cached_output_gpu_ = std::make_unique<cuda::CudaTensor<T>>(output_shape);
+        cuda::cuda_copy(activated, *cached_output_gpu_);
+        return activated;
+    }
+
+    /**
+     * Device-resident backward. Accepts GPU grad_output, returns GPU
+     * grad_input. Uses the GPU-resident caches populated by
+     * forward_cuda_dev. Accumulates weight + bias gradients into the host
+     * weight_gradients_/bias_gradients_ via a single dW + db D2H per layer
+     * per step (much cheaper than the old per-layer round-trip storm).
+     */
+    cuda::CudaTensor<T> backward_cuda_dev(const cuda::CudaTensor<T>& gpu_grad_output) {
+        if (!cached_input_gpu_ || !cached_pre_activation_gpu_ || !cached_output_gpu_) {
+            throw std::runtime_error(
+                "backward_cuda_dev: forward_cuda_dev was not called first");
+        }
+        ensure_gpu_active_mask_();
+
+        const size_t rank = cached_input_gpu_->ndim();
+        const size_t batch_size = (rank == 2) ? cached_input_gpu_->shape()[0] : 1;
+
+        // Match grad_output shape to our cached pre_activation. After
+        // architecture mutations grew this layer's output_size_, the next
+        // layer may return a narrower grad_input than our output_size_;
+        // pad with zeros so the activation backward kernel sees matching
+        // shapes. (Mirrors how the forward path slices oversized inputs.)
+        const size_t grad_in_size = (rank == 2)
+            ? gpu_grad_output.shape()[1] : gpu_grad_output.shape()[0];
+        std::vector<size_t> full_shape = (rank == 2)
+            ? std::vector<size_t>{batch_size, output_size_}
+            : std::vector<size_t>{output_size_};
+        cuda::CudaTensor<T> grad_out_padded(full_shape);
+        if (grad_in_size == output_size_) {
+            cuda::cuda_copy(gpu_grad_output, grad_out_padded);
+        } else if (grad_in_size < output_size_) {
+            // zero-fill, then copy the available cols.
+            cuda::cuda_fill(grad_out_padded, T(0));
+            cudaMemcpy2D(grad_out_padded.device_data(),
+                         output_size_ * sizeof(T),
+                         gpu_grad_output.device_data(),
+                         grad_in_size * sizeof(T),
+                         grad_in_size * sizeof(T),
+                         batch_size,
+                         cudaMemcpyDeviceToDevice);
+        } else {
+            // grad wider than our output (shouldn't happen, but slice
+            // defensively to first output_size_ cols).
+            cudaMemcpy2D(grad_out_padded.device_data(),
+                         output_size_ * sizeof(T),
+                         gpu_grad_output.device_data(),
+                         grad_in_size * sizeof(T),
+                         output_size_ * sizeof(T),
+                         batch_size,
+                         cudaMemcpyDeviceToDevice);
+        }
+
+        // grad_activation = d/dz of activation, applied to grad_output.
+        cuda::CudaTensor<T> grad_activation(full_shape);
+        if (!apply_activation_backward_gpu_(*cached_pre_activation_gpu_,
+                                            *cached_output_gpu_,
+                                            grad_out_padded, grad_activation)) {
+            // Slow path: D2H, run host activation backward, H2D.
+            Tensor<T> pre_host = cached_pre_activation_gpu_->to_host();
+            Tensor<T> out_host = cached_output_gpu_->to_host();
+            Tensor<T> grad_out_host = grad_out_padded.to_host();
+            Tensor<T> grad_act_host = activation_->backward(
+                pre_host, out_host, grad_out_host);
+            grad_activation.to_device(grad_act_host);
+        }
+
+        // Zero gradients for inactive nodes (mask multiply, on-device).
+        cuda::cuda_apply_mask_broadcast(grad_activation, *gpu_active_mask_);
+
+        // Record gradient metrics from first batch row (one tiny D2H).
+        record_first_row_gradient_gpu_(grad_activation);
+
+        if (rank == 1) {
+            // Single-sample path (init pass only — not the trainer hot path).
+            // Outer product + bias accumulation done on host after one D2H.
+            Tensor<T> grad_act_host = grad_activation.to_host();
+            Tensor<T> input_host = cached_input_gpu_->to_host();
+            for (size_t i = 0; i < output_size_; ++i) {
+                if (!is_node_active(i)) continue;
+                if (nodes_[i].is_trainable()) {
+                    for (size_t j = 0; j < input_size_; ++j) {
+                        weight_gradients_.at(i, j) +=
+                            grad_act_host[i] * input_host[j];
+                    }
+                    bias_gradients_[i] += grad_act_host[i];
+                }
+            }
+            // grad_input = W^T @ grad_activation
+            cuda::CudaTensor<T> grad_input(std::vector<size_t>{input_size_});
+            cuda::cuda_gemv(*gpu_weights_, grad_activation, grad_input,
+                            T(1), T(0), /*transpose=*/true);
+            return grad_input;
+        }
+
+        // Batched (rank-2) hot path. Everything stays on device — no D2H.
+        // dW = grad_activation^T @ cached_input  -> (O, I)
+        cuda::CudaTensor<T> dW(std::vector<size_t>{output_size_, input_size_});
+        cuda::cuda_gemm(grad_activation, *cached_input_gpu_, dW,
+                        T(1), T(0),
+                        /*transpose_A=*/true, /*transpose_B=*/false);
+
+        // db = sum(grad_activation, axis=0) -> (O,)
+        cuda::CudaTensor<T> db(std::vector<size_t>{output_size_});
+        cuda::cuda_sum_axis(grad_activation, db, /*axis=*/0);
+
+        // Apply the active+trainable mask on device, then accumulate into the
+        // GPU-resident gradient buffers. Zeros rows of dW (and elements of db)
+        // for nodes that are inactive (soft-removed) or not trainable, so the
+        // subsequent on-device SGD step naturally leaves their weights alone.
+        ensure_gpu_update_mask_();
+        cuda::cuda_apply_mask_rows_broadcast(dW, *gpu_update_mask_);
+        // db (O,) and mask (O,): apply_mask_broadcast treats this as
+        // B=1, O=output_size_ — element-wise multiply, exactly what we want.
+        cuda::cuda_apply_mask_broadcast(db, *gpu_update_mask_);
+
+        if (!gpu_weight_gradients_) {
+            gpu_weight_gradients_ = std::make_unique<cuda::CudaTensor<T>>(
+                std::vector<size_t>{output_size_, input_size_});
+            cuda::cuda_fill(*gpu_weight_gradients_, T(0));
+        }
+        if (!gpu_bias_gradients_) {
+            gpu_bias_gradients_ = std::make_unique<cuda::CudaTensor<T>>(
+                std::vector<size_t>{output_size_});
+            cuda::cuda_fill(*gpu_bias_gradients_, T(0));
+        }
+        cuda::cuda_add(*gpu_weight_gradients_, dW, *gpu_weight_gradients_);
+        cuda::cuda_add(*gpu_bias_gradients_, db, *gpu_bias_gradients_);
+
+        // grad_input = grad_activation @ W   -> (B, I)
+        cuda::CudaTensor<T> grad_input(std::vector<size_t>{batch_size, input_size_});
+        cuda::cuda_gemm(grad_activation, *gpu_weights_, grad_input,
+                        T(1), T(0),
+                        /*transpose_A=*/false, /*transpose_B=*/false);
+        return grad_input;
+    }
+#endif
+
 private:
     /**
      * CPU forward pass implementation.
@@ -165,7 +411,9 @@ private:
         Tensor<T> linear_output;
 
         if (input.rank() == 1) {
-            // Single sample: input is (input_size,)
+            // Single-sample path. Stays scalar — gemv is rarely the hot
+            // path (the trainer's batched_train_forward routes through
+            // rank-2). Keeps per-node activation recording inline.
             linear_output = Tensor<T>(std::vector<size_t>{output_size_});
             for (size_t i = 0; i < output_size_; ++i) {
                 if (!is_node_active(i)) {
@@ -177,32 +425,61 @@ private:
                     sum += input[j] * weights_.at(i, j);
                 }
                 linear_output[i] = sum;
-
-                // Record for node metrics
                 nodes_[i].record_activation(static_cast<float>(sum));
             }
         } else if (input.rank() == 2) {
-            // Batch: input is (batch_size, input_size). Each (b, i) cell
-            // is independent so we parallelise the outer batch loop.
+            // Batched path. Route through SIMDOps::matmul (blocked, AVX/SSE
+            // vectorised, OpenMP-parallel on the outer row block). The
+            // matmul needs row-major operands, so we build a transposed
+            // weights tensor (input_size, output_size) on the stack each
+            // forward. Cost is O(O*I); the matmul is O(B*O*I) so this is
+            // amortised. Local (not cached) to avoid mutable-state races
+            // under the concurrent runtime path.
             size_t batch_size = input.shape()[0];
             linear_output = Tensor<T>(std::vector<size_t>{batch_size, output_size_});
 
-#ifdef DNN_HAS_OPENMP
-            #pragma omp parallel for schedule(static) if (batch_size > kOpenMpBatchThreshold)
-#endif
-            for (size_t b = 0; b < batch_size; ++b) {
-                for (size_t i = 0; i < output_size_; ++i) {
-                    if (!is_node_active(i)) {
-                        linear_output.at(b, i) = T(0);
-                        continue;
-                    }
-                    T sum = biases_[i];
-                    for (size_t j = 0; j < input_size_; ++j) {
-                        sum += input.at(b, j) * weights_.at(i, j);
-                    }
-                    linear_output.at(b, i) = sum;
+            Tensor<T> weights_t(std::vector<size_t>{input_size_, output_size_});
+            for (size_t i = 0; i < output_size_; ++i) {
+                for (size_t j = 0; j < input_size_; ++j) {
+                    weights_t.at(j, i) = weights_.at(i, j);
                 }
             }
+
+            // Y(B, O) = X(B, I) @ W_t(I, O)
+            get_simd_ops_()->matmul(
+                input.data(),
+                weights_t.data(),
+                linear_output.data(),
+                /*m=*/batch_size,
+                /*k=*/input_size_,
+                /*n=*/output_size_,
+                /*lda=*/input_size_,
+                /*ldb=*/output_size_,
+                /*ldc=*/output_size_);
+
+            // Add bias broadcast: Y[b, o] += biases[o].
+            for (size_t b = 0; b < batch_size; ++b) {
+                T* row = linear_output.data() + b * output_size_;
+                const T* bias = biases_.data();
+                for (size_t i = 0; i < output_size_; ++i) row[i] += bias[i];
+            }
+
+            // Post-zero inactive output columns (soft-topology contract).
+            // The matmul above is dense; columns for inactive neurons must
+            // be cleared so downstream layers and the active-mask
+            // accounting see zero. Cost is O(B * inactive_count); active
+            // nodes pay nothing.
+            for (size_t i = 0; i < output_size_; ++i) {
+                if (is_node_active(i)) continue;
+                for (size_t b = 0; b < batch_size; ++b) {
+                    linear_output.at(b, i) = T(0);
+                }
+            }
+
+            // NOTE: per-node activation recording (nodes_[i].record_activation)
+            // is intentionally omitted in the rank-2 batched path to match the
+            // legacy CPU rank-2 baseline. Per-sample metrics come from the
+            // trainer's init forward pass (rank-1) at trainer.hpp:418.
         } else {
             throw exceptions::ShapeException("forward", "Input must be 1D or 2D");
         }
@@ -217,107 +494,102 @@ private:
 
 #ifdef DNN_ENABLE_CUDA
     /**
-     * CUDA forward pass implementation.
+     * CUDA forward pass entrypoint for legacy Tensor-in/Tensor-out callers.
+     * The hot path goes through Network::forward → forward_cuda_dev
+     * directly; this wrapper only fires when something calls
+     * Layer::forward(Tensor) on a CUDA layer in isolation (tests, ad-hoc
+     * inference). Does one H2D up front and one D2H at the end.
      */
     Tensor<T> forward_cuda(const Tensor<T>& input) {
-        // Move input to GPU
         cuda::CudaTensor<T> gpu_input(input);
+        cuda::CudaTensor<T> gpu_output = forward_cuda_dev(std::move(gpu_input));
+        return gpu_output.to_host();
+    }
 
-        // Cache input for backward pass (keep on CPU for now)
-        cached_input_ = input.clone();
-
-        size_t batch_size = (input.rank() == 2) ? input.shape()[0] : 1;
-
-        // Prepare output tensor on GPU
-        // For batch: output is (batch_size, output_size)
-        // Linear: Y = X @ W^T + B
-        std::vector<size_t> output_shape = (input.rank() == 2)
-            ? std::vector<size_t>{batch_size, output_size_}
-            : std::vector<size_t>{output_size_};
-
-        cuda::CudaTensor<T> gpu_output(output_shape);
-
-        // Ensure weights are on GPU
-        if (!gpu_weights_) {
-            gpu_weights_ = std::make_unique<cuda::CudaTensor<T>>(weights_);
+    /**
+     * Apply the layer's activation on device. Returns false when there is
+     * no GPU kernel for activation_type_ — caller falls back to host.
+     */
+    bool apply_activation_gpu_(const cuda::CudaTensor<T>& x,
+                                cuda::CudaTensor<T>& y) {
+        switch (activation_type_) {
+            case ActivationType::ReLU:    cuda::cuda_relu(x, y);    return true;
+            case ActivationType::Sigmoid: cuda::cuda_sigmoid(x, y); return true;
+            case ActivationType::Tanh:    cuda::cuda_tanh(x, y);    return true;
+            case ActivationType::Softmax: cuda::cuda_softmax(x, y); return true;
+            default: return false;
         }
-        if (!gpu_biases_) {
-            gpu_biases_ = std::make_unique<cuda::CudaTensor<T>>(biases_);
-        }
+    }
 
-        if (input.rank() == 1) {
-            // Single sample: y = W @ x + b
-            // Using gemv: y = alpha * A @ x + beta * y
-            // First copy biases to output
-            cuda::cuda_copy(*gpu_biases_, gpu_output);
-            // Then: output = 1.0 * weights @ input + 1.0 * output (biases)
-            cuda::cuda_gemv(*gpu_weights_, gpu_input, gpu_output, T(1), T(1), false);
-        } else {
-            // Batch: Y = X @ W^T + B (broadcast biases)
-            // Using gemm: C = alpha * A @ B + beta * C
-            // output = input @ weights^T, then add biases
-
-            // First: output = input @ weights^T
-            cuda::cuda_gemm(gpu_input, *gpu_weights_, gpu_output, T(1), T(0), false, true);
-
-            // Add biases to each row (broadcast)
-            // Create a temporary for bias broadcast
-            Tensor<T> bias_broadcast(output_shape);
-            for (size_t b = 0; b < batch_size; ++b) {
-                for (size_t i = 0; i < output_size_; ++i) {
-                    bias_broadcast.at(b, i) = biases_[i];
-                }
-            }
-            cuda::CudaTensor<T> gpu_bias_broadcast(bias_broadcast);
-            cuda::cuda_add(gpu_output, gpu_bias_broadcast, gpu_output);
-        }
-
-        // Copy result back to CPU for pre-activation cache.
-        Tensor<T> linear_output = gpu_output.to_host();
-
-        // Honor the active mask: zero out columns for soft-removed nodes so
-        // the activation and the next layer don't see stale outputs. The CPU
-        // forward already does this inside its per-node loop (see
-        // forward_cpu rank-1/rank-2). Without it, mid-training "remove node"
-        // had no effect on CUDA — the dense gemv/gemm path doesn't know
-        // about the mask. We re-upload the masked tensor so the on-GPU
-        // activation kernel reads the same values.
-        zero_inactive_components(linear_output);
-        gpu_output.to_device(linear_output);
-        cached_pre_activation_ = linear_output.clone();
-
-        // Apply activation on GPU
-        cuda::CudaTensor<T> gpu_activated(output_shape);
-
+    /**
+     * Apply the layer's activation backward on device. Returns false when
+     * no GPU kernel exists (notably Softmax — no cuda_softmax_backward).
+     */
+    bool apply_activation_backward_gpu_(const cuda::CudaTensor<T>& pre_act,
+                                         const cuda::CudaTensor<T>& post_act,
+                                         const cuda::CudaTensor<T>& grad_out,
+                                         cuda::CudaTensor<T>& grad_in) {
         switch (activation_type_) {
             case ActivationType::ReLU:
-                cuda::cuda_relu(gpu_output, gpu_activated);
-                break;
+                cuda::cuda_relu_backward(pre_act, grad_out, grad_in);
+                return true;
             case ActivationType::Sigmoid:
-                cuda::cuda_sigmoid(gpu_output, gpu_activated);
-                break;
+                cuda::cuda_sigmoid_backward(post_act, grad_out, grad_in);
+                return true;
             case ActivationType::Tanh:
-                cuda::cuda_tanh(gpu_output, gpu_activated);
-                break;
-            case ActivationType::Softmax:
-                cuda::cuda_softmax(gpu_output, gpu_activated);
-                break;
+                cuda::cuda_tanh_backward(post_act, grad_out, grad_in);
+                return true;
             default:
-                // Fall back to CPU activation
-                cached_output_ = activation_->forward(linear_output);
-                return cached_output_.clone();
+                return false;
         }
+    }
 
-        // Copy activated output back to CPU
-        cached_output_ = gpu_activated.to_host();
-
-        // Record node activations for metrics (sample from first batch item)
-        for (size_t i = 0; i < output_size_ && i < cached_pre_activation_.size(); ++i) {
-            nodes_[i].record_activation(static_cast<float>(
-                input.rank() == 1 ? cached_pre_activation_[i] : cached_pre_activation_.at(0, i)));
+    /**
+     * D2H one row of (B, O) pre-activation (or all of rank-1) for cheap
+     * per-node activation metric recording. Costs output_size_ floats per
+     * layer per forward — negligible vs. a full activation D2H.
+     */
+    void record_first_row_activation_gpu_(const cuda::CudaTensor<T>& pre_act) {
+        const size_t rank = pre_act.ndim();
+        const size_t row_size = (rank == 2) ? pre_act.shape()[1] : pre_act.size();
+        if (row_size != output_size_) return;
+        // The cheapest portable path: D2H the whole tensor then read its
+        // first row. For rank-1 this IS the whole tensor; for rank-2 the
+        // tensor is at most (B, O) — typically small enough that the D2H
+        // cost is bounded by the same kernel-launch granularity. A future
+        // CudaTensor::copy_row_to_host(0, dst, n) helper can reduce this
+        // further; not required for correctness.
+        Tensor<T> host_row(std::vector<size_t>{row_size});
+        if (rank == 1) {
+            Tensor<T> full = pre_act.to_host();
+            for (size_t i = 0; i < row_size; ++i) host_row[i] = full[i];
+        } else {
+            Tensor<T> full = pre_act.to_host();
+            for (size_t i = 0; i < row_size; ++i) host_row[i] = full.at(0, i);
         }
+        for (size_t i = 0; i < output_size_; ++i) {
+            nodes_[i].record_activation(static_cast<float>(host_row[i]));
+        }
+    }
 
-        return cached_output_.clone();
+    /**
+     * Same idea for the gradient backward pass.
+     */
+    void record_first_row_gradient_gpu_(const cuda::CudaTensor<T>& grad_act) {
+        const size_t rank = grad_act.ndim();
+        const size_t row_size = (rank == 2) ? grad_act.shape()[1] : grad_act.size();
+        if (row_size != output_size_) return;
+        Tensor<T> host_row(std::vector<size_t>{row_size});
+        if (rank == 1) {
+            Tensor<T> full = grad_act.to_host();
+            for (size_t i = 0; i < row_size; ++i) host_row[i] = full[i];
+        } else {
+            Tensor<T> full = grad_act.to_host();
+            for (size_t i = 0; i < row_size; ++i) host_row[i] = full.at(0, i);
+        }
+        for (size_t i = 0; i < output_size_; ++i) {
+            nodes_[i].record_gradient(static_cast<float>(host_row[i]));
+        }
     }
 #endif
 
@@ -380,40 +652,71 @@ private:
             return grad_input;
 
         } else if (cached_input_.rank() == 2) {
-            // Batch
+            // Batched path. Both matmuls go through SIMDOps::matmul so we
+            // get SIMD vectorisation + OpenMP-parallel-on-output-row from
+            // a single call. weight-grad accumulation no longer runs
+            // serially over the batch — the matmul itself parallelises.
             size_t batch_size = cached_input_.shape()[0];
+            simd::SIMDOps<T>* ops = get_simd_ops_();
 
+            // 1. Weight gradient:
+            //    dW (O, I) += grad_activation^T (O, B) @ cached_input (B, I)
+            //    Materialize grad_activation^T into a small scratch
+            //    (O × B floats; cheap for typical batch sizes).
+            Tensor<T> grad_act_t(std::vector<size_t>{output_size_, batch_size});
             for (size_t b = 0; b < batch_size; ++b) {
                 for (size_t i = 0; i < output_size_; ++i) {
-                    if (!is_node_active(i)) continue;
-                    if (nodes_[i].is_trainable()) {
-                        for (size_t j = 0; j < input_size_; ++j) {
-                            weight_gradients_.at(i, j) +=
-                                grad_activation.at(b, i) * cached_input_.at(b, j);
-                        }
-                        bias_gradients_[i] += grad_activation.at(b, i);
+                    grad_act_t.at(i, b) = grad_activation.at(b, i);
+                }
+            }
+            Tensor<T> dW_scratch(std::vector<size_t>{output_size_, input_size_}, T(0));
+            ops->matmul(
+                grad_act_t.data(),
+                cached_input_.data(),
+                dW_scratch.data(),
+                /*m=*/output_size_,
+                /*k=*/batch_size,
+                /*n=*/input_size_,
+                /*lda=*/batch_size,
+                /*ldb=*/input_size_,
+                /*ldc=*/input_size_);
+
+            // Accumulate into weight_gradients_ filtered by active +
+            // trainable. Bias gradient = sum along batch dim.
+            for (size_t i = 0; i < output_size_; ++i) {
+                if (!is_node_active(i)) continue;
+                if (nodes_[i].is_trainable()) {
+                    for (size_t j = 0; j < input_size_; ++j) {
+                        weight_gradients_.at(i, j) += dW_scratch.at(i, j);
                     }
+                    T bias_sum = T(0);
+                    for (size_t b = 0; b < batch_size; ++b) {
+                        bias_sum += grad_activation.at(b, i);
+                    }
+                    bias_gradients_[i] += bias_sum;
                 }
             }
 
-            // Compute input gradient. Each (b, j) cell is independent
-            // (no cross-write), so the outer batch loop parallelises
-            // safely. Weight-gradient accumulation above stays serial
-            // over batch because rows of weight_gradients_ are written
-            // by every b.
+            // NOTE: per-node gradient recording omitted in rank-2 path —
+            // legacy baseline also omitted it. Trainer init pass (rank-1)
+            // populates node gradient metrics.
+
+            // 2. Input gradient:
+            //    grad_input (B, I) = grad_activation (B, O) @ weights (O, I)
+            //    Note weights_ is laid out (output_size, input_size) row-
+            //    major, so it's the operand exactly — no transpose needed.
             Tensor<T> grad_input(std::vector<size_t>{batch_size, input_size_});
-#ifdef DNN_HAS_OPENMP
-            #pragma omp parallel for schedule(static) if (batch_size > kOpenMpBatchThreshold)
-#endif
-            for (size_t b = 0; b < batch_size; ++b) {
-                for (size_t j = 0; j < input_size_; ++j) {
-                    T sum = T(0);
-                    for (size_t i = 0; i < output_size_; ++i) {
-                        sum += weights_.at(i, j) * grad_activation.at(b, i);
-                    }
-                    grad_input.at(b, j) = sum;
-                }
-            }
+            ops->matmul(
+                grad_activation.data(),
+                weights_.data(),
+                grad_input.data(),
+                /*m=*/batch_size,
+                /*k=*/output_size_,
+                /*n=*/input_size_,
+                /*lda=*/output_size_,
+                /*ldb=*/input_size_,
+                /*ldc=*/input_size_);
+
             return grad_input;
         }
 
@@ -422,96 +725,17 @@ private:
 
 #ifdef DNN_ENABLE_CUDA
     /**
-     * CUDA backward pass implementation.
+     * CUDA backward entrypoint for Tensor-in/Tensor-out callers. The hot
+     * path is Network::backward → backward_cuda_dev directly. This wrapper
+     * runs one H2D + one D2H for ad-hoc Tensor-only callers.
+     *
+     * Requires forward_cuda (or forward_cuda_dev) to have been called
+     * first so the GPU-resident caches are populated.
      */
     Tensor<T> backward_cuda(const Tensor<T>& grad_output) {
-        // Compute activation gradient on CPU (for now, since we cached on CPU)
-        Tensor<T> grad_activation = activation_->backward(
-            cached_pre_activation_, cached_output_, grad_output);
-
-        // Zero gradients for inactive (dormant) nodes so their parameters
-        // don't drift and no gradient flows upstream through them.
-        zero_inactive_gradients(grad_activation);
-
-        // Move grad_activation to GPU
-        cuda::CudaTensor<T> gpu_grad_activation(grad_activation);
-
-        // Move cached input to GPU
-        cuda::CudaTensor<T> gpu_cached_input(cached_input_);
-
-        size_t batch_size = (cached_input_.rank() == 2) ? cached_input_.shape()[0] : 1;
-
-        // Compute weight gradients: dW = grad_activation^T @ cached_input
-        // For batch: dW = sum over batch of (grad[b] outer input[b])
-        // Using gemm: dW += grad_activation^T @ cached_input
-
-        // Compute input gradient: grad_input = grad_activation @ weights
-        // Using gemm: grad_input = grad_activation @ weights
-
-        if (cached_input_.rank() == 1) {
-            // Single sample
-            // Weight gradient: dW[i,j] = grad_activation[i] * cached_input[j]
-            // This is an outer product
-
-            // For now, compute on CPU and accumulate
-            for (size_t i = 0; i < output_size_; ++i) {
-                if (!is_node_active(i)) continue;
-                if (nodes_[i].is_trainable()) {
-                    for (size_t j = 0; j < input_size_; ++j) {
-                        weight_gradients_.at(i, j) += grad_activation[i] * cached_input_[j];
-                    }
-                    bias_gradients_[i] += grad_activation[i];
-                }
-                nodes_[i].record_gradient(static_cast<float>(grad_activation[i]));
-            }
-
-            // Compute input gradient on GPU: grad_input = weights^T @ grad_activation
-            cuda::CudaTensor<T> gpu_grad_input(std::vector<size_t>{input_size_});
-            cuda::cuda_gemv(*gpu_weights_, gpu_grad_activation, gpu_grad_input, T(1), T(0), true);
-
-            return gpu_grad_input.to_host();
-
-        } else {
-            // Batch mode
-            // Weight gradient: dW = grad_activation^T @ cached_input
-            // Shape: (output_size, batch_size) @ (batch_size, input_size) = (output_size, input_size)
-
-            // Compute weight gradients on GPU
-            cuda::CudaTensor<T> gpu_weight_grad(std::vector<size_t>{output_size_, input_size_});
-            cuda::cuda_gemm(gpu_grad_activation, gpu_cached_input, gpu_weight_grad, T(1), T(0), true, false);
-
-            // Accumulate weight gradients to CPU
-            Tensor<T> weight_grad_cpu = gpu_weight_grad.to_host();
-            for (size_t i = 0; i < output_size_; ++i) {
-                if (!is_node_active(i)) continue;
-                if (nodes_[i].is_trainable()) {
-                    for (size_t j = 0; j < input_size_; ++j) {
-                        weight_gradients_.at(i, j) += weight_grad_cpu.at(i, j);
-                    }
-                }
-            }
-
-            // Bias gradient: sum of grad_activation along batch dimension
-            for (size_t b = 0; b < batch_size; ++b) {
-                for (size_t i = 0; i < output_size_; ++i) {
-                    if (!is_node_active(i)) continue;
-                    if (nodes_[i].is_trainable()) {
-                        bias_gradients_[i] += grad_activation.at(b, i);
-                    }
-                }
-            }
-
-            // Record metrics
-            for (size_t i = 0; i < output_size_; ++i) {
-                nodes_[i].record_gradient(static_cast<float>(grad_activation.at(0, i)));
-            }
-
-            // Compute input gradient on GPU: grad_input = grad_activation @ weights
-            cuda::CudaTensor<T> gpu_grad_input(std::vector<size_t>{batch_size, input_size_});
-            cuda::cuda_gemm(gpu_grad_activation, *gpu_weights_, gpu_grad_input, T(1), T(0), false, false);
-
-            return gpu_grad_input.to_host();
-        }
+        cuda::CudaTensor<T> gpu_grad(grad_output);
+        cuda::CudaTensor<T> gpu_grad_input = backward_cuda_dev(gpu_grad);
+        return gpu_grad_input.to_host();
     }
 #endif
 
@@ -522,6 +746,28 @@ public:
      * @param learning_rate Learning rate for update
      */
     void apply_gradients(T learning_rate) {
+#ifdef DNN_ENABLE_CUDA
+        if (device_ == Device::CUDA && gpu_weights_ && gpu_biases_
+            && gpu_weight_gradients_ && gpu_bias_gradients_) {
+            // On-device SGD: weights -= lr * dW, biases -= lr * db. Then
+            // zero the GPU gradient buffers for the next batch. The
+            // active+trainable mask was already applied during accumulation
+            // in backward_cuda_dev, so we don't need to re-mask here.
+            cuda::cuda_axpy(*gpu_weights_, -learning_rate, *gpu_weight_gradients_);
+            cuda::cuda_axpy(*gpu_biases_, -learning_rate, *gpu_bias_gradients_);
+            cuda::cuda_fill(*gpu_weight_gradients_, T(0));
+            cuda::cuda_fill(*gpu_bias_gradients_, T(0));
+            // weights_ / biases_ on the host are now stale. Mark them so
+            // any code path that needs fresh host values (compact, model
+            // serialization, has_numerical_issues) calls sync_host_weights_
+            // before reading. The CPU forward path is not reachable from a
+            // CUDA layer, so during training this never matters.
+            host_weights_dirty_ = true;
+            return;
+        }
+#endif
+
+        // CPU SGD: in-place update of host weights/biases.
         for (size_t i = 0; i < output_size_; ++i) {
             if (!is_node_active(i)) continue;
             if (nodes_[i].is_trainable()) {
@@ -532,7 +778,16 @@ public:
             }
         }
 
-        // Reset gradients
+#ifdef DNN_ENABLE_CUDA
+        // GPU mirrors (if any) reference the old values; drop so the next
+        // forward_cuda_dev reuploads. Only reached when CUDA is enabled but
+        // we fell through the CUDA path above (no GPU gradients yet, e.g.
+        // first batch after a topology mutation invalidated the mirrors).
+        gpu_weights_.reset();
+        gpu_biases_.reset();
+#endif
+
+        // Reset host gradient accumulators.
         zero_gradients();
     }
 
@@ -597,6 +852,11 @@ public:
             size_t node_idx = efficiencies[i].second;
             nodes_[node_idx].set_trainable(i < target_trainable);
         }
+        // gpu_update_mask_ encodes (active && is_trainable); trainability
+        // just changed, so the mask must be rebuilt on next backward.
+#ifdef DNN_ENABLE_CUDA
+        gpu_update_mask_.reset();
+#endif
     }
 
     /**
@@ -787,6 +1047,9 @@ public:
 
         size_t to_allocate = count - reactivated;
         if (to_allocate == 0) {
+            // Mask values changed (some 0s flipped to 1s) but shape didn't.
+            // Drop the GPU mask mirror; keep weights/biases mirrors.
+            if (reactivated > 0) invalidate_gpu_active_mask_();
             ++topology_version_;
             return reactivated;
         }
@@ -832,15 +1095,11 @@ public:
         weight_gradients_ = Tensor<T>();
         bias_gradients_ = Tensor<T>();
 
-#ifdef DNN_ENABLE_CUDA
-        // weights_/biases_ shapes just changed (output_size_ grew). The GPU
-        // mirrors still reference the old sizes; if we left them in place
-        // the next forward_cuda() would call cuda_copy(*gpu_biases_,
-        // gpu_output) at a size mismatch. Drop them so forward_cuda()
-        // lazy-rebuilds at the new size.
-        gpu_weights_.reset();
-        gpu_biases_.reset();
-#endif
+        // weights_/biases_ shapes just changed (output_size_ grew). Drop
+        // GPU mirrors + transposed-weight cache so they lazy-rebuild at
+        // the new size. CLAUDE.md invariant: every host shape change
+        // invalidates GPU mirrors.
+        invalidate_gpu_mirrors_();
 
         ++topology_version_;
         return reactivated;
@@ -855,11 +1114,14 @@ public:
      */
     void remove_nodes(std::vector<size_t> indices) {
         if (indices.empty()) return;
+        bool any_changed = false;
         for (size_t idx : indices) {
-            if (idx < active_mask_.size()) {
+            if (idx < active_mask_.size() && active_mask_[idx] != 0) {
                 active_mask_[idx] = uint8_t(0);
+                any_changed = true;
             }
         }
+        if (any_changed) invalidate_gpu_active_mask_();
         ++topology_version_;
     }
 
@@ -871,6 +1133,12 @@ public:
      * not in the hot training loop.
      */
     size_t compact() {
+#ifdef DNN_ENABLE_CUDA
+        // compact() rebuilds weights_ / biases_ on host. If the on-device
+        // optimizer wrote new values that haven't been mirrored back yet,
+        // pull them now so we don't compact stale data.
+        sync_host_weights_();
+#endif
         std::vector<size_t> to_remove;
         for (size_t i = 0; i < active_mask_.size(); ++i) {
             if (!active_mask_[i]) to_remove.push_back(i);
@@ -909,11 +1177,9 @@ public:
         weight_gradients_ = Tensor<T>();
         bias_gradients_ = Tensor<T>();
 
-#ifdef DNN_ENABLE_CUDA
-        // Force GPU buffers to be re-uploaded on next forward.
-        gpu_weights_.reset();
-        gpu_biases_.reset();
-#endif
+        // compact() shrinks the dense buffers — every GPU mirror and the
+        // transposed-weight cache must rebuild on the new shape.
+        invalidate_gpu_mirrors_();
 
         ++topology_version_;
         return to_remove.size();
@@ -925,7 +1191,9 @@ public:
     }
     void set_node_active(size_t i, bool a) {
         if (i < active_mask_.size()) {
+            uint8_t prev = active_mask_[i];
             active_mask_[i] = a ? uint8_t(1) : uint8_t(0);
+            if (active_mask_[i] != prev) invalidate_gpu_active_mask_();
             ++topology_version_;
         }
     }
@@ -1053,11 +1321,138 @@ private:
     std::unique_ptr<Activation<T>> activation_;
     std::unique_ptr<Random> rng_;
 
+    // Lazily-built SIMD ops (AVX-512/AVX2/AVX/SSE/Scalar picked at runtime by
+    // simd::SIMDOps<T>::create()). Used by forward_cpu/backward_cpu rank-2.
+    // The pointee is stateless; `mutable` lets const accessors lazily build
+    // it. SIMDOps is single-threaded externally — concurrent forwards under
+    // the runtime path each build their own local transposed weights tensor
+    // (see forward_cpu rank-2) rather than sharing a cached one.
+    mutable std::unique_ptr<simd::SIMDOps<T>> simd_ops_;
+
 #ifdef DNN_ENABLE_CUDA
     // GPU tensors for CUDA mode
     std::unique_ptr<cuda::CudaTensor<T>> gpu_weights_;
     std::unique_ptr<cuda::CudaTensor<T>> gpu_biases_;
+
+    // Cached GPU active-mask: active_mask_ cast to T, shape (output_size_,).
+    // Used by cuda_apply_mask_broadcast in forward_cuda_dev to zero columns
+    // of soft-removed nodes without a host round-trip. Invalidated whenever
+    // active_mask_ mutates (add_nodes / remove_nodes / set_node_active /
+    // compact).
+    std::unique_ptr<cuda::CudaTensor<T>> gpu_active_mask_;
+
+    // GPU-resident forward caches. When device_ == CUDA, the forward_cuda_dev
+    // path stores these (rather than the host versions) so backward_cuda_dev
+    // can run the activation backward and the gemm on the GPU without a host
+    // round-trip per layer. The host cached_input_ / cached_pre_activation_ /
+    // cached_output_ remain authoritative for the CPU path.
+    std::unique_ptr<cuda::CudaTensor<T>> cached_input_gpu_;
+    std::unique_ptr<cuda::CudaTensor<T>> cached_pre_activation_gpu_;
+    std::unique_ptr<cuda::CudaTensor<T>> cached_output_gpu_;
+
+    // GPU-resident gradient accumulators. Mirror the host weight_gradients_
+    // / bias_gradients_ when device_ == CUDA; populated by backward_cuda_dev
+    // and consumed by apply_gradients (on-device SGD step). Avoids the
+    // dW / db D2H per layer per batch.
+    std::unique_ptr<cuda::CudaTensor<T>> gpu_weight_gradients_;
+    std::unique_ptr<cuda::CudaTensor<T>> gpu_bias_gradients_;
+
+    // Cached GPU update-mask: (active_mask_ AND nodes_[i].is_trainable()) cast
+    // to T, shape (output_size_,). Multiplied against dW rows and db elements
+    // in backward_cuda_dev so the on-device SGD step naturally skips inactive
+    // and non-trainable neurons. Invalidated whenever active_mask_ or
+    // trainability changes.
+    std::unique_ptr<cuda::CudaTensor<T>> gpu_update_mask_;
+
+    // True when GPU weights/biases have been updated by the on-device
+    // optimizer step but the host weights_/biases_ haven't been refreshed
+    // yet. sync_host_weights_() clears this. Read by code paths that need
+    // fresh host values (compact, model save, has_numerical_issues).
+    bool host_weights_dirty_ = false;
 #endif
+
+    // Centralized invalidator for the GPU weight/bias mirrors plus the
+    // derived active-mask mirror. Called from every site that mutates
+    // weights_/biases_ shape or active_mask_ in a shape-incompatible way.
+    // No-op on CPU-only builds. Per include/dnn/core/CLAUDE.md invariant
+    // "CUDA mirror invalidation runs on every host shape change".
+    void invalidate_gpu_mirrors_() {
+#ifdef DNN_ENABLE_CUDA
+        gpu_weights_.reset();
+        gpu_biases_.reset();
+        gpu_active_mask_.reset();
+        gpu_update_mask_.reset();
+        gpu_weight_gradients_.reset();
+        gpu_bias_gradients_.reset();
+        // The forward caches reference the old layer shape; drop them so the
+        // next forward rebuilds at the new size.
+        cached_input_gpu_.reset();
+        cached_pre_activation_gpu_.reset();
+        cached_output_gpu_.reset();
+        host_weights_dirty_ = false;
+#endif
+    }
+
+    // Cheap invalidation when only active_mask_ values changed (no shape
+    // change). Drops the active + update masks; weights/biases mirrors stay
+    // valid.
+    void invalidate_gpu_active_mask_() {
+#ifdef DNN_ENABLE_CUDA
+        gpu_active_mask_.reset();
+        gpu_update_mask_.reset();
+#endif
+    }
+
+#ifdef DNN_ENABLE_CUDA
+    // Build / refresh gpu_active_mask_ from the host active_mask_ vector.
+    // Called from forward_cuda_dev before the masking step.
+    void ensure_gpu_active_mask_() {
+        if (gpu_active_mask_ && gpu_active_mask_->size() == output_size_) {
+            return;
+        }
+        Tensor<T> host_mask(std::vector<size_t>{output_size_});
+        for (size_t i = 0; i < output_size_; ++i) {
+            host_mask[i] = active_mask_[i] ? T(1) : T(0);
+        }
+        gpu_active_mask_ = std::make_unique<cuda::CudaTensor<T>>(host_mask);
+    }
+
+    // Build / refresh gpu_update_mask_ = (active_mask_ AND is_trainable) cast
+    // to T. Used by the on-device SGD step to skip inactive or non-trainable
+    // neurons. Rebuilt lazily on shape change and whenever the host signals
+    // a trainability change (TrainableScheduler).
+    void ensure_gpu_update_mask_() {
+        if (gpu_update_mask_ && gpu_update_mask_->size() == output_size_) {
+            return;
+        }
+        Tensor<T> host_mask(std::vector<size_t>{output_size_});
+        for (size_t i = 0; i < output_size_; ++i) {
+            const bool keep = active_mask_[i] != 0
+                              && i < nodes_.size()
+                              && nodes_[i].is_trainable();
+            host_mask[i] = keep ? T(1) : T(0);
+        }
+        gpu_update_mask_ = std::make_unique<cuda::CudaTensor<T>>(host_mask);
+    }
+
+    // Pull GPU weights/biases back to host. Called before any code path that
+    // needs fresh host values during training (compact, save, numerical
+    // checks). No-op if not dirty.
+    void sync_host_weights_() {
+        if (!host_weights_dirty_) return;
+        if (gpu_weights_) weights_ = gpu_weights_->to_host();
+        if (gpu_biases_) biases_ = gpu_biases_->to_host();
+        host_weights_dirty_ = false;
+    }
+#endif
+
+    // Lazy SIMD ops accessor.
+    simd::SIMDOps<T>* get_simd_ops_() const {
+        if (!simd_ops_) {
+            simd_ops_ = simd::SIMDOps<T>::create();
+        }
+        return simd_ops_.get();
+    }
 };
 
 // Type alias

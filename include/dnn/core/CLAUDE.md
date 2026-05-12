@@ -43,14 +43,41 @@ instantiations for `float` and `double`; behaviour lives in the headers.
   (the original "dynamic_thresholds=True crashes on GPU" bug). Any
   future code that mutates `weights_` / `biases_` shape on an
   already-uploaded layer must follow the same pattern.
-- **CUDA forward honours the active mask.** `Layer<T>::forward_cuda`
-  zeros inactive-node columns of the pre-activation tensor (via
-  `zero_inactive_components`) and re-uploads the masked tensor to the
-  GPU before activation. This makes `remove_nodes` actually shrink the
-  network on CUDA — without the masking step the dense `gemv` / `gemm`
-  produces non-zero outputs for soft-removed neurons and the next
-  layer happily consumes them. CPU's per-node forward already gates on
-  `is_node_active(i)`; both paths now agree.
+- **CUDA forward honours the active mask, on-device.**
+  `Layer<T>::forward_cuda_dev` calls `cuda_apply_mask_broadcast(pre_act,
+  gpu_active_mask_)` to zero columns for soft-removed neurons. The mask
+  is a 1-D GPU tensor cached in `gpu_active_mask_`, invalidated by
+  `add_nodes` / `remove_nodes` / `set_node_active` / `compact` via
+  `invalidate_gpu_active_mask_()`. This replaced an earlier D2H → host
+  zero → H2D triplet on every layer forward — see `cuda_ops.hpp`
+  `cuda_apply_mask_broadcast`. The CPU forward post-zeros inactive
+  output columns after the SIMD matmul; both paths produce the same
+  values.
+- **Device-resident forward/backward chain.** When
+  `Network::device_ == Device::CUDA`, `Network::forward` and
+  `Network::backward` do one H2D at start and one D2H at end (or none,
+  for backward). Each layer's `forward_cuda_dev` / `backward_cuda_dev`
+  accepts and returns `cuda::CudaTensor<T>` so intermediates stay on
+  device. The Tensor-in/Tensor-out wrappers `Layer::forward_cuda` /
+  `backward_cuda` only fire when something calls them in isolation
+  (tests, ad-hoc inference); they delegate to `*_cuda_dev`.
+- **GPU mirror invalidation is centralised.**
+  `Layer<T>::invalidate_gpu_mirrors_()` resets every GPU-resident cache
+  (weights, biases, active-mask, forward-pass caches). Called from every
+  site that mutates `weights_`/`biases_` shape (add_nodes,
+  compact, to_device). For weight-value-only changes (e.g.
+  `apply_gradients`) the GPU weight/bias mirrors are reset directly so
+  they reupload on the next forward — a future optimisation is to keep
+  the optimizer step on device. `invalidate_gpu_active_mask_()` is the
+  cheaper variant when only mask values changed.
+- **Per-node metrics are recorded from one row, not the full output.**
+  `Layer::forward_cuda_dev` D2Hs only the first batch row of the
+  pre-activation (output_size_ floats) for `record_activation`; the
+  rest of the pre-activation / output stays GPU-resident. Same for
+  `record_first_row_gradient_gpu_` in backward. The host
+  `cached_output_` / `cached_pre_activation_` are no longer populated
+  on the CUDA path — `compute_metrics().output_variance` will be zero
+  unless the network was run on CPU.
 - **`Network::insert_layer` / `remove_layer` propagate `device_`.**
   Newly created and rebuilt layers inherit the network's device.
   Earlier versions defaulted to `Device::CPU` here even when the
@@ -100,10 +127,19 @@ instantiations for `float` and `double`; behaviour lives in the headers.
 - `Network::clone()` deep-copies all layers' tensors. It's not in the
   hot path but is used by `Network::inherit_from`; expect it to be
   expensive on large nets.
-- The OpenMP `#pragma omp parallel for` directives in `forward_cpu`
-  (batch loop) and `backward_cpu` (grad-input loop) are gated by
-  `if (batch_size > 4)` so small batches don't pay the team-spawn
-  cost. Preserve that guard.
+- `Layer::forward_cpu` and `Layer::backward_cpu` (rank-2 path) now
+  route through `simd::SIMDOps<T>::matmul` instead of the old manual
+  nested loops. The SIMD matmul provides AVX/AVX2/SSE vectorisation
+  *and* OpenMP parallelism on the outer i-block (see
+  `include/dnn/simd/CLAUDE.md`). The previous per-batch
+  `#pragma omp parallel for` at the layer level was removed because
+  nesting it inside the matmul's OpenMP team causes oversubscription.
+  The `kOpenMpBatchThreshold = 4` constant is retained for potential
+  future use but is no longer referenced by layer code. Forward uses
+  a lazily-rebuilt transposed-weights cache `weights_t_cached_` of
+  shape `(input_size, output_size)`; backward materialises a small
+  `grad_activation^T` scratch (output_size × batch_size) so the
+  weight-gradient matmul can run as `dW = G^T @ X`.
 - `Layer::reset_node_metrics()` zeroes per-node counters but **not** the
   `active_mask_`. Don't conflate the two.
 

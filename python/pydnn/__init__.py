@@ -82,12 +82,27 @@ try:
     except ImportError:
         _cpp_set_cuda_memory_mode = None
         _cpp_get_cuda_memory_mode = None
+    # OpenMP thread-count controls were added alongside the SIMD/CUDA perf
+    # refactor; older .so builds may not expose them, so degrade gracefully.
+    try:
+        from ._dnn_core import (
+            set_num_threads as _cpp_set_num_threads,
+            get_num_threads as _cpp_get_num_threads,
+            openmp_available as _cpp_openmp_available,
+        )
+    except ImportError:
+        _cpp_set_num_threads = None
+        _cpp_get_num_threads = None
+        _cpp_openmp_available = None
     _CPP_AVAILABLE = True
 except ImportError as e:
     _CPP_AVAILABLE = False
     _CPP_ERROR = str(e)
     _cpp_set_cuda_memory_mode = None
     _cpp_get_cuda_memory_mode = None
+    _cpp_set_num_threads = None
+    _cpp_get_num_threads = None
+    _cpp_openmp_available = None
 
 
 def cuda_available() -> bool:
@@ -153,6 +168,44 @@ def get_cuda_memory_mode() -> str:
     if not _CPP_AVAILABLE or _cpp_get_cuda_memory_mode is None:
         return "device"
     return _cpp_get_cuda_memory_mode()
+
+
+def set_num_threads(n: int) -> None:
+    """Set the OpenMP thread count used by CPU training.
+
+    Routes to ``omp_set_num_threads`` inside the loaded ``_dnn_core``
+    extension. Call this once before ``fit()`` to engage all cores on
+    machines where ``OMP_NUM_THREADS`` isn't set in the environment.
+
+    No-op when the loaded ``.so`` was built without OpenMP, or when
+    the C++ extension isn't available.
+
+    Example:
+        >>> import os, pydnn
+        >>> pydnn.set_num_threads(os.cpu_count())
+        >>> net = pydnn.DynamicNetwork(..., device="cpu")
+    """
+    if not _CPP_AVAILABLE or _cpp_set_num_threads is None:
+        return
+    _cpp_set_num_threads(int(n))
+
+
+def get_num_threads() -> int:
+    """Return the current OpenMP max thread count.
+
+    Returns ``1`` when OpenMP is disabled or the binding is too old to
+    expose this information.
+    """
+    if not _CPP_AVAILABLE or _cpp_get_num_threads is None:
+        return 1
+    return _cpp_get_num_threads()
+
+
+def openmp_available() -> bool:
+    """True iff the loaded ``_dnn_core`` was built with OpenMP."""
+    if not _CPP_AVAILABLE or _cpp_openmp_available is None:
+        return False
+    return _cpp_openmp_available()
 
 # Pure Python components (always available)
 from .network import (
@@ -232,6 +285,10 @@ __all__ = [
     "cuda_available",
     "set_cuda_memory_mode",
     "get_cuda_memory_mode",
+    # OpenMP / CPU multi-core support
+    "set_num_threads",
+    "get_num_threads",
+    "openmp_available",
     # Configuration classes for advanced ML engineers
     "TrainingPhaseConfig",
     "ArchitectureConfig",

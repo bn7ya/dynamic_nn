@@ -122,6 +122,12 @@ public:
 
     /**
      * Forward pass through the network.
+     *
+     * On CUDA, performs a single host→device transfer at the start and a
+     * single device→host transfer at the end; intermediate layer outputs
+     * stay on the GPU between layers. On CPU, uses each layer's SIMD-
+     * accelerated forward_cpu (OpenMP-parallel matmul). See
+     * include/dnn/core/CLAUDE.md for the device-resident chain contract.
      */
     Tensor<T> forward(const Tensor<T>& input) {
         // Flatten input if needed
@@ -130,7 +136,17 @@ public:
             x = input.flatten();
         }
 
-        // Pass through each layer
+#ifdef DNN_ENABLE_CUDA
+        if (device_ == Device::CUDA && !layers_.empty()) {
+            cuda::CudaTensor<T> gpu_x(x);
+            for (auto& layer : layers_) {
+                gpu_x = layer->forward_cuda_dev(std::move(gpu_x));
+            }
+            return gpu_x.to_host();
+        }
+#endif
+
+        // CPU path: each layer's forward_cpu uses SIMDOps::matmul + OpenMP.
         for (auto& layer : layers_) {
             x = layer->forward(x);
         }
@@ -153,11 +169,26 @@ public:
     /**
      * Backward pass (compute gradients).
      * @param grad_output Gradient from loss function
+     *
+     * Symmetrical to forward(): on CUDA, one H2D at the start, gradients
+     * propagate device-resident through every layer, no D2H at the end
+     * (the input-side grad is discarded — only the per-layer weight and
+     * bias gradients are accumulated for the optimizer step).
      */
     void backward(const Tensor<T>& grad_output) {
+#ifdef DNN_ENABLE_CUDA
+        if (device_ == Device::CUDA && !layers_.empty()) {
+            cuda::CudaTensor<T> gpu_grad(grad_output);
+            for (auto it = layers_.rbegin(); it != layers_.rend(); ++it) {
+                gpu_grad = (*it)->backward_cuda_dev(gpu_grad);
+            }
+            return;
+        }
+#endif
+
         Tensor<T> grad = grad_output;
 
-        // Backpropagate through layers in reverse
+        // Backpropagate through layers in reverse (CPU path).
         for (auto it = layers_.rbegin(); it != layers_.rend(); ++it) {
             grad = (*it)->backward(grad);
         }

@@ -347,6 +347,125 @@ void cuda_transpose(const CudaTensor<T>& src, CudaTensor<T>& dst) {
 }
 
 // ============================================================================
+// Broadcast helpers (used by Layer::forward_cuda_dev)
+// ============================================================================
+
+// y is (B, O) row-major OR rank-1 (O,). bias is (O,). Adds bias[o] to every row.
+template<typename T>
+__global__ void add_bias_broadcast_kernel(T* y, const T* bias, size_t B, size_t O) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = B * O;
+    if (idx < total) {
+        size_t o = idx % O;
+        y[idx] = y[idx] + bias[o];
+    }
+}
+
+template<typename T>
+__global__ void apply_mask_broadcast_kernel(T* y, const T* mask, size_t B, size_t O) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = B * O;
+    if (idx < total) {
+        size_t o = idx % O;
+        y[idx] = y[idx] * mask[o];
+    }
+}
+
+template<typename T>
+void cuda_add_bias_broadcast(CudaTensor<T>& y, const CudaTensor<T>& bias) {
+    if (bias.ndim() != 1) {
+        throw std::runtime_error("cuda_add_bias_broadcast: bias must be 1D");
+    }
+    size_t O = bias.size();
+    size_t total = y.size();
+    if (total % O != 0) {
+        throw std::runtime_error("cuda_add_bias_broadcast: y size not divisible by bias size");
+    }
+    size_t B = total / O;
+    auto config = KernelConfig::for_elementwise(total);
+    add_bias_broadcast_kernel<T><<<config.grid, config.block, 0, config.stream>>>(
+        static_cast<T*>(y.device_data()),
+        static_cast<const T*>(bias.device_data()),
+        B, O);
+    CUDA_CHECK_LAST();
+}
+
+template<typename T>
+void cuda_apply_mask_broadcast(CudaTensor<T>& y, const CudaTensor<T>& mask) {
+    if (mask.ndim() != 1) {
+        throw std::runtime_error("cuda_apply_mask_broadcast: mask must be 1D");
+    }
+    size_t O = mask.size();
+    size_t total = y.size();
+    if (total % O != 0) {
+        throw std::runtime_error("cuda_apply_mask_broadcast: y size not divisible by mask size");
+    }
+    size_t B = total / O;
+    auto config = KernelConfig::for_elementwise(total);
+    apply_mask_broadcast_kernel<T><<<config.grid, config.block, 0, config.stream>>>(
+        static_cast<T*>(y.device_data()),
+        static_cast<const T*>(mask.device_data()),
+        B, O);
+    CUDA_CHECK_LAST();
+}
+
+// Row-wise mask kernel: y[r, c] *= mask[r]. y is (R, C) row-major; mask is (R,).
+template<typename T>
+__global__ void apply_mask_rows_broadcast_kernel(T* y, const T* mask,
+                                                  size_t R, size_t C) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total = R * C;
+    if (idx < total) {
+        size_t r = idx / C;
+        y[idx] = y[idx] * mask[r];
+    }
+}
+
+template<typename T>
+void cuda_apply_mask_rows_broadcast(CudaTensor<T>& y, const CudaTensor<T>& mask) {
+    if (mask.ndim() != 1) {
+        throw std::runtime_error("cuda_apply_mask_rows_broadcast: mask must be 1D");
+    }
+    size_t R = mask.size();
+    size_t total = y.size();
+    if (total % R != 0) {
+        throw std::runtime_error(
+            "cuda_apply_mask_rows_broadcast: y size not divisible by mask size");
+    }
+    size_t C = total / R;
+    auto config = KernelConfig::for_elementwise(total);
+    apply_mask_rows_broadcast_kernel<T><<<config.grid, config.block, 0, config.stream>>>(
+        static_cast<T*>(y.device_data()),
+        static_cast<const T*>(mask.device_data()),
+        R, C);
+    CUDA_CHECK_LAST();
+}
+
+// AXPY: y = y + alpha * x. Same-size, element-wise.
+template<typename T>
+__global__ void axpy_kernel(T* y, T alpha, const T* x, size_t n) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        y[idx] = y[idx] + alpha * x[idx];
+    }
+}
+
+template<typename T>
+void cuda_axpy(CudaTensor<T>& y, T alpha, const CudaTensor<T>& x) {
+    if (y.size() != x.size()) {
+        throw std::runtime_error("cuda_axpy: size mismatch");
+    }
+    size_t n = y.size();
+    auto config = KernelConfig::for_elementwise(n);
+    axpy_kernel<T><<<config.grid, config.block, 0, config.stream>>>(
+        static_cast<T*>(y.device_data()),
+        alpha,
+        static_cast<const T*>(x.device_data()),
+        n);
+    CUDA_CHECK_LAST();
+}
+
+// ============================================================================
 // Explicit Template Instantiations
 // ============================================================================
 
@@ -358,6 +477,14 @@ template void cuda_fill<float>(CudaTensor<float>&, float);
 template void cuda_fill<double>(CudaTensor<double>&, double);
 template void cuda_transpose<float>(const CudaTensor<float>&, CudaTensor<float>&);
 template void cuda_transpose<double>(const CudaTensor<double>&, CudaTensor<double>&);
+template void cuda_add_bias_broadcast<float>(CudaTensor<float>&, const CudaTensor<float>&);
+template void cuda_add_bias_broadcast<double>(CudaTensor<double>&, const CudaTensor<double>&);
+template void cuda_apply_mask_broadcast<float>(CudaTensor<float>&, const CudaTensor<float>&);
+template void cuda_apply_mask_broadcast<double>(CudaTensor<double>&, const CudaTensor<double>&);
+template void cuda_apply_mask_rows_broadcast<float>(CudaTensor<float>&, const CudaTensor<float>&);
+template void cuda_apply_mask_rows_broadcast<double>(CudaTensor<double>&, const CudaTensor<double>&);
+template void cuda_axpy<float>(CudaTensor<float>&, float, const CudaTensor<float>&);
+template void cuda_axpy<double>(CudaTensor<double>&, double, const CudaTensor<double>&);
 
 } // namespace cuda
 } // namespace dnn

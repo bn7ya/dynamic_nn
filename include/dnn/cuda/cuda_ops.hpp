@@ -132,6 +132,37 @@ void cuda_copy(const CudaTensor<T>& src, CudaTensor<T>& dst);
 template<typename T>
 void cuda_transpose(const CudaTensor<T>& src, CudaTensor<T>& dst);
 
+// Broadcast helpers (cuda_elementwise.cu). Used by Layer::forward_cuda_dev
+// to fuse the per-step "add bias" and "zero inactive output columns"
+// operations onto the GPU instead of round-tripping through host memory.
+//
+// cuda_add_bias_broadcast(y, bias):
+//   y is (B, O) or (O,) row-major. bias is (O,). Adds bias[o] to every row.
+//   When y is rank-1, equivalent to cuda_add(y, bias, y).
+//
+// cuda_apply_mask_broadcast(y, mask):
+//   y is (B, O) or (O,). mask is (O,). Multiplies y[b, o] *= mask[o].
+//   Used to zero columns for soft-removed (inactive) neurons without a
+//   host round-trip. Mask values are typically 0 or 1.
+template<typename T>
+void cuda_add_bias_broadcast(CudaTensor<T>& y, const CudaTensor<T>& bias);
+
+template<typename T>
+void cuda_apply_mask_broadcast(CudaTensor<T>& y, const CudaTensor<T>& mask);
+
+// Row-wise mask: y is (R, C) row-major or rank-1 (R,). mask is (R,).
+// Multiplies y[r, c] *= mask[r] (vs the column-wise cuda_apply_mask_broadcast).
+// Used by the on-device optimizer to zero dW rows for inactive / non-trainable
+// neurons before accumulation.
+template<typename T>
+void cuda_apply_mask_rows_broadcast(CudaTensor<T>& y, const CudaTensor<T>& mask);
+
+// AXPY: y = y + alpha * x. Element-wise, x and y must have the same size.
+// Used by the on-device SGD step in Layer::apply_gradients to update weights
+// without round-tripping dW through host memory.
+template<typename T>
+void cuda_axpy(CudaTensor<T>& y, T alpha, const CudaTensor<T>& x);
+
 // Activation Functions (cuda_activations.cu)
 template<typename T>
 void cuda_relu(const CudaTensor<T>& x, CudaTensor<T>& y);
@@ -243,6 +274,30 @@ template<typename T>
 void cuda_transpose(const CudaTensor<T>& src, CudaTensor<T>& dst) {
     (void)src; (void)dst;
     throw std::runtime_error("cuda_transpose: CUDA not enabled");
+}
+
+template<typename T>
+void cuda_add_bias_broadcast(CudaTensor<T>& y, const CudaTensor<T>& bias) {
+    (void)y; (void)bias;
+    throw std::runtime_error("cuda_add_bias_broadcast: CUDA not enabled");
+}
+
+template<typename T>
+void cuda_apply_mask_broadcast(CudaTensor<T>& y, const CudaTensor<T>& mask) {
+    (void)y; (void)mask;
+    throw std::runtime_error("cuda_apply_mask_broadcast: CUDA not enabled");
+}
+
+template<typename T>
+void cuda_apply_mask_rows_broadcast(CudaTensor<T>& y, const CudaTensor<T>& mask) {
+    (void)y; (void)mask;
+    throw std::runtime_error("cuda_apply_mask_rows_broadcast: CUDA not enabled");
+}
+
+template<typename T>
+void cuda_axpy(CudaTensor<T>& y, T alpha, const CudaTensor<T>& x) {
+    (void)y; (void)alpha; (void)x;
+    throw std::runtime_error("cuda_axpy: CUDA not enabled");
 }
 
 // Activation Functions
