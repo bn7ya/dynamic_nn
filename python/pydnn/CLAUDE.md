@@ -79,6 +79,25 @@ observer, and `ThreeModelGenerator` for spawning multiple variants.
   calling `trainer_.train(...)` (`_bindings.cpp:164`). Preserve
   this on any new long-running binding so Python threads can
   observe progress.
+- **`_fit_cpp` forwards Python `*Config` objects into the C++
+  `TrainerConfig`.** `_apply_python_configs_to_cpp` (called from
+  `_fit_cpp` right after constructing `TrainerConfig`) propagates
+  `self.normalization` (input/output flags, method, epsilon),
+  `self.early_stopping.window_size` → `patience`,
+  `self.early_stopping.improvement_threshold` → `min_improvement`,
+  `self.gradient.gradient_clip_value`,
+  `self.training_phase.main_learning_rate` →
+  `initial_learning_rate`, and `phase4_patience` /
+  `phase4_min_improvement`. Before this helper existed only
+  `runtime_enabled` and the dynamic-thresholds-derived fields
+  crossed the boundary; user-supplied `NormalizationConfig` was
+  silently dropped, which Z-score-normalised one-hot CrossEntropy
+  inputs into a softmax-saturation lockup. The legacy
+  `train_phased` body still hard-codes Phase 1/2/3 epoch counts
+  and learning rates, so `exploration_epochs` /
+  `estimation_epochs` only take effect on the runtime path —
+  `_apply_python_configs_to_cpp` prints a warning in `verbose`
+  mode when those fields are set with `runtime_enabled=False`.
 
 - **`set_cuda_memory_mode("device" | "managed")`** is a module-level
   function in `__init__.py` that toggles the `CudaMemoryPool` between

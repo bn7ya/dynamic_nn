@@ -888,6 +888,81 @@ class DynamicNetwork:
 
         return result
 
+    def _apply_python_configs_to_cpp(self, trainer_config, verbose: bool) -> None:
+        """Translate user-supplied Python configs into C++ TrainerConfig fields.
+
+        Only fields with a 1:1 (or close) C++ counterpart are forwarded. The
+        legacy ``train_phased`` body still hard-codes Phase 1/2/3 epoch counts
+        and learning rates, so ``TrainingPhaseConfig.exploration_epochs`` /
+        ``estimation_epochs`` / ``main_learning_rate`` only take effect on the
+        runtime path (via ``initial_learning_rate``). We surface a warning in
+        verbose mode when the user set a value the legacy path can't honour.
+        """
+        from . import _dnn_core
+
+        norm = self.normalization
+        try:
+            tc_norm = trainer_config.normalization
+            tc_norm.normalize_input = bool(norm.normalize_input)
+            tc_norm.normalize_output = bool(norm.normalize_output)
+            tc_norm.epsilon = float(norm.epsilon)
+            method = (norm.method or "zscore").lower()
+            if method == "minmax":
+                tc_norm.method = _dnn_core.NormalizationMethod.MinMax
+            else:
+                tc_norm.method = _dnn_core.NormalizationMethod.ZScore
+            trainer_config.normalization = tc_norm
+        except AttributeError:
+            if verbose:
+                print("  [config] NormalizationConfig fields not exposed by this "
+                      "_dnn_core build; falling back to defaults.")
+
+        es = self.early_stopping
+        for cpp_attr, value in (
+            ("patience", int(es.window_size)),
+            ("min_improvement", float(es.improvement_threshold)),
+        ):
+            try:
+                setattr(trainer_config, cpp_attr, value)
+            except AttributeError:
+                pass
+
+        try:
+            trainer_config.gradient_clip_value = float(self.gradient.gradient_clip_value)
+        except AttributeError:
+            pass
+
+        tp = self.training_phase
+        try:
+            trainer_config.initial_learning_rate = float(tp.main_learning_rate)
+        except AttributeError:
+            pass
+        for cpp_attr, value in (
+            ("phase4_patience", int(tp.phase4_patience)),
+            ("phase4_min_improvement", float(tp.phase4_min_improvement)),
+        ):
+            try:
+                setattr(trainer_config, cpp_attr, value)
+            except AttributeError:
+                pass
+
+        if verbose and not self.runtime_enabled:
+            tp_defaults = TrainingPhaseConfig()
+            overridden = [
+                name for name in (
+                    "exploration_epochs",
+                    "estimation_epochs",
+                    "main_learning_rate",
+                    "target_efficiency",
+                )
+                if getattr(tp, name) != getattr(tp_defaults, name)
+            ]
+            if overridden:
+                print("  [config] Legacy train_phased ignores these "
+                      "TrainingPhaseConfig fields: "
+                      f"{', '.join(overridden)}. Set runtime_enabled=True for "
+                      "configurable phases.")
+
     def _fit_cpp(self, X, y, callback, verbose) -> TrainingResult:
         """Train using C++ backend."""
         from . import _dnn_core
@@ -906,6 +981,15 @@ class DynamicNetwork:
             trainer_config.runtime_enabled = True
             if verbose:
                 print("  [runtime] StageController + parallel Estimation observer enabled.")
+
+        # Propagate user-supplied Python configs into the C++ TrainerConfig.
+        # Until this was added, the only fields that crossed the boundary were
+        # runtime_enabled and the dynamic_thresholds-derived ones — every other
+        # *Config the user constructed (NormalizationConfig, EarlyStoppingConfig,
+        # GradientConfig, the phase-4 fields of TrainingPhaseConfig) was
+        # silently dropped. Z-score normalising one-hot CrossEntropy inputs in
+        # particular was a hidden saturation bug.
+        self._apply_python_configs_to_cpp(trainer_config, verbose)
 
         # Tier 1: derive thresholds from dataset variance + complexity.
         # When False, leave trainer_config at its C++ defaults so behaviour
