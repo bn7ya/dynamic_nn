@@ -217,12 +217,24 @@ class CausalLMTrainer:
             seq_len: int = 64,
             log_every: int = 10,
             verbose: bool = True,
-            rng: Optional[np.random.Generator] = None) -> TrainResult:
+            rng: Optional[np.random.Generator] = None,
+            adapt_every: Optional[int] = None,
+            adapt_window: int = 50) -> TrainResult:
+        """Train for ``steps`` steps.
+
+        ``adapt_every`` (optional): when set, every ``adapt_every`` steps the
+        trainer calls ``self.model.adapt(result.losses[-adapt_window:])`` if
+        the model exposes an ``adapt`` method (e.g. ``DynamicTransformer``).
+        Silently no-op for models without ``adapt``.
+        """
         rng = rng if rng is not None else np.random.default_rng()
         token_ids = np.asarray(token_ids, dtype=np.int64)
         result = TrainResult()
         t0 = time.time()
         self.model.train()
+        can_adapt = (adapt_every is not None
+                     and adapt_every > 0
+                     and hasattr(self.model, "adapt"))
         for _ in range(steps):
             batch = self._make_batch(token_ids, batch_size, seq_len, rng)
             inputs = batch[:, :-1]
@@ -254,6 +266,12 @@ class CausalLMTrainer:
                 if aux is not None:
                     msg += f"  aux={float(aux.data):.4f}"
                 print(msg)
+
+            if can_adapt and self._step % adapt_every == 0:
+                info = self.model.adapt(result.losses[-adapt_window:])
+                if verbose and any(info.get(k)
+                                   for k in ("pruned", "grew", "reinit_experts")):
+                    print(f"  step {self._step:5d}  model.adapt -> {info}")
         result.steps = self._step
         result.seconds = time.time() - t0
         if result.losses:

@@ -166,10 +166,16 @@ static py::array_t<float> matmul_cpu(py::array_t<float> a_in, py::array_t<float>
     out_shape.push_back(py::ssize_t(N));
     auto out = alloc_f32(out_shape);
 
+    // Capture raw data pointers BEFORE releasing the GIL — fptr() calls
+    // py::array_t::request() which touches Python's buffer protocol and
+    // requires the GIL. Doing this inside the released block segfaults.
+    const float* a_p = fptr(a);
+    const float* b_p = fptr(b);
+    float* out_p = fptr_mut(out);
     {
         py::gil_scoped_release rel;
         tx::matmul_batched_cpu(
-            fptr(a), fptr(b), fptr_mut(out),
+            a_p, b_p, out_p,
             info.dims.data(), int(info.dims.size()),
             info.a_strides.data(), info.b_strides.data(),
             M, K, N, transpose_a, transpose_b);
@@ -184,9 +190,11 @@ static py::array_t<float> softmax_cpu(py::array_t<float> x_in) {
     int64_t rows = 1;
     for (int i = 0; i < buf.ndim - 1; ++i) rows *= buf.shape[i];
     auto out = py::array_t<float>(buf.shape);
+    const float* x_p = fptr(x);
+    float* out_p = fptr_mut(out);
     {
         py::gil_scoped_release rel;
-        tx::softmax_lastdim_cpu(fptr(x), fptr_mut(out), rows, cols);
+        tx::softmax_lastdim_cpu(x_p, out_p, rows, cols);
     }
     return out;
 }
@@ -200,9 +208,12 @@ static py::array_t<float> softmax_backward_cpu(py::array_t<float> y_in,
     int64_t rows = 1;
     for (int i = 0; i < buf.ndim - 1; ++i) rows *= buf.shape[i];
     auto dx = py::array_t<float>(buf.shape);
+    const float* y_p = fptr(y);
+    const float* dy_p = fptr(dy);
+    float* dx_p = fptr_mut(dx);
     {
         py::gil_scoped_release rel;
-        tx::softmax_lastdim_backward_cpu(fptr(y), fptr(dy), fptr_mut(dx), rows, cols);
+        tx::softmax_lastdim_backward_cpu(y_p, dy_p, dx_p, rows, cols);
     }
     return dx;
 }
@@ -221,12 +232,16 @@ static py::tuple layernorm_forward_cpu(py::array_t<float> x_in,
     auto y = py::array_t<float>(buf.shape);
     auto mean = py::array_t<float>({py::ssize_t(rows)});
     auto inv_std = py::array_t<float>({py::ssize_t(rows)});
+    const float* x_p = fptr(x);
+    const float* g_p = fptr(g);
+    const float* b_p = fptr(b);
+    float* y_p = fptr_mut(y);
+    float* mean_p = fptr_mut(mean);
+    float* inv_p = fptr_mut(inv_std);
     {
         py::gil_scoped_release rel;
         tx::layernorm_forward_cpu(
-            fptr(x), fptr(g), fptr(b),
-            fptr_mut(y), fptr_mut(mean), fptr_mut(inv_std),
-            rows, cols, eps);
+            x_p, g_p, b_p, y_p, mean_p, inv_p, rows, cols, eps);
     }
     return py::make_tuple(y, mean, inv_std);
 }
@@ -248,12 +263,19 @@ static py::tuple layernorm_backward_cpu(py::array_t<float> x_in,
     auto dx = py::array_t<float>(buf.shape);
     auto dgamma = py::array_t<float>({py::ssize_t(cols)});
     auto dbeta = py::array_t<float>({py::ssize_t(cols)});
+    const float* x_p = fptr(x);
+    const float* g_p = fptr(g);
+    const float* m_p = fptr(m);
+    const float* isd_p = fptr(isd);
+    const float* dy_p = fptr(dy);
+    float* dx_p = fptr_mut(dx);
+    float* dg_p = fptr_mut(dgamma);
+    float* db_p = fptr_mut(dbeta);
     {
         py::gil_scoped_release rel;
         tx::layernorm_backward_cpu(
-            fptr(x), fptr(g), fptr(m), fptr(isd), fptr(dy),
-            fptr_mut(dx), fptr_mut(dgamma), fptr_mut(dbeta),
-            rows, cols);
+            x_p, g_p, m_p, isd_p, dy_p,
+            dx_p, dg_p, db_p, rows, cols);
     }
     return py::make_tuple(dx, dgamma, dbeta);
 }
@@ -269,11 +291,13 @@ static py::tuple rmsnorm_forward_cpu(py::array_t<float> x_in,
     for (int i = 0; i < buf.ndim - 1; ++i) rows *= buf.shape[i];
     auto y = py::array_t<float>(buf.shape);
     auto inv_rms = py::array_t<float>({py::ssize_t(rows)});
+    const float* x_p = fptr(x);
+    const float* g_p = fptr(g);
+    float* y_p = fptr_mut(y);
+    float* iv_p = fptr_mut(inv_rms);
     {
         py::gil_scoped_release rel;
-        tx::rmsnorm_forward_cpu(
-            fptr(x), fptr(g), fptr_mut(y), fptr_mut(inv_rms),
-            rows, cols, eps);
+        tx::rmsnorm_forward_cpu(x_p, g_p, y_p, iv_p, rows, cols, eps);
     }
     return py::make_tuple(y, inv_rms);
 }
@@ -292,12 +316,16 @@ static py::tuple rmsnorm_backward_cpu(py::array_t<float> x_in,
     for (int i = 0; i < buf.ndim - 1; ++i) rows *= buf.shape[i];
     auto dx = py::array_t<float>(buf.shape);
     auto dgamma = py::array_t<float>({py::ssize_t(cols)});
+    const float* x_p = fptr(x);
+    const float* g_p = fptr(g);
+    const float* iv_p = fptr(inv);
+    const float* dy_p = fptr(dy);
+    float* dx_p = fptr_mut(dx);
+    float* dg_p = fptr_mut(dgamma);
     {
         py::gil_scoped_release rel;
         tx::rmsnorm_backward_cpu(
-            fptr(x), fptr(g), fptr(inv), fptr(dy),
-            fptr_mut(dx), fptr_mut(dgamma),
-            rows, cols);
+            x_p, g_p, iv_p, dy_p, dx_p, dg_p, rows, cols);
     }
     return py::make_tuple(dx, dgamma);
 }
@@ -307,9 +335,12 @@ static py::tuple rmsnorm_backward_cpu(py::array_t<float> x_in,
         auto x = ensure_f32(x_in);                                                \
         auto buf = x.request();                                                   \
         auto out = py::array_t<float>(buf.shape);                                 \
+        const float* x_p = fptr(x);                                               \
+        float* out_p = fptr_mut(out);                                             \
+        int64_t n = int64_t(buf.size);                                            \
         {                                                                         \
             py::gil_scoped_release rel;                                           \
-            FWD_FN(fptr(x), fptr_mut(out), int64_t(buf.size));                    \
+            FWD_FN(x_p, out_p, n);                                                \
         }                                                                         \
         return out;                                                               \
     }                                                                             \
@@ -319,9 +350,13 @@ static py::tuple rmsnorm_backward_cpu(py::array_t<float> x_in,
         auto dy = ensure_f32(dy_in);                                              \
         auto buf = x.request();                                                   \
         auto dx = py::array_t<float>(buf.shape);                                  \
+        const float* x_p = fptr(x);                                               \
+        const float* dy_p = fptr(dy);                                             \
+        float* dx_p = fptr_mut(dx);                                               \
+        int64_t n = int64_t(buf.size);                                            \
         {                                                                         \
             py::gil_scoped_release rel;                                           \
-            BWD_FN(fptr(x), fptr(dy), fptr_mut(dx), int64_t(buf.size));           \
+            BWD_FN(x_p, dy_p, dx_p, n);                                           \
         }                                                                         \
         return dx;                                                                \
     }
@@ -341,9 +376,12 @@ static py::array_t<float> embedding_forward_cpu(py::array_t<float> weight_in,
     std::vector<py::ssize_t> out_shape(ibuf.shape.begin(), ibuf.shape.end());
     out_shape.push_back(py::ssize_t(dim));
     auto out = alloc_f32(out_shape);
+    const float* w_p = fptr(w);
+    const int64_t* ids_p = iptr(ids);
+    float* out_p = fptr_mut(out);
     {
         py::gil_scoped_release rel;
-        tx::embedding_forward_cpu(fptr(w), iptr(ids), fptr_mut(out), n, dim, vocab);
+        tx::embedding_forward_cpu(w_p, ids_p, out_p, n, dim, vocab);
     }
     return out;
 }
@@ -354,15 +392,15 @@ static py::array_t<float> embedding_backward_cpu(py::array_t<float> dy_in,
     auto dy = ensure_f32(dy_in);
     auto ids = ensure_i64(ids_in);
     auto dweight = py::array_t<float>({py::ssize_t(vocab), py::ssize_t(dim)});
-    {
-        auto buf = dweight.request();
-        std::memset(buf.ptr, 0, sizeof(float) * buf.size);
-    }
+    auto dw_buf = dweight.request();
+    std::memset(dw_buf.ptr, 0, sizeof(float) * dw_buf.size);
     int64_t n = ids.request().size;
+    const float* dy_p = fptr(dy);
+    const int64_t* ids_p = iptr(ids);
+    float* dw_p = fptr_mut(dweight);
     {
         py::gil_scoped_release rel;
-        tx::embedding_backward_cpu(fptr(dy), iptr(ids), fptr_mut(dweight),
-                                   n, dim, vocab);
+        tx::embedding_backward_cpu(dy_p, ids_p, dw_p, n, dim, vocab);
     }
     return dweight;
 }
@@ -382,11 +420,13 @@ static py::tuple xent_forward_cpu(py::array_t<float> logits_in,
     auto log_probs = py::array_t<float>(lbuf.shape);
     int64_t valid = 0;
     float loss = 0.0f;
+    const float* logits_p = fptr(logits);
+    const int64_t* targets_p = iptr(targets);
+    float* lp_p = fptr_mut(log_probs);
     {
         py::gil_scoped_release rel;
         loss = tx::softmax_xent_forward_cpu(
-            fptr(logits), iptr(targets),
-            fptr_mut(log_probs), &valid, n, v, ignore_index);
+            logits_p, targets_p, lp_p, &valid, n, v, ignore_index);
     }
     return py::make_tuple(loss, log_probs, valid);
 }
@@ -403,12 +443,14 @@ static py::array_t<float> xent_backward_cpu(py::array_t<float> log_probs_in,
     int64_t n = 1;
     for (int i = 0; i < buf.ndim - 1; ++i) n *= buf.shape[i];
     auto dlogits = py::array_t<float>(buf.shape);
+    const float* lp_p = fptr(lp);
+    const int64_t* targets_p = iptr(targets);
+    float* dl_p = fptr_mut(dlogits);
     {
         py::gil_scoped_release rel;
-        tx::softmax_xent_backward_cpu(fptr(lp), iptr(targets),
+        tx::softmax_xent_backward_cpu(lp_p, targets_p,
                                       grad_loss, valid_count,
-                                      fptr_mut(dlogits),
-                                      n, v, ignore_index);
+                                      dl_p, n, v, ignore_index);
     }
     return dlogits;
 }

@@ -209,6 +209,7 @@ class DynamicTransformer(Module):
     # Reuse generation from DecoderOnlyModel.
     generate = DecoderOnlyModel.generate
     make_kv_caches = DecoderOnlyModel.make_kv_caches
+    _sample = staticmethod(DecoderOnlyModel._sample)
 
     # -------------------- adaptation --------------------
 

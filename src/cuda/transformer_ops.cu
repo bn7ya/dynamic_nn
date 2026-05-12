@@ -67,22 +67,21 @@ void matmul_batched_cuda(const float* a, const float* b, float* c,
     const float alpha = 1.0f, beta = 0.0f;
     cublasHandle_t handle = cublas_handle();
 
-    // For a typical attention layout the strides are uniform so we
-    // can use SgemmStridedBatched directly. When any stride is 0
-    // (broadcast) we fall back to per-batch Sgemm.
+    // For a typical attention layout the leading dims are contiguous
+    // (no broadcast). In that case we can use SgemmStridedBatched with
+    // a constant per-matrix stride of M*K (for a) and K*N (for b).
+    // When any stride is 0 (broadcast) we fall back to per-batch Sgemm.
     bool uniform = true;
-    int64_t a_stride = 0, b_stride = 0;
-    if (leading_rank > 0) {
-        a_stride = a_batch_strides[0];
-        b_stride = b_batch_strides[0];
-    }
-    for (int i = 1; i < leading_rank && uniform; ++i) {
-        // Each non-trivial leading axis must contribute a constant stride
-        // pattern. This holds when the leading dims have *no* broadcast.
+    for (int i = 0; i < leading_rank && uniform; ++i) {
         if (a_batch_strides[i] == 0 || b_batch_strides[i] == 0) {
             uniform = false;
         }
     }
+    // Per-matrix stride in elements. M and K are the *post-transpose*
+    // logical dims; the original matrix memory footprint equals M*K
+    // either way, so this is the correct contiguous stride.
+    const int64_t a_stride = M * K;
+    const int64_t b_stride = K * N;
 
     auto opA = transpose_a ? CUBLAS_OP_T : CUBLAS_OP_N;
     auto opB = transpose_b ? CUBLAS_OP_T : CUBLAS_OP_N;
