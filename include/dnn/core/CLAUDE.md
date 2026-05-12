@@ -13,7 +13,7 @@ flip an active mask instead of erasing weights — lives here.
 | File | Role |
 |---|---|
 | `tensor.hpp` | `Tensor<T>` storage, shape, basic ops. `[invariant]` shape semantics; `[hot]` data layout. |
-| `node.hpp` | `Node` (one neuron's metrics + adaptive `EfficiencyWeights`). `[invariant]` `w_alive=0.25` baseline. |
+| `node.hpp` | `Node` (one neuron's metrics + adaptive `EfficiencyWeights` + EMA-smoothed `efficiency_score()`). `[invariant]` `w_alive=0.25` baseline. |
 | `layer.hpp` | `Layer<T>` (dense forward/backward, soft `add_nodes` / `remove_nodes`, `compact()`, OpenMP batch loops). `[hot]` `[invariant]` |
 | `network.hpp` | `Network<T>` (chain of layers, `mark_layer_inactive`, `compact()`, `topology_version_`). `[invariant]` |
 | `activations.hpp` | ReLU / Sigmoid / Tanh / Softmax forward + backward. |
@@ -70,6 +70,17 @@ instantiations for `float` and `double`; behaviour lives in the headers.
   they reupload on the next forward — a future optimisation is to keep
   the optimizer step on device. `invalidate_gpu_active_mask_()` is the
   cheaper variant when only mask values changed.
+- **`Node::efficiency_score()` is EMA-smoothed with a warmup.**
+  `Node::compute_metrics()` returns the "unknown" default (0.5) until
+  `sample_count_ >= kMinSamplesForEfficiency` (16). After warmup, the
+  weighted variance/gradient/alive/contribution score is run through
+  an EMA (`kEmaAlpha = 0.2`) so a single noisy epoch can't trip the
+  layer-manager's shrink path. `smoothed_efficiency_` and
+  `smoothed_initialised_` are `mutable` because `compute_metrics()`
+  is `const`; same caching idiom as `Layer`'s forward tensors. The
+  EMA state is reset by `Node::reset_metrics()` alongside the
+  per-node counters — preserve that pairing or a new phase will
+  start training with stale smoothing.
 - **Per-node metrics are recorded from one row, not the full output.**
   `Layer::forward_cuda_dev` D2Hs only the first batch row of the
   pre-activation (output_size_ floats) for `record_activation`; the

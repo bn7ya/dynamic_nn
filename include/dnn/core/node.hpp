@@ -116,7 +116,9 @@ public:
         , gradient_sq_sum_(0.0)
         , contribution_sum_(0.0)
         , sample_count_(0)
-        , dead_count_(0) {}
+        , dead_count_(0)
+        , smoothed_efficiency_(0.5)
+        , smoothed_initialised_(false) {}
 
     // Identification
     size_t index() const { return index_; }
@@ -169,7 +171,15 @@ public:
     NodeMetrics compute_metrics() const {
         NodeMetrics metrics;
 
-        if (sample_count_ == 0) {
+        // Warmup: until we have enough recording events, treat the
+        // efficiency as "unknown" (0.5). This prevents random-init
+        // gradients < 0.1 from scoring nodes near zero in epoch 1 and
+        // triggering shrink decisions before the network has learned.
+        // sample_count_ counts recording events, which on CUDA equals
+        // batches (one D2H row per batch) and on the CPU rank-2 path
+        // also equals batches — so "kMinSamplesForEfficiency" is a
+        // coarse, device-agnostic warmup of ~16 events.
+        if (sample_count_ < kMinSamplesForEfficiency) {
             metrics.efficiency_score = 0.5;  // Unknown
             metrics.status = "unknown";
             return metrics;
@@ -210,6 +220,10 @@ public:
         contribution_sum_ = 0.0;
         sample_count_ = 0;
         dead_count_ = 0;
+        // Reset EMA so a new training phase re-seeds smoothing from the
+        // first post-reset observation rather than carrying stale state.
+        smoothed_efficiency_ = 0.5;
+        smoothed_initialised_ = false;
     }
 
     /**
@@ -294,13 +308,24 @@ private:
         double contribution_score = std::min(1.0, metrics.contribution_score / 0.1);
 
         // Weighted combination using adaptive weights
-        double efficiency =
+        double raw =
             weights_.w_variance * variance_score +
             weights_.w_gradient * gradient_score +
             weights_.w_alive * alive_score +
             weights_.w_contribution * contribution_score;
+        raw = std::max(0.0, std::min(1.0, raw));
 
-        return std::max(0.0, std::min(1.0, efficiency));
+        // EMA smoothing so one noisy epoch can't trip removal. Seeded
+        // with the first observed value to avoid the cold-start pull
+        // toward the 0.5 default.
+        if (!smoothed_initialised_) {
+            smoothed_efficiency_ = raw;
+            smoothed_initialised_ = true;
+        } else {
+            smoothed_efficiency_ =
+                kEmaAlpha * raw + (1.0 - kEmaAlpha) * smoothed_efficiency_;
+        }
+        return smoothed_efficiency_;
     }
 
     std::string determine_status(const NodeMetrics& metrics) const {
@@ -322,6 +347,17 @@ private:
         return "normal";
     }
 
+    // Number of recording events to accumulate before reporting a real
+    // efficiency score. Below this, compute_metrics() returns the
+    // "unknown" default (0.5). One recording event == one batch on CUDA
+    // and on the CPU rank-2 SIMD path, one sample on the legacy rank-1
+    // CPU path. 16 keeps the warmup short on either device.
+    static constexpr uint64_t kMinSamplesForEfficiency = 16;
+    // EMA smoothing factor on per-node efficiency. Effective window ~5
+    // observations at alpha=0.2, enough to absorb one noisy epoch
+    // without dampening genuine trends.
+    static constexpr double kEmaAlpha = 0.2;
+
     size_t index_;
     bool trainable_;
     float activation_;
@@ -335,6 +371,12 @@ private:
     double contribution_sum_;
     uint64_t sample_count_;
     uint64_t dead_count_;
+
+    // EMA-smoothed efficiency. `mutable` so that compute_efficiency_score
+    // (called from the const compute_metrics()) can update it; same
+    // pattern as Layer's cached forward/backward tensors.
+    mutable double smoothed_efficiency_;
+    mutable bool smoothed_initialised_;
 
     // Adaptive efficiency weights
     EfficiencyWeights weights_;

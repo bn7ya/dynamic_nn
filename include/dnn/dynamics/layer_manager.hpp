@@ -2,6 +2,7 @@
 
 #include "../core/network.hpp"
 #include "../exceptions/dnn_exception.hpp"
+#include "efficiency_tracker.hpp"
 #include "health_monitor.hpp"
 #include <memory>
 #include <vector>
@@ -25,6 +26,18 @@ struct LayerManagerConfig {
     double efficiency_threshold = 0.5;   // Below this, nodes are "inefficient"
     double saturation_threshold = 0.7;   // Above this, layer is saturated
     double redundancy_threshold = 0.01;  // Below this, a layer is redundant
+
+    // Local-maximum efficiency gate. Shrink decisions (RemoveNodes /
+    // RemoveLayer) are deferred until the per-epoch efficiency curve
+    // E(t) has reached a discrete local maximum (slope ~ 0, curvature
+    // <= 0) and a warmup + cooldown have elapsed. The gradient-descent
+    // analog: descent finds dC/dt -> 0 with d2C/dt2 > 0; we find
+    // dE/dt -> 0 with d2E/dt2 <= 0. Disable for legacy reproducibility.
+    bool shrink_requires_plateau = true;
+    std::size_t plateau_window = 10;            // W epochs in the slope window
+    double plateau_slope_epsilon = 1e-4;        // |dE/dt| flat-enough threshold
+    std::size_t min_epochs_before_shrink = 8;   // warmup (recording events)
+    std::size_t shrink_cooldown_epochs = 5;     // hysteresis between shrinks
 };
 
 /**
@@ -79,7 +92,9 @@ public:
         // parameters; user-overridable thresholds live in LayerManagerConfig.
         , sigmoid_k_(5.0)
         , sigmoid_base_(0.3)
-        , sigmoid_range_(0.5) {
+        , sigmoid_range_(0.5)
+        , shrink_requires_plateau_(config.shrink_requires_plateau)
+        , gate_(make_gate_config_(config)) {
         // Validate config consistency. The decision logic in
         // analyze_with_efficiency() compares against efficiency_threshold and
         // saturation_threshold; inverting them silently breaks add-vs-remove
@@ -104,6 +119,15 @@ public:
               config.redundancy_threshold <= 1.0)) {
             throw exceptions::InvalidArgumentException("redundancy_threshold",
                 "redundancy_threshold must be in [0, 1]");
+        }
+        if (config.plateau_window < 3) {
+            throw exceptions::InvalidArgumentException("plateau_window",
+                "plateau_window must be >= 3 (need >= 3 points for a "
+                "finite second difference)");
+        }
+        if (!(config.plateau_slope_epsilon >= 0.0)) {
+            throw exceptions::InvalidArgumentException("plateau_slope_epsilon",
+                "plateau_slope_epsilon must be non-negative");
         }
     }
 
@@ -136,6 +160,30 @@ public:
         sigmoid_base_ = base;
         sigmoid_range_ = range;
     }
+
+    /**
+     * Feed the per-epoch efficiency scalar into the local-maximum gate.
+     * Call once per epoch from the trainer, before analyze_with_efficiency().
+     */
+    void tick_efficiency(double current_efficiency) {
+        gate_.tick(current_efficiency);
+    }
+
+    /** Whether the gate currently detects a local maximum of E(t). */
+    bool plateau_detected() const { return gate_.is_at_local_max(); }
+
+    /** Least-squares slope of efficiency over the gate window. */
+    double efficiency_slope() const { return gate_.slope(); }
+
+    /** Mean second-difference estimate of efficiency curvature. */
+    double efficiency_curvature() const { return gate_.curvature(); }
+
+    /** Enable or disable the local-maximum shrink gate at runtime. */
+    void set_shrink_requires_plateau(bool enabled) {
+        shrink_requires_plateau_ = enabled;
+    }
+
+    bool shrink_requires_plateau() const { return shrink_requires_plateau_; }
 
     /**
      * Analyze network and recommend structural changes.
@@ -174,6 +222,11 @@ public:
 
         // Check if we should remove a layer
         if (should_remove_layer()) {
+            if (shrink_requires_plateau_ && !gate_.is_at_local_max()) {
+                decision.action = LayerDecision::Action::None;
+                decision.reason = "Deferred RemoveLayer: efficiency still climbing";
+                return decision;
+            }
             decision.action = LayerDecision::Action::RemoveLayer;
             decision.layer_index = find_least_efficient_layer();
             decision.reason = "Redundant layer detected";
@@ -201,6 +254,12 @@ public:
             if (layer_metrics.avg_node_efficiency < efficiency_threshold_ &&
                 layer_metrics.dead_nodes > 0 &&
                 network_.layer(i).num_nodes() > min_nodes_per_layer_) {
+
+                if (shrink_requires_plateau_ && !gate_.is_at_local_max()) {
+                    decision.action = LayerDecision::Action::None;
+                    decision.reason = "Deferred RemoveNodes: efficiency still climbing";
+                    return decision;
+                }
 
                 decision.action = LayerDecision::Action::RemoveNodes;
                 decision.layer_index = i;
@@ -243,6 +302,7 @@ public:
 
             case LayerDecision::Action::RemoveLayer:
                 remove_layer(decision.layer_index);
+                gate_.notify_shrink_fired();
                 break;
 
             case LayerDecision::Action::AddNodes:
@@ -251,6 +311,7 @@ public:
 
             case LayerDecision::Action::RemoveNodes:
                 remove_nodes(decision.layer_index, decision.nodes_to_remove);
+                gate_.notify_shrink_fired();
                 break;
 
             case LayerDecision::Action::None:
@@ -470,6 +531,15 @@ private:
         return (size_sim + eff_sim) / 2.0;
     }
 
+    static EfficiencyGateConfig make_gate_config_(const LayerManagerConfig& config) {
+        EfficiencyGateConfig gc;
+        gc.window = config.plateau_window;
+        gc.slope_epsilon = config.plateau_slope_epsilon;
+        gc.min_epochs_before_shrink = config.min_epochs_before_shrink;
+        gc.cooldown_epochs = config.shrink_cooldown_epochs;
+        return gc;
+    }
+
     Network<T>& network_;
     HealthMonitor<T>& health_monitor_;
     size_t min_layers_;
@@ -483,6 +553,8 @@ private:
     double sigmoid_k_;
     double sigmoid_base_;
     double sigmoid_range_;
+    bool shrink_requires_plateau_;
+    EfficiencyTracker gate_;
 };
 
 } // namespace dynamics

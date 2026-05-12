@@ -14,7 +14,8 @@ modify weights directly — they only call into `Layer<T>` /
 
 | File | Role |
 |---|---|
-| `layer_manager.hpp` | `LayerManager`: `analyze_with_efficiency()`, `execute(decision)`, `add_nodes` / `remove_nodes` / `add_layer` / `remove_layer` (all soft). `[hot]` `[invariant]` |
+| `layer_manager.hpp` | `LayerManager`: `analyze_with_efficiency()`, `execute(decision)`, `add_nodes` / `remove_nodes` / `add_layer` / `remove_layer` (all soft). Hosts the local-max shrink gate via `tick_efficiency` + `EfficiencyTracker`. `[hot]` `[invariant]` |
+| `efficiency_tracker.hpp` | `EfficiencyTracker` + `EfficiencyGateConfig`: sliding-window detector of local maxima of E(t) (slope ~ 0, curvature <= 0) used to defer shrink decisions. Pure host-side scalar math. |
 | `health_monitor.hpp` | Cancer / Alzheimer scores, "should we allow more growth / removal?" gates. `[hot]` |
 | `trainable_scheduler.hpp` | Schedules `Layer::set_trainable_fraction` over training. |
 
@@ -40,6 +41,22 @@ modify weights directly — they only call into `Layer<T>` /
 - **`HealthMonitor::allow_*` gates are advisory, not enforcement.**
   The manager calls them and skips the action when they return false.
   Honour the contract; don't bypass to "force" a mutation.
+- **Shrink decisions go through the local-max gate.** When
+  `LayerManagerConfig::shrink_requires_plateau == true` (default),
+  `analyze_with_efficiency()` defers `RemoveNodes` / `RemoveLayer`
+  decisions to `Action::None` unless the gate reports
+  `is_at_local_max()` — i.e. the efficiency time-series E(t) has a
+  flat slope (`|dE/dt| <= plateau_slope_epsilon`) and non-positive
+  curvature (`d2E/dt2 <= 0`) AND a warmup
+  (`min_epochs_before_shrink`) plus cooldown
+  (`shrink_cooldown_epochs`) have elapsed. The trainer must call
+  `LayerManager::tick_efficiency(eff)` once per epoch before the
+  decision call so the gate window stays current. `execute()`
+  notifies the gate on `RemoveNodes` / `RemoveLayer` so cooldowns
+  reset. Both `train_phased` and `train_phased_runtime` are wired;
+  preserve that. Setting `shrink_requires_plateau=false` recovers
+  the pre-gate behaviour bit-for-bit (documented exception, same
+  pattern as `dynamic_thresholds`).
 
 ## Maintenance notes
 

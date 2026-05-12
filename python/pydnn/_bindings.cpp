@@ -516,7 +516,19 @@ PYBIND11_MODULE(_dnn_core, m) {
         .def(py::init<>())
         .def_readwrite("efficiency_threshold", &dynamics::LayerManagerConfig::efficiency_threshold)
         .def_readwrite("saturation_threshold", &dynamics::LayerManagerConfig::saturation_threshold)
-        .def_readwrite("redundancy_threshold", &dynamics::LayerManagerConfig::redundancy_threshold);
+        .def_readwrite("redundancy_threshold", &dynamics::LayerManagerConfig::redundancy_threshold)
+        // Local-maximum efficiency gate (default-on; opt out via
+        // shrink_requires_plateau=False for legacy reproducibility).
+        .def_readwrite("shrink_requires_plateau",
+                       &dynamics::LayerManagerConfig::shrink_requires_plateau)
+        .def_readwrite("plateau_window",
+                       &dynamics::LayerManagerConfig::plateau_window)
+        .def_readwrite("plateau_slope_epsilon",
+                       &dynamics::LayerManagerConfig::plateau_slope_epsilon)
+        .def_readwrite("min_epochs_before_shrink",
+                       &dynamics::LayerManagerConfig::min_epochs_before_shrink)
+        .def_readwrite("shrink_cooldown_epochs",
+                       &dynamics::LayerManagerConfig::shrink_cooldown_epochs);
 
     // Reward / penalty + emotional-state thresholds (was constructed locally in Phase 3)
     py::class_<training::RewardPenaltyConfig>(m, "RewardPenaltyConfig")

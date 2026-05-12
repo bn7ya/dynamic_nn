@@ -119,6 +119,8 @@ how to engage it.
 | Adaptive learning hyperparameters | [`include/dnn/training/runtime/`](include/dnn/training/runtime/CLAUDE.md) | Active when `runtime_enabled=True` |
 | Reward/penalty + emotional state | [`include/dnn/training/`](include/dnn/training/CLAUDE.md) | Always on in Phase 3 |
 | Layer/node efficiency tracking | [`include/dnn/dynamics/`](include/dnn/dynamics/CLAUDE.md) | Always on; drives architecture mutation |
+| Local-maximum efficiency gate (defers shrinks until E(t) plateaus) | [`include/dnn/dynamics/`](include/dnn/dynamics/CLAUDE.md) | **On by default**; `TrainerConfig.layer_manager_config.shrink_requires_plateau = False` to opt out |
+| Per-node efficiency EMA + sample warmup | [`include/dnn/core/`](include/dnn/core/CLAUDE.md) | Always on; `Node::kEmaAlpha=0.2`, `kMinSamplesForEfficiency=16` |
 | Cancer / Alzheimer health monitoring | [`include/dnn/dynamics/`](include/dnn/dynamics/CLAUDE.md) | Always on; thresholds in `TrainerConfig` |
 | SIMD CPU acceleration (AVX/AVX2/AVX512/SSE) | [`include/dnn/simd/`](include/dnn/simd/CLAUDE.md) | Auto-detected at runtime |
 | OpenMP parallelism (CPU batch loops, matmul) | [`include/dnn/simd/`](include/dnn/simd/CLAUDE.md) | Compile-time `DNN_HAS_OPENMP` |

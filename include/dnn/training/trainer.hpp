@@ -436,6 +436,11 @@ public:
             double epoch_cost = train_epoch_with_lr(norm_inputs, norm_targets, exploration_lr);
             result.cost_history.push_back(epoch_cost);
 
+            // Feed the per-epoch efficiency scalar to the local-maximum
+            // gate before any shrink decision can fire this epoch.
+            double efficiency = compute_efficiency(result.cost_history);
+            layer_manager_.tick_efficiency(efficiency);
+
             // Aggressive architecture exploration with low threshold
             auto decision = layer_manager_.analyze_with_efficiency(0.3);  // Low threshold
             if (decision.action != dynamics::LayerDecision::Action::None) {
@@ -457,7 +462,6 @@ public:
             result.alzheimer_score_history.push_back(health.alzheimer_score);
             result.architecture_history.emplace_back(network_.num_layers(), network_.num_nodes());
 
-            double efficiency = compute_efficiency(result.cost_history);
             result.efficiency_history.push_back(efficiency);
 
             if (epoch_cost < result.best_cost) {
@@ -494,6 +498,9 @@ public:
 
             double efficiency = compute_efficiency(result.cost_history);
             result.efficiency_history.push_back(efficiency);
+            // Keep the gate's window warm during Phase 2 (estimation,
+            // no mutations) so its warmup is satisfied by Phase 3 start.
+            layer_manager_.tick_efficiency(efficiency);
 
             // Adapt efficiency weights based on gradient statistics
             for (size_t l = 0; l < network_.num_layers(); ++l) {
@@ -537,6 +544,11 @@ public:
 
             double epoch_cost = train_epoch_with_lr(norm_inputs, norm_targets, main_lr);
             result.cost_history.push_back(epoch_cost);
+
+            // Tick the local-maximum gate with the same efficiency value
+            // analyze_with_efficiency() will see, so the gate reflects
+            // the same signal that drives the decision.
+            layer_manager_.tick_efficiency(efficiency);
 
             // Layer adjustment with adaptive threshold
             auto decision = layer_manager_.analyze_with_efficiency(efficiency);
@@ -628,6 +640,9 @@ public:
                 // Track metrics
                 double efficiency = compute_efficiency(result.cost_history);
                 result.efficiency_history.push_back(efficiency);
+                // Phase 4 is architecture-frozen, but keep ticking the
+                // gate so its window stays coherent.
+                layer_manager_.tick_efficiency(efficiency);
 
                 auto health = health_monitor_.diagnose();
                 result.cancer_score_history.push_back(health.cancer_score);
@@ -787,6 +802,15 @@ public:
             return efficiency;
         };
 
+        // Feed the local-maximum gate with this epoch's efficiency so
+        // analyze_with_efficiency() can defer shrinks until E(t) has
+        // plateaued. Used by both Phase 1 and Phase 3 of the runtime
+        // path; Phase 4 keeps architecture frozen but still ticks for
+        // window coherency.
+        auto tick_efficiency_gate = [&](double efficiency) {
+            layer_manager_.tick_efficiency(efficiency);
+        };
+
         // ============ PHASE 1: EXPLORATION ============
         auto phase1_start = std::chrono::high_resolution_clock::now();
         const size_t phase1_epochs =
@@ -799,6 +823,8 @@ public:
                 double lr = adaptive_cfg.exploration_lr.current();
                 double epoch_cost = train_epoch_with_lr(norm_inputs, norm_targets, lr);
                 result.cost_history.push_back(epoch_cost);
+
+                tick_efficiency_gate(compute_efficiency(result.cost_history));
 
                 double sat = adaptive_cfg.exploration_saturation_threshold.current();
                 auto decision = layer_manager_.analyze_with_efficiency(sat);
@@ -848,6 +874,7 @@ public:
                 estimation_costs.push_back(epoch_cost);
                 result.cost_history.push_back(epoch_cost);
                 double efficiency = record_epoch_metrics(epoch_cost);
+                tick_efficiency_gate(efficiency);
                 for (size_t l = 0; l < network_.num_layers(); ++l) {
                     network_.layer(l).adapt_node_weights();
                 }
@@ -917,6 +944,7 @@ public:
                         train_epoch_with_lr(norm_inputs, norm_targets, main_lr);
                     result.cost_history.push_back(epoch_cost);
 
+                    tick_efficiency_gate(efficiency_pre);
                     auto decision = layer_manager_.analyze_with_efficiency(efficiency_pre);
                     if (decision.action != dynamics::LayerDecision::Action::None) {
                         auto wlock = topo_lock.write_lock();
@@ -983,6 +1011,7 @@ public:
                         rewind_costs.push_back(c);
                         result.cost_history.push_back(c);
                         double e = record_epoch_metrics(c);
+                        tick_efficiency_gate(e);
                         controller.publish_metric(rt::StageId::Estimation,
                                                   epoch_in_stage, c, e,
                                                   lr, network_.topology_version());
@@ -1027,6 +1056,7 @@ public:
                         train_epoch_with_lr(norm_inputs, norm_targets, phase4_lr);
                     result.cost_history.push_back(epoch_cost);
                     double efficiency = record_epoch_metrics(epoch_cost);
+                    tick_efficiency_gate(efficiency);
 
                     if (epoch_cost < phase4_best_cost - config_.phase4_min_improvement) {
                         phase4_best_cost = epoch_cost;
