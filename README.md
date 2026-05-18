@@ -1,4 +1,4 @@
-# pydnn — Dynamic Neural Network
+# ElasticAI — Dynamic Neural Network
 
 A neural network that **grows and prunes itself during training**. It starts small, watches how much useful signal each neuron carries, and reshapes its own architecture as it learns: adding capacity where the network needs it, removing it where it doesn't.
 
