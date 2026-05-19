@@ -82,6 +82,18 @@ sequential body and the helpers shared between both paths.
   rewinds, Phase 1 reactivation), the place is
   `trainer.hpp` `train_phased_runtime` and the observer in
   [runtime/CLAUDE.md](runtime/CLAUDE.md).
+- The optimizer family is now wired. `Trainer::apply_gradients_step()`
+  replaces the direct `network_.apply_gradients(lr)` call in
+  `train_epoch`. Default `TrainerConfig::use_optimizer=false` keeps the
+  legacy inline-SGD path bit-for-bit. When true, each CPU layer's
+  update routes through a per-layer `Optimizer<T>` built from
+  `optimizer_config` (the optimizer's own clipping is disabled since
+  `clip_gradients()` runs first). CUDA layers keep the on-device legacy
+  step (device-path optimizer wiring is a CUDA-host follow-up). Per-
+  layer optimizer state is rebuilt on `topology_version_` change (1.11
+  adds overlap-preserving resize). New `TrainerConfig` fields
+  `use_optimizer` / `optimizer_config` are additive — add the matching
+  `_bindings.cpp` rows in a pybind-host session.
 - `Trainer::apply_random_perturbation(fraction)` is now implemented
   (was a no-op that still incremented `result.perturbations_applied`).
   It picks `max(1, total_nodes*fraction)` random (layer, active-node)

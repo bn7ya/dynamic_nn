@@ -293,6 +293,7 @@ if(DNN_BUILD_TESTS)
         tests/cpp/test_simd.cpp
         tests/cpp/test_pool_allocator.cpp
         tests/cpp/test_layer.cpp
+        tests/cpp/test_optimizer.cpp
     )
     target_link_libraries(dnn_tests PRIVATE dnn_core GTest::gtest_main)
 

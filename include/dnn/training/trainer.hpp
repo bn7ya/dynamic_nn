@@ -3,6 +3,7 @@
 #include "../core/network.hpp"
 #include "../core/tensor.hpp"
 #include "cost_functions.hpp"
+#include "optimizer.hpp"
 #include "batch_manager.hpp"
 #include "early_stopping.hpp"
 #include "emotional_state.hpp"
@@ -162,6 +163,14 @@ struct TrainerConfig {
     // Phase-3 random perturbation: stddev of the zero-mean Gaussian
     // noise added to a perturbed node's weight row.
     double perturbation_scale = 0.01;
+
+    // Optimizer. Default keeps the legacy inline-SGD path
+    // (network_.apply_gradients) bit-for-bit. Set use_optimizer=true to
+    // route the weight update through optimizer_config (Adam/Momentum/
+    // RMSprop/SGD). The optimizer's own clipping is disabled — the
+    // trainer's clip_gradients() already runs before the step.
+    bool use_optimizer = false;
+    OptimizerConfig optimizer_config;
 
     // Normalization (auto-normalize data even if not pre-normalized)
     NormalizationConfig normalization;
@@ -1328,7 +1337,7 @@ public:
 
             // Apply gradients
             T lr = static_cast<T>(learning_rate_ / batch_inputs.size());
-            network_.apply_gradients(lr);
+            apply_gradients_step(lr);
         }
 
         return total_cost / num_batches;
@@ -1466,6 +1475,54 @@ private:
         if (clip <= T(0)) return;
         for (auto& layer : network_.layers()) {
             layer->clip_gradients(clip);
+        }
+    }
+
+    /**
+     * Weight-update step. Default (use_optimizer=false) keeps the legacy
+     * inline-SGD path bit-for-bit. When enabled, routes each CPU layer's
+     * update through a per-layer Optimizer (Adam/Momentum/RMSprop/SGD).
+     * CUDA layers keep the on-device legacy step (optimizer wiring on the
+     * device path is a CUDA-host follow-up). Optimizer state is rebuilt
+     * when the topology version changes (1.11 adds overlap-preserving
+     * resize).
+     */
+    void apply_gradients_step(T lr) {
+        if (!config_.use_optimizer) {
+            network_.apply_gradients(lr);
+            return;
+        }
+
+        auto& layers = network_.layers();
+        const uint64_t tv = network_.topology_version();
+        if (optimizers_.size() != layers.size() ||
+            tv != optimizer_topology_version_) {
+            OptimizerConfig oc = config_.optimizer_config;
+            oc.enable_gradient_clipping = false;  // clip_gradients() owns this
+            optimizers_.clear();
+            optimizers_.reserve(layers.size());
+            for (size_t i = 0; i < layers.size(); ++i) {
+                optimizers_.push_back(Optimizer<T>::create(oc));
+                optimizers_[i]->initialize(layers[i]->weights().size(),
+                                           layers[i]->biases().size());
+            }
+            optimizer_topology_version_ = tv;
+        }
+
+        for (size_t i = 0; i < layers.size(); ++i) {
+            core::Layer<T>& layer = *layers[i];
+#ifdef DNN_ENABLE_CUDA
+            if (layer.device() == core::Device::CUDA) {
+                layer.apply_gradients(lr);  // legacy on-device step
+                continue;
+            }
+#endif
+            if (layer.weight_gradients().empty()) continue;
+            optimizers_[i]->set_learning_rate(lr);
+            optimizers_[i]->update(layer.weights(), layer.biases(),
+                                   layer.weight_gradients(),
+                                   layer.bias_gradients());
+            layer.zero_gradients();
         }
     }
 
@@ -1617,6 +1674,8 @@ private:
     core::Random perturb_rng_;
     EpochCallback<T> epoch_callback_;
     NormalizationParams<T> norm_params_;
+    std::vector<std::unique_ptr<Optimizer<T>>> optimizers_;
+    uint64_t optimizer_topology_version_ = UINT64_MAX;
 };
 
 // Out-of-line definition of RuntimeAdaptiveConfig::apply_static_config.
