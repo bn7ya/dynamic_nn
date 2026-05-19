@@ -156,6 +156,10 @@ struct TrainerConfig {
     // Health monitoring
     double cancer_threshold = 0.7;
     double alzheimer_threshold = 0.7;
+    // Rolling window (number of structural-change events) the
+    // cancer/alzheimer scores look back over. Default 50; raise for
+    // long Phase-3 runs so slow chronic growth stays visible.
+    size_t health_history_window = 50;
 
     // Numerical stability
     double gradient_clip_value = 1.0;
@@ -258,7 +262,9 @@ public:
         , cost_type_(cost_type)
         , cost_function_(CostFunction<T>::create(cost_type))
         , batch_manager_(config.batch_config)
-        , health_monitor_(network, config.cancer_threshold, config.alzheimer_threshold)
+        , health_monitor_(network, config.cancer_threshold,
+                          config.alzheimer_threshold,
+                          config.health_history_window)
         , layer_manager_(network, health_monitor_, config.layer_manager_config)
         , trainable_scheduler_(network, config.trainable_config)
         , early_stopping_(config.patience, config.min_improvement,
@@ -1162,15 +1168,6 @@ public:
         return cost;
     }
 
-    /**
-     * Compute efficiency from cost history.
-     */
-    double compute_efficiency(const std::vector<double>& cost_history) const {
-        if (cost_history.size() < 2) return 0.5;
-        double improvement = (cost_history[cost_history.size() - 2] - cost_history.back()) /
-                            (cost_history[cost_history.size() - 2] + 1e-8);
-        return std::min(1.0, std::max(0.0, 0.5 + improvement * 10.0));
-    }
 
     /**
      * Compute sigmoid-based adaptive saturation threshold.
@@ -1767,6 +1764,14 @@ inline void runtime::RuntimeAdaptiveConfig::apply_static_config(
 
     cancer_threshold.set(cfg.cancer_threshold);
     alzheimer_threshold.set(cfg.alzheimer_threshold);
+
+    phase4_lr_decay_rate.set(cfg.phase4_lr_decay_rate);
+    phase4_lr_decay_interval.set(
+        static_cast<double>(cfg.phase4_lr_decay_interval));
+    phase4_batch_size.set(static_cast<double>(cfg.phase4_batch_size));
+    layer_adjustment_interval.set(
+        static_cast<double>(cfg.layer_adjustment_interval));
+    enable_dynamic_layers.set(cfg.enable_dynamic_layers ? 1.0 : 0.0);
 
     const auto& rp = cfg.reward_penalty_config;
     cost_improvement_threshold.set(rp.cost_improvement_threshold);

@@ -131,6 +131,10 @@ instantiations for `float` and `double`; behaviour lives in the headers.
 - `Layer<T>::clone()` copies `active_mask_`, `layer_active_`,
   `topology_version_`. New per-layer state must be added here too or
   inherit-based features (`Network::inherit_from`) lose state.
+- `Layer<T>::clone()` is documented to copy inference state only (no
+  gradients / forward caches / GPU mirrors). `clone_with_state()`
+  additionally copies the host gradient accumulators for checkpointing
+  a mid-training run.
 - `Network<T>::clone()` copies `state_`, `topology_version_`, and
   `training_in_progress_`. The last is deliberate: a clone of an
   in-training network must also refuse `compact()`. The clone is for

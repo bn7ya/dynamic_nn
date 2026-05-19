@@ -1310,7 +1310,17 @@ public:
     }
 
     /**
-     * Clone the layer.
+     * Clone the layer's *inference* state.
+     *
+     * Copies: weights_, biases_, nodes_ (per-node metrics/efficiency
+     * weights), active_mask_, layer_active_, topology_version_.
+     *
+     * Does NOT copy: weight_gradients_ / bias_gradients_, the forward
+     * caches (cached_input_/pre_activation_/output_), or any GPU
+     * mirrors. A clone taken mid-training therefore has no gradient
+     * state — it is intended for inheritance / inference, not for
+     * resuming a backward pass. Use clone_with_state() if you need the
+     * gradient accumulators (e.g. checkpointing a training run).
      */
     std::unique_ptr<Layer> clone() const {
         auto copy = std::make_unique<Layer>(input_size_, output_size_,
@@ -1321,6 +1331,19 @@ public:
         copy->active_mask_ = active_mask_;
         copy->layer_active_ = layer_active_;
         copy->topology_version_ = topology_version_;
+        return copy;
+    }
+
+    /**
+     * Like clone(), additionally copying the host gradient accumulators
+     * (weight_gradients_ / bias_gradients_) so a checkpoint can resume
+     * mid-training. GPU mirrors and forward caches are still not copied
+     * (they are rebuilt lazily on the next forward).
+     */
+    std::unique_ptr<Layer> clone_with_state() const {
+        auto copy = clone();
+        copy->weight_gradients_ = weight_gradients_.clone();
+        copy->bias_gradients_ = bias_gradients_.clone();
         return copy;
     }
 

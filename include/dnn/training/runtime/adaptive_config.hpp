@@ -139,6 +139,15 @@ struct RuntimeAdaptiveConfig {
     AdaptiveScalar cancer_threshold   {0.7, 0.1,  0.99};
     AdaptiveScalar alzheimer_threshold{0.7, 0.1,  0.99};
 
+    // Phase-4 / dynamic-layer knobs. Previously silently dropped on the
+    // runtime path (apply_static_config didn't map them); now carried
+    // through. enable_dynamic_layers is encoded as 0.0/1.0.
+    AdaptiveScalar phase4_lr_decay_rate    {0.95, 0.01, 1.0};
+    AdaptiveScalar phase4_lr_decay_interval{10.0, 1.0,  1000.0};
+    AdaptiveScalar phase4_batch_size       {64.0, 1.0,  8192.0};
+    AdaptiveScalar layer_adjustment_interval{10.0, 1.0, 1000.0};
+    AdaptiveScalar enable_dynamic_layers   {1.0,  0.0,  1.0};
+
     /**
      * Reset every scalar to its default value. Used when the controller
      * decides to fully restart a stage rather than nudge it.

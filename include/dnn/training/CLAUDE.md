@@ -113,6 +113,18 @@ sequential body and the helpers shared between both paths.
   — add the matching row in `_bindings.cpp` in a pybind-host session.
   Phase 3 cost trajectory now genuinely changes when perturbation
   fires (expected, Tier 1).
+- There is now a single `compute_efficiency` definition — the
+  windowed-sigmoid free function in `emotional_state.hpp`. The
+  trainer's local 2-point member was deleted (3.2); unqualified calls
+  resolve to the free function. Efficiency values (hence some
+  decisions) differ from the old member formula — Tier-3 behaviour
+  change, record a fresh baseline if bisecting.
+- `apply_static_config` now also maps `phase4_lr_decay_rate`,
+  `phase4_lr_decay_interval`, `phase4_batch_size`,
+  `layer_adjustment_interval`, `enable_dynamic_layers` (0/1) into new
+  `RuntimeAdaptiveConfig` `AdaptiveScalar`s (3.7) — previously silently
+  dropped on the runtime path. New `TrainerConfig::health_history_window`
+  (default 50) is additive — flag `_bindings.cpp` for pybind host.
 - `Trainer::evaluate` now uses the batched rank-2 forward when
   `batched_train_forward` is true (no backward), matching `train_epoch`.
   Numerically equivalent to the per-sample loop modulo matmul summation

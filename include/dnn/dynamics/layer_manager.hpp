@@ -6,6 +6,8 @@
 #include "health_monitor.hpp"
 #include <memory>
 #include <vector>
+#include <unordered_map>
+#include <cmath>
 
 namespace dnn {
 namespace dynamics {
@@ -407,6 +409,12 @@ public:
     void set_efficiency_threshold(double threshold) { efficiency_threshold_ = threshold; }
     void set_saturation_threshold(double threshold) { saturation_threshold_ = threshold; }
 
+    // Test/inspection hook for the functional-similarity engine.
+    static double linear_cka(const core::Tensor<T>& A,
+                             const core::Tensor<T>& B, size_t n) {
+        return linear_cka_(A, B, n);
+    }
+
 private:
     bool should_add_layer() const {
         return should_add_layer_adaptive(saturation_threshold_);
@@ -515,20 +523,93 @@ private:
         return std::max(min_nodes_per_layer_, new_size);
     }
 
+    /**
+     * Functional similarity of two layers via linear CKA (Centered
+     * Kernel Alignment) of their activations on a fixed random probe
+     * batch. CKA is invariant to orthogonal transforms and isotropic
+     * scaling and works across differing widths, so two same-size /
+     * same-efficiency layers that compute *different* functions score
+     * low (and are no longer collapsed). Cached per
+     * (i, j, topology_version) so it doesn't run every epoch.
+     */
     double compute_layer_similarity(size_t i, size_t j) const {
-        // Simplified similarity based on size and efficiency
-        auto metrics_i = network_.layer(i).compute_metrics();
-        auto metrics_j = network_.layer(j).compute_metrics();
+        const uint64_t tv = network_.topology_version();
+        const uint64_t key = (static_cast<uint64_t>(i) << 40) ^
+                             (static_cast<uint64_t>(j) << 20) ^ tv;
+        auto it = sim_cache_.find(key);
+        if (it != sim_cache_.end()) return it->second;
 
-        double size_sim = 1.0 - std::abs(
-            static_cast<double>(network_.layer(i).output_size()) /
-            static_cast<double>(network_.layer(j).output_size()) - 1.0);
-        size_sim = std::max(0.0, size_sim);
+        const size_t B = 16;
+        core::Random rng(0xC0FFEE);  // deterministic probe
+        // Compute the layer's linear response (W x + b) directly from
+        // its parameters — never call forward(): that records per-node
+        // activation metrics and would pollute the very efficiency
+        // state these decisions read (observers don't mutate observed
+        // state).
+        auto probe = [&](size_t layer_idx) {
+            const auto& L = network_.layer(layer_idx);
+            const auto& W = L.weights();   // (out, in)
+            const auto& bs = L.biases();   // (out,)
+            size_t in = L.input_size();
+            size_t out = L.output_size();
+            core::Tensor<T> resp(std::vector<size_t>{B, out});
+            for (size_t r = 0; r < B; ++r) {
+                std::vector<T> xr(in);
+                for (size_t c = 0; c < in; ++c)
+                    xr[c] = rng.template normal<T>(T(0), T(1));
+                for (size_t o = 0; o < out; ++o) {
+                    T s = bs[o];
+                    for (size_t c = 0; c < in; ++c) s += W.at(o, c) * xr[c];
+                    resp.at(r, o) = s;
+                }
+            }
+            return resp;
+        };
 
-        double eff_sim = 1.0 - std::abs(
-            metrics_i.avg_node_efficiency - metrics_j.avg_node_efficiency);
+        core::Tensor<T> A = probe(i);
+        core::Tensor<T> Bm = probe(j);
+        double sim = linear_cka_(A, Bm, B);
+        sim = std::max(0.0, std::min(1.0, sim));
+        sim_cache_[key] = sim;
+        return sim;
+    }
 
-        return (size_sim + eff_sim) / 2.0;
+    // Linear CKA = ||Ac^T Bc||_F^2 / (||Ac^T Ac||_F ||Bc^T Bc||_F),
+    // with columns (features) mean-centred. Dimension-agnostic.
+    static double linear_cka_(const core::Tensor<T>& A,
+                              const core::Tensor<T>& B, size_t n) {
+        if (A.rank() != 2 || B.rank() != 2) return 0.0;
+        const size_t da = A.shape()[1], db = B.shape()[1];
+        std::vector<double> Ac(n * da), Bc(n * db);
+        for (size_t c = 0; c < da; ++c) {
+            double m = 0.0;
+            for (size_t r = 0; r < n; ++r) m += A.at(r, c);
+            m /= n;
+            for (size_t r = 0; r < n; ++r) Ac[r * da + c] = A.at(r, c) - m;
+        }
+        for (size_t c = 0; c < db; ++c) {
+            double m = 0.0;
+            for (size_t r = 0; r < n; ++r) m += B.at(r, c);
+            m /= n;
+            for (size_t r = 0; r < n; ++r) Bc[r * db + c] = B.at(r, c) - m;
+        }
+        auto cross_fro2 = [&](const std::vector<double>& X, size_t dx,
+                              const std::vector<double>& Y, size_t dy) {
+            double acc = 0.0;
+            for (size_t p = 0; p < dx; ++p)
+                for (size_t q = 0; q < dy; ++q) {
+                    double s = 0.0;
+                    for (size_t r = 0; r < n; ++r)
+                        s += X[r * dx + p] * Y[r * dy + q];
+                    acc += s * s;
+                }
+            return acc;
+        };
+        double xy = cross_fro2(Ac, da, Bc, db);
+        double xx = cross_fro2(Ac, da, Ac, da);
+        double yy = cross_fro2(Bc, db, Bc, db);
+        double denom = std::sqrt(xx) * std::sqrt(yy);
+        return denom > 1e-12 ? xy / denom : 0.0;
     }
 
     static EfficiencyGateConfig make_gate_config_(const LayerManagerConfig& config) {
@@ -555,6 +636,7 @@ private:
     double sigmoid_range_;
     bool shrink_requires_plateau_;
     EfficiencyTracker gate_;
+    mutable std::unordered_map<uint64_t, double> sim_cache_;
 };
 
 } // namespace dynamics

@@ -60,6 +60,18 @@ modify weights directly — they only call into `Layer<T>` /
 
 ## Maintenance notes
 
+- `compute_layer_similarity(i, j)` is now functional: linear CKA of
+  the two layers' linear responses (`Wx+b`) to a fixed deterministic
+  random probe, cached per `(i, j, topology_version)`. It computes the
+  response directly from `weights()`/`biases()` and never calls
+  `forward()` — `forward()` records per-node activation metrics and
+  would pollute the efficiency state these decisions read. Two
+  same-size/same-efficiency but functionally different layers now
+  score low and are no longer collapsed. `LayerManager::linear_cka`
+  is a public test hook.
+- `HealthMonitor`'s rolling window is now a constructor parameter
+  surfaced as `TrainerConfig::health_history_window` (default 50).
+  Raise it for long Phase-3 runs so slow chronic growth stays visible.
 - `analyze_with_efficiency(threshold)` returns a single
   `LayerDecision`. If multiple layers want to mutate in the same
   epoch, only the highest-priority one fires. This is intentional
