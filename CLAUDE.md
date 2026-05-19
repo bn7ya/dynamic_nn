@@ -156,6 +156,10 @@ cmake -S . -B build_test \
     -DDNN_BUILD_EXAMPLES=OFF
 cmake --build build_test -j
 
+# C++ unit tests (GoogleTest is auto-fetched if no system GTest;
+# first configure needs github egress). See tests/CLAUDE.md.
+ctest --test-dir build_test --output-on-failure
+
 # Python extension build (requires pybind11)
 PYBIND11_DIR="$(python3 -c 'import pybind11; print(pybind11.get_cmake_dir())')"
 cmake -S . -B build_smoke \
