@@ -937,14 +937,21 @@ public:
     void compute_initial_variance_zscores() {
         if (nodes_.empty()) return;
 
-        // Collect all node variances
+        // Collect variances of active nodes only. Inactive (soft-removed)
+        // nodes never see activations, so their default-zero variance
+        // would skew the mean/std and make active nodes look like outliers.
+        std::vector<size_t> active_idx;
         std::vector<double> variances;
+        active_idx.reserve(nodes_.size());
         variances.reserve(nodes_.size());
 
-        for (const auto& node : nodes_) {
-            auto metrics = node.compute_metrics();
-            variances.push_back(metrics.activation_variance);
+        for (size_t i = 0; i < nodes_.size(); ++i) {
+            if (!is_node_active(i)) continue;
+            active_idx.push_back(i);
+            variances.push_back(nodes_[i].compute_metrics().activation_variance);
         }
+
+        if (variances.empty()) return;
 
         // Compute mean
         double sum = 0.0;
@@ -965,10 +972,10 @@ public:
             std_dev = 1e-8;
         }
 
-        // Compute z-scores and adapt variance weights
-        for (size_t i = 0; i < nodes_.size(); ++i) {
-            double z = (variances[i] - mean) / std_dev;
-            nodes_[i].adapt_variance_weight(z);
+        // Compute z-scores and adapt variance weights (active nodes only)
+        for (size_t k = 0; k < active_idx.size(); ++k) {
+            double z = (variances[k] - mean) / std_dev;
+            nodes_[active_idx[k]].adapt_variance_weight(z);
         }
     }
 
@@ -979,13 +986,17 @@ public:
     double compute_gradient_threshold() const {
         if (nodes_.empty()) return 0.1;
 
+        // Active nodes only: inactive nodes have no gradient history and
+        // would drag the threshold toward zero.
         std::vector<double> grad_mags;
         grad_mags.reserve(nodes_.size());
 
-        for (const auto& node : nodes_) {
-            auto metrics = node.compute_metrics();
-            grad_mags.push_back(metrics.gradient_magnitude_avg);
+        for (size_t i = 0; i < nodes_.size(); ++i) {
+            if (!is_node_active(i)) continue;
+            grad_mags.push_back(nodes_[i].compute_metrics().gradient_magnitude_avg);
         }
+
+        if (grad_mags.empty()) return 0.1;
 
         // Compute mean
         double sum = 0.0;
@@ -1018,8 +1029,9 @@ public:
      * Should be called each epoch after training.
      */
     void adapt_node_weights() {
-        for (auto& node : nodes_) {
-            node.adapt_gradient_weight();
+        for (size_t i = 0; i < nodes_.size(); ++i) {
+            if (!is_node_active(i)) continue;
+            nodes_[i].adapt_gradient_weight();
         }
     }
 
