@@ -82,6 +82,14 @@ sequential body and the helpers shared between both paths.
   rewinds, Phase 1 reactivation), the place is
   `trainer.hpp` `train_phased_runtime` and the observer in
   [runtime/CLAUDE.md](runtime/CLAUDE.md).
+- `Trainer::clip_gradients()` is now implemented (was a no-op). It
+  iterates `network_.layers()` and calls `Layer::clip_gradients(value)`,
+  which clamps the accumulated gradients in place to
+  `[-gradient_clip_value, +gradient_clip_value]` — the GPU gradient
+  mirrors on the CUDA path, the host accumulators otherwise. It runs
+  after backward and before `apply_gradients`. `enable_gradient_clipping`
+  defaults to `true`, so training output changed vs the old no-op
+  baseline; record a fresh reference if you bisect on cost trajectory.
 - `BatchManager`'s adaptive growth is gated by epoch and efficiency
   thresholds. If you add a new growth trigger, do it inside
   `BatchManager` so both training paths get it for free.

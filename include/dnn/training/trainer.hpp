@@ -1435,9 +1435,11 @@ private:
     }
 
     void clip_gradients() {
-        // Simple gradient clipping by value
-        // In a full implementation, we'd access the accumulated gradients
-        // For now, this is a placeholder
+        const T clip = static_cast<T>(config_.gradient_clip_value);
+        if (clip <= T(0)) return;
+        for (auto& layer : network_.layers()) {
+            layer->clip_gradients(clip);
+        }
     }
 
     /**

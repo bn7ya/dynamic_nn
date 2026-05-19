@@ -745,6 +745,40 @@ public:
      * Apply accumulated gradients and update weights.
      * @param learning_rate Learning rate for update
      */
+    /**
+     * Clamp every accumulated gradient element to [-clip_value,
+     * +clip_value]. Clips the same buffers apply_gradients() will
+     * consume: the GPU gradient mirrors on the CUDA path, the host
+     * accumulators on the CPU path.
+     */
+    void clip_gradients(T clip_value) {
+        if (clip_value <= T(0)) return;
+#ifdef DNN_ENABLE_CUDA
+        if (device_ == Device::CUDA && gpu_weight_gradients_
+            && gpu_bias_gradients_) {
+            cuda::launch_gradient_clip(
+                static_cast<T*>(gpu_weight_gradients_->device_data()),
+                clip_value, gpu_weight_gradients_->size());
+            cuda::launch_gradient_clip(
+                static_cast<T*>(gpu_bias_gradients_->device_data()),
+                clip_value, gpu_bias_gradients_->size());
+            return;
+        }
+#endif
+        if (!weight_gradients_.empty()) {
+            T* w = weight_gradients_.data();
+            for (size_t k = 0; k < weight_gradients_.size(); ++k) {
+                w[k] = std::max(-clip_value, std::min(clip_value, w[k]));
+            }
+        }
+        if (!bias_gradients_.empty()) {
+            T* b = bias_gradients_.data();
+            for (size_t k = 0; k < bias_gradients_.size(); ++k) {
+                b[k] = std::max(-clip_value, std::min(clip_value, b[k]));
+            }
+        }
+    }
+
     void apply_gradients(T learning_rate) {
 #ifdef DNN_ENABLE_CUDA
         if (device_ == Device::CUDA && gpu_weights_ && gpu_biases_
@@ -815,6 +849,10 @@ public:
     const Tensor<T>& weights() const { return weights_; }
     Tensor<T>& biases() { return biases_; }
     const Tensor<T>& biases() const { return biases_; }
+    Tensor<T>& weight_gradients() { return weight_gradients_; }
+    const Tensor<T>& weight_gradients() const { return weight_gradients_; }
+    Tensor<T>& bias_gradients() { return bias_gradients_; }
+    const Tensor<T>& bias_gradients() const { return bias_gradients_; }
 
     std::vector<Node>& nodes() { return nodes_; }
     const std::vector<Node>& nodes() const { return nodes_; }

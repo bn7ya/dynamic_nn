@@ -201,6 +201,12 @@ T cuda_max(const CudaTensor<T>& x);
 template<typename T>
 T cuda_min(const CudaTensor<T>& x);
 
+// Optimizer helpers (cuda_optimizers.cu)
+// Clamp every element of `gradients` to [-clip_value, +clip_value].
+template<typename T>
+void launch_gradient_clip(T* gradients, T clip_value, size_t n,
+                          cudaStream_t stream = nullptr);
+
 // Loss Functions (cuda_reductions.cu)
 template<typename T>
 T cuda_cross_entropy(const CudaTensor<T>& predictions, const CudaTensor<T>& targets);
@@ -215,6 +221,14 @@ void cuda_randn(CudaTensor<T>& x, T mean = T(0), T stddev = T(1));
 #else // !DNN_ENABLE_CUDA
 
 // Stub implementations when CUDA is not enabled
+
+// Optimizer helpers (no-CUDA stub: no stream parameter since
+// cudaStream_t is unavailable without the toolkit).
+template<typename T>
+void launch_gradient_clip(T* gradients, T clip_value, size_t n) {
+    (void)gradients; (void)clip_value; (void)n;
+    throw std::runtime_error("launch_gradient_clip: CUDA not enabled");
+}
 
 // Matrix Operations
 template<typename T>

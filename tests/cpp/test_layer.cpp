@@ -33,3 +33,25 @@ TEST(Layer, GradientThresholdIgnoresInactiveNodes) {
 
     EXPECT_NEAR(layer.compute_gradient_threshold(), expected, 1e-5);
 }
+
+// 1.1: clip_gradients clamps every gradient element into [-clip, clip].
+TEST(Layer, ClipGradientsClampsExtremeValues) {
+    Layer<float> layer(5, 4, ActivationType::ReLU, /*seed=*/2);
+    layer.zero_gradients();
+
+    auto& wg = layer.weight_gradients();
+    auto& bg = layer.bias_gradients();
+    for (size_t k = 0; k < wg.size(); ++k)
+        wg.data()[k] = (k % 2 == 0) ? 1e6f : -1e6f;
+    for (size_t k = 0; k < bg.size(); ++k) bg.data()[k] = -42.0f;
+
+    const float clip = 1.5f;
+    layer.clip_gradients(clip);
+
+    for (size_t k = 0; k < wg.size(); ++k) {
+        EXPECT_LE(wg.data()[k], clip);
+        EXPECT_GE(wg.data()[k], -clip);
+    }
+    for (size_t k = 0; k < bg.size(); ++k)
+        EXPECT_NEAR(bg.data()[k], -clip, 1e-6);
+}
