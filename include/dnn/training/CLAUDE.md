@@ -19,6 +19,7 @@ sequential body and the helpers shared between both paths.
 | `cost_functions.hpp` | MSE, MAE, CrossEntropy, BinaryCrossEntropy, Huber, LogCosh, KLDivergence, CosineSimilarity. `[invariant]` external API. |
 | `early_stopping.hpp` | `EarlyStopping`: patience + min-improvement + window-based plateau detection. |
 | `emotional_state.hpp` | `EmotionalState` + `RewardPenaltyConfig` + `apply_reward_penalty_system`. `[invariant]` Phase 3 LR adjustment. |
+| `train_strategy.hpp` | `TrainStrategy<T>` extraction interface (3.12). `[scaffolding]` — interface only, intentionally not wired (see note below). |
 | `runtime/` | Concurrent stage runtime — separate sub-feature with its own [CLAUDE.md](runtime/CLAUDE.md). |
 
 `src/training/` provides the corresponding `.cpp` files plus
@@ -113,6 +114,14 @@ sequential body and the helpers shared between both paths.
   — add the matching row in `_bindings.cpp` in a pybind-host session.
   Phase 3 cost trajectory now genuinely changes when perturbation
   fires (expected, Tier 1).
+- 3.12 (`TrainStrategy` extraction) is intentionally interface-only
+  (`train_strategy.hpp`, `[scaffolding]`). `train`/`train_phased` are
+  NOT rewired: `train_phased` is the bit-for-bit reproducibility
+  baseline and parity can only be proven via the end-to-end
+  Python/`_dnn_core` cost-trajectory smoke, which is unbuildable here
+  (no pybind11). Wiring it unverified would risk a silent
+  reproducibility regression. The header documents the safe path for a
+  pybind/CUDA-capable session.
 - There is now a single `compute_efficiency` definition — the
   windowed-sigmoid free function in `emotional_state.hpp`. The
   trainer's local 2-point member was deleted (3.2); unqualified calls
