@@ -1495,8 +1495,8 @@ private:
 
         auto& layers = network_.layers();
         const uint64_t tv = network_.topology_version();
-        if (optimizers_.size() != layers.size() ||
-            tv != optimizer_topology_version_) {
+        if (optimizers_.size() != layers.size()) {
+            // Layer count changed (insert/remove): rebuild from scratch.
             OptimizerConfig oc = config_.optimizer_config;
             oc.enable_gradient_clipping = false;  // clip_gradients() owns this
             optimizers_.clear();
@@ -1505,6 +1505,15 @@ private:
                 optimizers_.push_back(Optimizer<T>::create(oc));
                 optimizers_[i]->initialize(layers[i]->weights().size(),
                                            layers[i]->biases().size());
+            }
+            optimizer_topology_version_ = tv;
+        } else if (tv != optimizer_topology_version_) {
+            // Same layers, but a layer grew/shrank (add_nodes): resize
+            // optimizer state, preserving momentum/variance for the
+            // surviving parameters; new params start with no history.
+            for (size_t i = 0; i < layers.size(); ++i) {
+                optimizers_[i]->resize(layers[i]->weights().size(),
+                                       layers[i]->biases().size());
             }
             optimizer_topology_version_ = tv;
         }

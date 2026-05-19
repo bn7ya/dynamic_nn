@@ -82,6 +82,14 @@ sequential body and the helpers shared between both paths.
   rewinds, Phase 1 reactivation), the place is
   `trainer.hpp` `train_phased_runtime` and the observer in
   [runtime/CLAUDE.md](runtime/CLAUDE.md).
+- `Optimizer<T>::resize(weight_size, bias_size)` preserves momentum/
+  variance for the surviving parameter prefix and zero-fills growth
+  (new params get no history — correct). SGD is a no-op (stateless).
+  `Trainer::apply_gradients_step` calls `resize` per layer when the
+  topology version changes but the layer count is unchanged (a layer
+  grew via `add_nodes`); a layer-count change still triggers a full
+  rebuild. Adam's `timestep_` (bias correction) is intentionally kept
+  across resize.
 - The optimizer family is now wired. `Trainer::apply_gradients_step()`
   replaces the direct `network_.apply_gradients(lr)` call in
   `train_epoch`. Default `TrainerConfig::use_optimizer=false` keeps the

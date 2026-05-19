@@ -93,10 +93,34 @@ public:
     virtual void initialize(size_t weight_size, size_t bias_size) = 0;
 
     /**
+     * Resize state after the layer's parameter count changes (e.g.
+     * Layer::add_nodes grew the weight matrix). Existing state for the
+     * overlapping prefix is preserved; newly-added entries start at
+     * zero (no momentum/variance history — correct, they are new).
+     * Default: no-op (stateless optimizers).
+     */
+    virtual void resize(size_t weight_size, size_t bias_size) {
+        (void)weight_size; (void)bias_size;
+    }
+
+    /**
      * Factory method to create optimizer from config.
      */
     static std::unique_ptr<Optimizer<T>> create(const OptimizerConfig& config);
 };
+
+/**
+ * Resize a 1-D state tensor, preserving the first min(old,new) elements
+ * and zero-filling any growth. Shrinking simply truncates.
+ */
+template<typename T>
+inline void resize_state_(Tensor<T>& state, size_t new_size) {
+    if (state.size() == new_size) return;
+    Tensor<T> resized(std::vector<size_t>{new_size}, T(0));
+    const size_t keep = std::min(state.size(), new_size);
+    for (size_t i = 0; i < keep; ++i) resized.data()[i] = state.data()[i];
+    state = std::move(resized);
+}
 
 /**
  * Gradient clipping utility.
@@ -191,6 +215,12 @@ public:
         velocity_w_ = Tensor<T>(std::vector<size_t>{weight_size}, T(0));
         velocity_b_ = Tensor<T>(std::vector<size_t>{bias_size}, T(0));
         initialized_ = true;
+    }
+
+    void resize(size_t weight_size, size_t bias_size) override {
+        if (!initialized_) { initialize(weight_size, bias_size); return; }
+        resize_state_(velocity_w_, weight_size);
+        resize_state_(velocity_b_, bias_size);
     }
 
     void update(Tensor<T>& weights, Tensor<T>& biases,
@@ -289,6 +319,16 @@ public:
         v_b_ = Tensor<T>(std::vector<size_t>{bias_size}, T(0));
 
         initialized_ = true;
+    }
+
+    void resize(size_t weight_size, size_t bias_size) override {
+        if (!initialized_) { initialize(weight_size, bias_size); return; }
+        // Preserve moments for surviving params; new params get no
+        // history. timestep_ (bias correction) is intentionally kept.
+        resize_state_(m_w_, weight_size);
+        resize_state_(m_b_, bias_size);
+        resize_state_(v_w_, weight_size);
+        resize_state_(v_b_, bias_size);
     }
 
     void update(Tensor<T>& weights, Tensor<T>& biases,
@@ -422,6 +462,12 @@ public:
         cache_w_ = Tensor<T>(std::vector<size_t>{weight_size}, T(0));
         cache_b_ = Tensor<T>(std::vector<size_t>{bias_size}, T(0));
         initialized_ = true;
+    }
+
+    void resize(size_t weight_size, size_t bias_size) override {
+        if (!initialized_) { initialize(weight_size, bias_size); return; }
+        resize_state_(cache_w_, weight_size);
+        resize_state_(cache_b_, bias_size);
     }
 
     void update(Tensor<T>& weights, Tensor<T>& biases,
