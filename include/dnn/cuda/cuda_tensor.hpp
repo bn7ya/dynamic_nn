@@ -153,6 +153,23 @@ public:
                    size_ * sizeof(T), MemcpyKind::DeviceToHost);
     }
 
+    /**
+     * Copy exactly `n` elements starting at element `offset` from device
+     * memory into host buffer `dst`. Avoids D2H-ing the whole (B, O)
+     * tensor just to read one row for per-node metric recording.
+     */
+    void copy_to_host_strided(T* dst, size_t offset, size_t n) const {
+        if (!is_cuda_available() || !device_ptr_) {
+            throw std::runtime_error("No GPU data to copy");
+        }
+        if (offset + n > size_) {
+            throw std::runtime_error("copy_to_host_strided: out of range");
+        }
+        const char* src = static_cast<const char*>(device_ptr_) +
+                          offset * sizeof(T);
+        cuda_memcpy(dst, src, n * sizeof(T), MemcpyKind::DeviceToHost);
+    }
+
     // Accessors
     const std::vector<size_t>& shape() const { return shape_; }
     size_t size() const { return size_; }

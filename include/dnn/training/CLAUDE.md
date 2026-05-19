@@ -19,6 +19,7 @@ sequential body and the helpers shared between both paths.
 | `cost_functions.hpp` | MSE, MAE, CrossEntropy, BinaryCrossEntropy, Huber, LogCosh, KLDivergence, CosineSimilarity. `[invariant]` external API. |
 | `early_stopping.hpp` | `EarlyStopping`: patience + min-improvement + window-based plateau detection. |
 | `emotional_state.hpp` | `EmotionalState` + `RewardPenaltyConfig` + `apply_reward_penalty_system`. `[invariant]` Phase 3 LR adjustment. |
+| `train_strategy.hpp` | `TrainStrategy<T>` extraction interface (3.12). `[scaffolding]` — interface only, intentionally not wired (see note below). |
 | `runtime/` | Concurrent stage runtime — separate sub-feature with its own [CLAUDE.md](runtime/CLAUDE.md). |
 
 `src/training/` provides the corresponding `.cpp` files plus
@@ -82,6 +83,83 @@ sequential body and the helpers shared between both paths.
   rewinds, Phase 1 reactivation), the place is
   `trainer.hpp` `train_phased_runtime` and the observer in
   [runtime/CLAUDE.md](runtime/CLAUDE.md).
+- `Optimizer<T>::resize(weight_size, bias_size)` preserves momentum/
+  variance for the surviving parameter prefix and zero-fills growth
+  (new params get no history — correct). SGD is a no-op (stateless).
+  `Trainer::apply_gradients_step` calls `resize` per layer when the
+  topology version changes but the layer count is unchanged (a layer
+  grew via `add_nodes`); a layer-count change still triggers a full
+  rebuild. Adam's `timestep_` (bias correction) is intentionally kept
+  across resize.
+- The optimizer family is now wired. `Trainer::apply_gradients_step()`
+  replaces the direct `network_.apply_gradients(lr)` call in
+  `train_epoch`. Default `TrainerConfig::use_optimizer=false` keeps the
+  legacy inline-SGD path bit-for-bit. When true, each CPU layer's
+  update routes through a per-layer `Optimizer<T>` built from
+  `optimizer_config` (the optimizer's own clipping is disabled since
+  `clip_gradients()` runs first). CUDA layers keep the on-device legacy
+  step (device-path optimizer wiring is a CUDA-host follow-up). Per-
+  layer optimizer state is rebuilt on `topology_version_` change (1.11
+  adds overlap-preserving resize). New `TrainerConfig` fields
+  `use_optimizer` / `optimizer_config` are additive — add the matching
+  `_bindings.cpp` rows in a pybind-host session.
+- `Trainer::apply_random_perturbation(fraction)` is now implemented
+  (was a no-op that still incremented `result.perturbations_applied`).
+  It picks `max(1, total_nodes*fraction)` random (layer, active-node)
+  pairs via a Trainer-owned `perturb_rng_` (seeded from
+  `network.config().seed`, deterministic) and adds zero-mean Gaussian
+  noise (stddev `TrainerConfig::perturbation_scale`, default 0.01) to
+  each chosen node's weight row, then marks those layers' GPU mirrors
+  dirty. New field `perturbation_scale` is additive on `TrainerConfig`
+  — add the matching row in `_bindings.cpp` in a pybind-host session.
+  Phase 3 cost trajectory now genuinely changes when perturbation
+  fires (expected, Tier 1).
+- 3.12 (`TrainStrategy` extraction) is intentionally interface-only
+  (`train_strategy.hpp`, `[scaffolding]`). `train`/`train_phased` are
+  NOT rewired: `train_phased` is the bit-for-bit reproducibility
+  baseline and parity can only be proven via the end-to-end
+  Python/`_dnn_core` cost-trajectory smoke, which is unbuildable here
+  (no pybind11). Wiring it unverified would risk a silent
+  reproducibility regression. The header documents the safe path for a
+  pybind/CUDA-capable session.
+- There is now a single `compute_efficiency` definition — the
+  windowed-sigmoid free function in `emotional_state.hpp`. The
+  trainer's local 2-point member was deleted (3.2); unqualified calls
+  resolve to the free function. Efficiency values (hence some
+  decisions) differ from the old member formula — Tier-3 behaviour
+  change, record a fresh baseline if bisecting.
+- `apply_static_config` now also maps `phase4_lr_decay_rate`,
+  `phase4_lr_decay_interval`, `phase4_batch_size`,
+  `layer_adjustment_interval`, `enable_dynamic_layers` (0/1) into new
+  `RuntimeAdaptiveConfig` `AdaptiveScalar`s (3.7) — previously silently
+  dropped on the runtime path. New `TrainerConfig::health_history_window`
+  (default 50) is additive — flag `_bindings.cpp` for pybind host.
+- `Trainer::evaluate` now uses the batched rank-2 forward when
+  `batched_train_forward` is true (no backward), matching `train_epoch`.
+  Numerically equivalent to the per-sample loop modulo matmul summation
+  order; the per-sample path stays reachable via the same flag.
+- `compute_normalization_params` is single-pass Welford (mean + M2 +
+  min/max in one traversal) instead of two passes. Same std values
+  within fp tolerance, numerically stabler.
+- `TrainerConfig::async_callback` (default false) runs the epoch
+  callback on a background thread against a `network_.clone()` with
+  single-slot drop semantics; `~Trainer()` joins any in-flight
+  callback. Default false keeps the synchronous live-network behaviour
+  bit-for-bit. Additive field — flag `_bindings.cpp` for pybind host.
+- 2.3 (forward_cpu weights_t per-forward transpose) was intentionally
+  NOT cached: the optimizer mutates `weights_` through the public
+  `weights()` accessor, so no internal version counter can correctly
+  invalidate a cached transpose, and changing the `SIMDOps::matmul`
+  virtual interface risks Tier-2 numerical identity across SIMD
+  backends. Left as-is for correctness.
+- `Trainer::clip_gradients()` is now implemented (was a no-op). It
+  iterates `network_.layers()` and calls `Layer::clip_gradients(value)`,
+  which clamps the accumulated gradients in place to
+  `[-gradient_clip_value, +gradient_clip_value]` — the GPU gradient
+  mirrors on the CUDA path, the host accumulators otherwise. It runs
+  after backward and before `apply_gradients`. `enable_gradient_clipping`
+  defaults to `true`, so training output changed vs the old no-op
+  baseline; record a fresh reference if you bisect on cost trajectory.
 - `BatchManager`'s adaptive growth is gated by epoch and efficiency
   thresholds. If you add a new growth trigger, do it inside
   `BatchManager` so both training paths get it for free.

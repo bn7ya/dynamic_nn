@@ -61,8 +61,15 @@ instantiation so latent type errors surface at link time.
   training forever.
 - **`MetricsBus::publish` is single-producer per stage, MPSC overall.**
   The controller thread and observer thread are both readers. The
-  ring is mutex-guarded; that's intentional and adequate for ~1
-  publish per epoch.
+  ring is now lock-free: `publish` reserves a unique slot via an
+  atomic fetch-add and release-publishes the count; readers acquire-
+  load it. A rare slightly-stale read is acceptable — the observer
+  re-polls every few ms and only needs the recent trend. Don't
+  reintroduce the mutex.
+- **The observer poll fallback is 5 ms** (was 50 ms).
+  `notify_observer()` still wakes it immediately on every
+  `publish_metric`; the timeout only bounds detection latency if a
+  notification is missed.
 
 ## Maintenance notes
 
@@ -94,9 +101,6 @@ instantiation so latent type errors surface at link time.
   own worker thread; it's still feasible and the API is ready, but
   the current `train_phased_runtime` runs phases in the calling
   thread and uses workers only for the parallel observer.
-- The CQRS bus in [`include/dnn/cqrs/CLAUDE.md`](../../cqrs/CLAUDE.md)
-  is the planned dispatch backbone for this runtime — promotion is a
-  follow-up.
 
 ## Memory & reliability notes
 
@@ -127,8 +131,6 @@ instantiation so latent type errors surface at link time.
 - The Python parallel observer that mirrors this on the
   pure-Python fallback:
   [`python/pydnn/CLAUDE.md`](../../../../python/pydnn/CLAUDE.md).
-- Dormant CQRS infrastructure that may eventually back this:
-  [`include/dnn/cqrs/CLAUDE.md`](../../cqrs/CLAUDE.md).
 
 ## Updating this file
 

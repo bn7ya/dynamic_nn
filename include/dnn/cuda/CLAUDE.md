@@ -70,10 +70,15 @@ The `.cu` files in `src/cuda/` implement the kernels:
   path. Migrating to `cudaMallocAsync` / `cudaFreeAsync` would help
   multi-stream workloads but requires per-stream free-lists or event
   records. See the runtime plan for the design.
-- `cuda_tensor.hpp:283-293` (in CUDA forward) records node activations
-  by copying the first batch row back to host. That host round-trip
-  is wasteful but kept because the metrics path lives on CPU. If you
-  move metrics to GPU, drop this copy.
+- Per-node metric recording now uses
+  `CudaTensor::copy_to_host_strided(dst, offset, n)` to D2H exactly the
+  first row (`output_size_` floats) instead of the whole (B, O) tensor
+  (2.1). If you move metrics to GPU, drop this copy entirely.
+- 2.4 (cudaMemcpy2D input slicing → cuBLAS `lda`) and 2.5 (compute/
+  copy CUDA streams in the trainer) and 2.2 (`CudaTensor` shared
+  device buffer) are deferred: they need a CUDA host to verify and
+  2.5 risks silent correctness on an untestable path. Tracked for a
+  CUDA-host session.
 - The current kernel launches use `KernelConfig` which carries a
   stream, but the trainer mostly passes `nullptr`. Wiring per-worker
   streams from `train_phased_runtime()` is a known follow-up

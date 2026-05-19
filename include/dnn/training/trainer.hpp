@@ -3,6 +3,7 @@
 #include "../core/network.hpp"
 #include "../core/tensor.hpp"
 #include "cost_functions.hpp"
+#include "optimizer.hpp"
 #include "batch_manager.hpp"
 #include "early_stopping.hpp"
 #include "emotional_state.hpp"
@@ -15,6 +16,7 @@
 #include "runtime/topology_lock.hpp"
 #include <functional>
 #include <chrono>
+#include <future>
 #include <memory>
 
 namespace dnn {
@@ -154,10 +156,32 @@ struct TrainerConfig {
     // Health monitoring
     double cancer_threshold = 0.7;
     double alzheimer_threshold = 0.7;
+    // Rolling window (number of structural-change events) the
+    // cancer/alzheimer scores look back over. Default 50; raise for
+    // long Phase-3 runs so slow chronic growth stays visible.
+    size_t health_history_window = 50;
 
     // Numerical stability
     double gradient_clip_value = 1.0;
     bool enable_gradient_clipping = true;
+
+    // Phase-3 random perturbation: stddev of the zero-mean Gaussian
+    // noise added to a perturbed node's weight row.
+    double perturbation_scale = 0.01;
+
+    // Optimizer. Default keeps the legacy inline-SGD path
+    // (network_.apply_gradients) bit-for-bit. Set use_optimizer=true to
+    // route the weight update through optimizer_config (Adam/Momentum/
+    // RMSprop/SGD). The optimizer's own clipping is disabled — the
+    // trainer's clip_gradients() already runs before the step.
+    bool use_optimizer = false;
+    OptimizerConfig optimizer_config;
+
+    // When true, the epoch callback runs on a background thread against
+    // a network *clone* (single-slot: dropped if the previous callback
+    // is still running) so a slow callback can't stall training. Default
+    // false keeps the synchronous, live-network behaviour bit-for-bit.
+    bool async_callback = false;
 
     // Normalization (auto-normalize data even if not pre-normalized)
     NormalizationConfig normalization;
@@ -238,15 +262,22 @@ public:
         , cost_type_(cost_type)
         , cost_function_(CostFunction<T>::create(cost_type))
         , batch_manager_(config.batch_config)
-        , health_monitor_(network, config.cancer_threshold, config.alzheimer_threshold)
+        , health_monitor_(network, config.cancer_threshold,
+                          config.alzheimer_threshold,
+                          config.health_history_window)
         , layer_manager_(network, health_monitor_, config.layer_manager_config)
         , trainable_scheduler_(network, config.trainable_config)
         , early_stopping_(config.patience, config.min_improvement,
                           config.min_epochs_for_early_stop)
-        , learning_rate_(config.initial_learning_rate) {
+        , learning_rate_(config.initial_learning_rate)
+        , perturb_rng_(network.config().seed + 0x9E3779B9ULL) {
         // Initialize normalization params
         norm_params_.method = config.normalization.method;
         norm_params_.epsilon = static_cast<T>(config.normalization.epsilon);
+    }
+
+    ~Trainer() {
+        if (cb_future_.valid()) cb_future_.wait();  // no leaked threads
     }
 
     /**
@@ -346,9 +377,8 @@ public:
             batch_manager_.adjust_for_efficiency(efficiency_metrics.overall_efficiency);
 
             // Callback
-            if (epoch_callback_) {
-                epoch_callback_(epoch, val_cost, efficiency_metrics.overall_efficiency, network_);
-            }
+            invoke_epoch_callback(epoch, val_cost,
+                                  efficiency_metrics.overall_efficiency);
 
             previous_cost = val_cost;
             result.epochs_completed = epoch + 1;
@@ -677,10 +707,8 @@ public:
                 }
 
                 // Callback
-                if (epoch_callback_) {
-                    epoch_callback_(20 + result.estimated_epochs + epoch,
-                                   epoch_cost, efficiency, network_);
-                }
+                invoke_epoch_callback(20 + result.estimated_epochs + epoch,
+                                      epoch_cost, efficiency);
 
                 // Early stopping check
                 if (patience_counter >= config_.phase4_patience) {
@@ -1140,15 +1168,6 @@ public:
         return cost;
     }
 
-    /**
-     * Compute efficiency from cost history.
-     */
-    double compute_efficiency(const std::vector<double>& cost_history) const {
-        if (cost_history.size() < 2) return 0.5;
-        double improvement = (cost_history[cost_history.size() - 2] - cost_history.back()) /
-                            (cost_history[cost_history.size() - 2] + 1e-8);
-        return std::min(1.0, std::max(0.0, 0.5 + improvement * 10.0));
-    }
 
     /**
      * Compute sigmoid-based adaptive saturation threshold.
@@ -1163,11 +1182,33 @@ public:
      * Apply random perturbation to fraction of nodes.
      */
     void apply_random_perturbation(double fraction) {
-        // This is a placeholder - full implementation would modify network weights
-        // The actual perturbation happens at the network level
+        auto& layers = network_.layers();
+        if (layers.empty()) return;
+
         size_t total_nodes = network_.num_nodes();
-        size_t num_to_perturb = std::max(size_t(1), static_cast<size_t>(total_nodes * fraction));
-        // Network-level perturbation would be implemented here
+        if (total_nodes == 0) return;
+        size_t num_to_perturb = std::max(
+            size_t(1), static_cast<size_t>(total_nodes * fraction));
+
+        const T stddev = static_cast<T>(config_.perturbation_scale);
+        std::vector<bool> layer_touched(layers.size(), false);
+
+        for (size_t n = 0; n < num_to_perturb; ++n) {
+            size_t li = static_cast<size_t>(
+                perturb_rng_.randint(0, static_cast<int>(layers.size()) - 1));
+            auto& layer = *layers[li];
+            size_t out = layer.output_size();
+            if (out == 0) continue;
+            size_t node = static_cast<size_t>(
+                perturb_rng_.randint(0, static_cast<int>(out) - 1));
+            layer.perturb_node(node, stddev, perturb_rng_);
+            layer_touched[li] = true;
+        }
+
+        // Reupload mutated weights to the GPU mirrors once per layer.
+        for (size_t li = 0; li < layers.size(); ++li) {
+            if (layer_touched[li]) layers[li]->mark_weights_dirty();
+        }
     }
 
     /**
@@ -1301,7 +1342,7 @@ public:
 
             // Apply gradients
             T lr = static_cast<T>(learning_rate_ / batch_inputs.size());
-            network_.apply_gradients(lr);
+            apply_gradients_step(lr);
         }
 
         return total_cost / num_batches;
@@ -1312,14 +1353,44 @@ public:
      */
     double evaluate(const std::vector<Tensor<T>>& inputs,
                     const std::vector<Tensor<T>>& targets) {
+        if (inputs.empty()) return 0.0;
         double total_cost = 0.0;
+
+        if (config_.batched_train_forward) {
+            const size_t N = inputs.size();
+            const size_t input_dim = inputs[0].size();
+            const size_t target_dim = targets[0].size();
+
+            Tensor<T> input_2d(std::vector<size_t>{N, input_dim});
+            for (size_t b = 0; b < N; ++b)
+                for (size_t j = 0; j < input_dim; ++j)
+                    input_2d.at(b, j) = inputs[b][j];
+
+            auto output_2d = network_.forward(input_2d);
+            if (output_2d.rank() != 2) {
+                throw exceptions::ShapeException("evaluate",
+                    "batched forward did not return a rank-2 tensor");
+            }
+            const size_t output_dim = output_2d.shape()[1];
+
+            Tensor<T> output_row(std::vector<size_t>{output_dim});
+            Tensor<T> target_row(std::vector<size_t>{target_dim});
+            for (size_t b = 0; b < N; ++b) {
+                for (size_t j = 0; j < output_dim; ++j)
+                    output_row[j] = output_2d.at(b, j);
+                for (size_t j = 0; j < target_dim; ++j)
+                    target_row[j] = targets[b][j];
+                total_cost += static_cast<double>(
+                    cost_function_->compute(output_row, target_row));
+            }
+            return total_cost / N;
+        }
 
         for (size_t i = 0; i < inputs.size(); ++i) {
             auto output = network_.forward(inputs[i]);
             T sample_cost = cost_function_->compute(output, targets[i]);
             total_cost += static_cast<double>(sample_cost);
         }
-
         return total_cost / inputs.size();
     }
 
@@ -1435,9 +1506,94 @@ private:
     }
 
     void clip_gradients() {
-        // Simple gradient clipping by value
-        // In a full implementation, we'd access the accumulated gradients
-        // For now, this is a placeholder
+        const T clip = static_cast<T>(config_.gradient_clip_value);
+        if (clip <= T(0)) return;
+        for (auto& layer : network_.layers()) {
+            layer->clip_gradients(clip);
+        }
+    }
+
+    /**
+     * Weight-update step. Default (use_optimizer=false) keeps the legacy
+     * inline-SGD path bit-for-bit. When enabled, routes each CPU layer's
+     * update through a per-layer Optimizer (Adam/Momentum/RMSprop/SGD).
+     * CUDA layers keep the on-device legacy step (optimizer wiring on the
+     * device path is a CUDA-host follow-up). Optimizer state is rebuilt
+     * when the topology version changes (1.11 adds overlap-preserving
+     * resize).
+     */
+    void apply_gradients_step(T lr) {
+        if (!config_.use_optimizer) {
+            network_.apply_gradients(lr);
+            return;
+        }
+
+        auto& layers = network_.layers();
+        const uint64_t tv = network_.topology_version();
+        if (optimizers_.size() != layers.size()) {
+            // Layer count changed (insert/remove): rebuild from scratch.
+            OptimizerConfig oc = config_.optimizer_config;
+            oc.enable_gradient_clipping = false;  // clip_gradients() owns this
+            optimizers_.clear();
+            optimizers_.reserve(layers.size());
+            for (size_t i = 0; i < layers.size(); ++i) {
+                optimizers_.push_back(Optimizer<T>::create(oc));
+                optimizers_[i]->initialize(layers[i]->weights().size(),
+                                           layers[i]->biases().size());
+            }
+            optimizer_topology_version_ = tv;
+        } else if (tv != optimizer_topology_version_) {
+            // Same layers, but a layer grew/shrank (add_nodes): resize
+            // optimizer state, preserving momentum/variance for the
+            // surviving parameters; new params start with no history.
+            for (size_t i = 0; i < layers.size(); ++i) {
+                optimizers_[i]->resize(layers[i]->weights().size(),
+                                       layers[i]->biases().size());
+            }
+            optimizer_topology_version_ = tv;
+        }
+
+        for (size_t i = 0; i < layers.size(); ++i) {
+            core::Layer<T>& layer = *layers[i];
+#ifdef DNN_ENABLE_CUDA
+            if (layer.device() == core::Device::CUDA) {
+                layer.apply_gradients(lr);  // legacy on-device step
+                continue;
+            }
+#endif
+            if (layer.weight_gradients().empty()) continue;
+            optimizers_[i]->set_learning_rate(lr);
+            optimizers_[i]->update(layer.weights(), layer.biases(),
+                                   layer.weight_gradients(),
+                                   layer.bias_gradients());
+            layer.zero_gradients();
+        }
+    }
+
+    /**
+     * Dispatch the epoch callback. Synchronous by default; when
+     * config_.async_callback is set, runs on a background thread against
+     * a network clone with single-slot semantics (a new dispatch is
+     * dropped while the previous one is still running) so a slow user
+     * callback never blocks training.
+     */
+    void invoke_epoch_callback(uint64_t epoch, double cost, double eff) {
+        if (!epoch_callback_) return;
+        if (!config_.async_callback) {
+            epoch_callback_(epoch, cost, eff, network_);
+            return;
+        }
+        if (cb_future_.valid() &&
+            cb_future_.wait_for(std::chrono::seconds(0)) !=
+                std::future_status::ready) {
+            return;  // single-slot: previous callback still running
+        }
+        auto snapshot = network_.clone();  // stable, read-only copy
+        cb_future_ = std::async(
+            std::launch::async,
+            [this, epoch, cost, eff, snap = std::move(snapshot)]() {
+                epoch_callback_(epoch, cost, eff, *snap);
+            });
     }
 
     /**
@@ -1458,29 +1614,26 @@ private:
             norm_params_.input_min.resize(input_size, std::numeric_limits<T>::max());
             norm_params_.input_max.resize(input_size, std::numeric_limits<T>::lowest());
 
-            // Compute mean, min, max
+            // Single-pass Welford: mean + M2 (sum of squared deviations)
+            // alongside min/max. Numerically stabler than the old
+            // two-pass sum-of-squares and halves the data traversal.
+            std::vector<T> m2(input_size, T(0));
+            size_t cnt = 0;
             for (const auto& input : inputs) {
                 const T* data = input.data();
+                ++cnt;
                 for (size_t i = 0; i < input_size; ++i) {
-                    norm_params_.input_mean[i] += data[i];
-                    norm_params_.input_min[i] = std::min(norm_params_.input_min[i], data[i]);
-                    norm_params_.input_max[i] = std::max(norm_params_.input_max[i], data[i]);
+                    T x = data[i];
+                    T delta = x - norm_params_.input_mean[i];
+                    norm_params_.input_mean[i] += delta / static_cast<T>(cnt);
+                    m2[i] += delta * (x - norm_params_.input_mean[i]);
+                    norm_params_.input_min[i] = std::min(norm_params_.input_min[i], x);
+                    norm_params_.input_max[i] = std::max(norm_params_.input_max[i], x);
                 }
             }
             for (size_t i = 0; i < input_size; ++i) {
-                norm_params_.input_mean[i] /= n_samples;
-            }
-
-            // Compute std
-            for (const auto& input : inputs) {
-                const T* data = input.data();
-                for (size_t i = 0; i < input_size; ++i) {
-                    T diff = data[i] - norm_params_.input_mean[i];
-                    norm_params_.input_std[i] += diff * diff;
-                }
-            }
-            for (size_t i = 0; i < input_size; ++i) {
-                norm_params_.input_std[i] = std::sqrt(norm_params_.input_std[i] / n_samples) + norm_params_.epsilon;
+                norm_params_.input_std[i] =
+                    std::sqrt(m2[i] / n_samples) + norm_params_.epsilon;
             }
 
             norm_params_.input_normalized = true;
@@ -1498,29 +1651,24 @@ private:
             norm_params_.output_min.resize(output_size, std::numeric_limits<T>::max());
             norm_params_.output_max.resize(output_size, std::numeric_limits<T>::lowest());
 
-            // Compute mean, min, max
+            // Single-pass Welford (see input block above).
+            std::vector<T> m2(output_size, T(0));
+            size_t cnt = 0;
             for (const auto& target : targets) {
                 const T* data = target.data();
+                ++cnt;
                 for (size_t i = 0; i < output_size; ++i) {
-                    norm_params_.output_mean[i] += data[i];
-                    norm_params_.output_min[i] = std::min(norm_params_.output_min[i], data[i]);
-                    norm_params_.output_max[i] = std::max(norm_params_.output_max[i], data[i]);
+                    T x = data[i];
+                    T delta = x - norm_params_.output_mean[i];
+                    norm_params_.output_mean[i] += delta / static_cast<T>(cnt);
+                    m2[i] += delta * (x - norm_params_.output_mean[i]);
+                    norm_params_.output_min[i] = std::min(norm_params_.output_min[i], x);
+                    norm_params_.output_max[i] = std::max(norm_params_.output_max[i], x);
                 }
             }
             for (size_t i = 0; i < output_size; ++i) {
-                norm_params_.output_mean[i] /= n_samples;
-            }
-
-            // Compute std
-            for (const auto& target : targets) {
-                const T* data = target.data();
-                for (size_t i = 0; i < output_size; ++i) {
-                    T diff = data[i] - norm_params_.output_mean[i];
-                    norm_params_.output_std[i] += diff * diff;
-                }
-            }
-            for (size_t i = 0; i < output_size; ++i) {
-                norm_params_.output_std[i] = std::sqrt(norm_params_.output_std[i] / n_samples) + norm_params_.epsilon;
+                norm_params_.output_std[i] =
+                    std::sqrt(m2[i] / n_samples) + norm_params_.epsilon;
             }
 
             norm_params_.output_normalized = true;
@@ -1585,8 +1733,12 @@ private:
     TrainableScheduler<T> trainable_scheduler_;
     EarlyStopping<T> early_stopping_;
     double learning_rate_;
+    core::Random perturb_rng_;
     EpochCallback<T> epoch_callback_;
     NormalizationParams<T> norm_params_;
+    std::vector<std::unique_ptr<Optimizer<T>>> optimizers_;
+    uint64_t optimizer_topology_version_ = UINT64_MAX;
+    std::future<void> cb_future_;
 };
 
 // Out-of-line definition of RuntimeAdaptiveConfig::apply_static_config.
@@ -1612,6 +1764,14 @@ inline void runtime::RuntimeAdaptiveConfig::apply_static_config(
 
     cancer_threshold.set(cfg.cancer_threshold);
     alzheimer_threshold.set(cfg.alzheimer_threshold);
+
+    phase4_lr_decay_rate.set(cfg.phase4_lr_decay_rate);
+    phase4_lr_decay_interval.set(
+        static_cast<double>(cfg.phase4_lr_decay_interval));
+    phase4_batch_size.set(static_cast<double>(cfg.phase4_batch_size));
+    layer_adjustment_interval.set(
+        static_cast<double>(cfg.layer_adjustment_interval));
+    enable_dynamic_layers.set(cfg.enable_dynamic_layers ? 1.0 : 0.0);
 
     const auto& rp = cfg.reward_penalty_config;
     cost_improvement_threshold.set(rp.cost_improvement_threshold);

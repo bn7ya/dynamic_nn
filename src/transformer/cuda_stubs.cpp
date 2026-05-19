@@ -74,7 +74,7 @@ void embedding_forward_cuda(const float*, const int64_t*, float*,
     unavailable("embedding_forward_cuda");
 }
 void embedding_backward_cuda(const float*, const int64_t*, float*,
-                             int64_t, int64_t, int64_t) {
+                             int64_t, int64_t, int64_t, bool) {
     unavailable("embedding_backward_cuda");
 }
 

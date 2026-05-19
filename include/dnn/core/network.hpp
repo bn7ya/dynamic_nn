@@ -251,14 +251,13 @@ public:
 
         layers_.insert(layers_.begin() + index, std::move(new_layer));
 
-        // Adjust the following layer — rebuild with new input_size_ and
-        // the same device_ as the rest of the network.
+        // Adjust the following layer — its input_size_ changes to
+        // num_nodes. Rebuild weight-preservingly so its trained
+        // parameters for the surviving fan-in are not discarded.
         auto& next_layer = layers_[index + 1];
-        auto rebuilt = std::make_unique<Layer<T>>(
-            num_nodes, next_layer->output_size(),
-            next_layer->activation_type(),
-            rng_->seed() + index, device_);
-        layers_[index + 1] = std::move(rebuilt);
+        layers_[index + 1] = rebuild_layer_preserving_(
+            *next_layer, num_nodes, next_layer->output_size(),
+            rng_->seed() + index);
 
         update_state();
     }
@@ -283,15 +282,13 @@ public:
         // Remove the layer
         layers_.erase(layers_.begin() + index);
 
-        // Rebuild the layer that was after the removed one (preserve device_;
-        // see insert_layer for why a missing device_ silently splits the
-        // network across CPU/GPU on CUDA builds).
+        // Rebuild the layer that was after the removed one: its
+        // input_size_ becomes prev_output. Preserve its trained
+        // parameters for the surviving fan-in instead of reinitialising.
         auto& layer_after = layers_[index];
-        auto rebuilt = std::make_unique<Layer<T>>(
-            prev_output, next_output,
-            layer_after->activation_type(),
-            rng_->seed() + index, device_);
-        layers_[index] = std::move(rebuilt);
+        layers_[index] = rebuild_layer_preserving_(
+            *layer_after, prev_output, next_output,
+            rng_->seed() + index);
 
         update_state();
     }
@@ -463,6 +460,11 @@ public:
             copy->layers_.push_back(layer->clone());
         }
         copy->state_ = state_;
+        copy->topology_version_ = topology_version_;
+        // Copy the training-in-progress flag so a clone taken mid-training
+        // also refuses compact() — otherwise the clone looks idle and its
+        // weights can be silently regressed.
+        copy->training_in_progress_ = training_in_progress_;
         return copy;
     }
 
@@ -529,26 +531,23 @@ public:
             if (!layers_[i]->is_active()) {
                 size_t prev_output = layers_[i - 1]->output_size();
                 size_t next_output = layers_[i + 1]->output_size();
-                ActivationType next_act = layers_[i + 1]->activation_type();
                 layers_.erase(layers_.begin() + i);
-                auto rebuilt = std::make_unique<Layer<T>>(
-                    prev_output, next_output, next_act,
-                    rng_->seed() + i, device_);
-                layers_[i] = std::move(rebuilt);
+                layers_[i] = rebuild_layer_preserving_(
+                    *layers_[i], prev_output, next_output,
+                    rng_->seed() + i);
             }
         }
 
-        // Repair input-size mismatches that compaction can introduce when a
-        // layer's output count shrinks: rebuild the downstream layer to
-        // accept the new fan-in. Weights of the rebuilt layer are reset --
-        // this is acceptable because compact() is end-of-training.
+        // Repair input-size mismatches that compaction can introduce when
+        // a layer's output count shrinks: rebuild the downstream layer to
+        // accept the new fan-in, preserving the trained weights for the
+        // surviving columns (first min(old,new)) instead of resetting.
         for (size_t i = 1; i < layers_.size(); ++i) {
             if (layers_[i]->input_size() != layers_[i - 1]->output_size()) {
                 size_t new_in = layers_[i - 1]->output_size();
                 size_t out = layers_[i]->output_size();
-                ActivationType act = layers_[i]->activation_type();
-                layers_[i] = std::make_unique<Layer<T>>(
-                    new_in, out, act, rng_->seed() + i, device_);
+                layers_[i] = rebuild_layer_preserving_(
+                    *layers_[i], new_in, out, rng_->seed() + i);
             }
         }
 
@@ -601,6 +600,38 @@ private:
         hidden = std::min(hidden, std::max(input_size_, config_.output_size));
 
         return hidden;
+    }
+
+    /**
+     * Rebuild a layer to new (input,output) sizes while preserving the
+     * trained parameters of the overlapping region. The first
+     * min(old,new) rows/columns of the weight matrix, the matching
+     * biases, and the per-node active mask are copied; any new
+     * rows/columns keep the fresh layer's initialised values. Used by
+     * insert_layer / remove_layer / compact() so a fan-in change does
+     * not silently regress trained weights.
+     */
+    std::unique_ptr<Layer<T>> rebuild_layer_preserving_(
+            const Layer<T>& old, size_t new_in, size_t new_out,
+            uint64_t seed) {
+        auto rebuilt = std::make_unique<Layer<T>>(
+            new_in, new_out, old.activation_type(), seed, device_);
+
+        const Tensor<T>& ow = old.weights();
+        const Tensor<T>& ob = old.biases();
+        Tensor<T>& nw = rebuilt->weights();
+        Tensor<T>& nb = rebuilt->biases();
+
+        const size_t copy_out = std::min(old.output_size(), new_out);
+        const size_t copy_in = std::min(old.input_size(), new_in);
+        for (size_t i = 0; i < copy_out; ++i) {
+            for (size_t j = 0; j < copy_in; ++j) {
+                nw.at(i, j) = ow.at(i, j);
+            }
+            nb[i] = ob[i];
+            rebuilt->set_node_active(i, old.is_node_active(i));
+        }
+        return rebuilt;
     }
 
     /**

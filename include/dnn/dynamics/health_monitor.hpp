@@ -53,13 +53,14 @@ class HealthMonitor {
 public:
     explicit HealthMonitor(Network<T>& network,
                           double cancer_threshold = 0.7,
-                          double alzheimer_threshold = 0.7)
+                          double alzheimer_threshold = 0.7,
+                          size_t history_window = 50)
         : network_(network)
         , cancer_threshold_(cancer_threshold)
         , alzheimer_threshold_(alzheimer_threshold)
         , initial_layer_count_(network.num_layers())
         , initial_node_count_(network.num_nodes())
-        , history_window_(50) {}
+        , history_window_(history_window == 0 ? 50 : history_window) {}
 
     /**
      * Record a structural change event.

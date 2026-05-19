@@ -167,9 +167,12 @@ void silu_backward_cuda(const float* x, const float* dy, float* dx, int64_t n);
 
 void embedding_forward_cuda(const float* weight, const int64_t* ids,
                             float* y, int64_t n_ids, int64_t dim, int64_t vocab);
+// deterministic=true uses a no-atomics, fixed-order kernel so the
+// scatter-add is bitwise reproducible (slower). Default keeps the
+// fast atomicAdd path.
 void embedding_backward_cuda(const float* dy, const int64_t* ids,
                              float* dweight, int64_t n_ids, int64_t dim,
-                             int64_t vocab);
+                             int64_t vocab, bool deterministic = false);
 
 float softmax_xent_forward_cuda(const float* logits, const int64_t* targets,
                                 float* log_probs_out, int64_t* valid_count_out,

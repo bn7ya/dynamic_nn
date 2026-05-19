@@ -568,13 +568,40 @@ __global__ void embedding_bwd_kernel(const float* __restrict__ dy,
     }
 }
 
+// Deterministic variant: one block per vocab row, single writer, fixed
+// summation order over ids (no atomics) so the result is bitwise
+// reproducible. O(vocab * n_ids) — slower; opt in when determinism
+// (e.g. testability/regression bisection) matters.
+__global__ void embedding_bwd_kernel_det(const float* __restrict__ dy,
+                                          const int64_t* __restrict__ ids,
+                                          float* __restrict__ dweight,
+                                          int64_t n_ids, int64_t dim,
+                                          int64_t vocab) {
+    int64_t row = blockIdx.x;
+    int tid = threadIdx.x;
+    if (row >= vocab) return;
+    for (int64_t d = tid; d < dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int64_t k = 0; k < n_ids; ++k) {  // fixed order
+            if (ids[k] == row) acc += dy[k * dim + d];
+        }
+        dweight[row * dim + d] += acc;
+    }
+}
+
 void embedding_backward_cuda(const float* dy, const int64_t* ids,
                              float* dweight, int64_t n_ids, int64_t dim,
-                             int64_t vocab) {
+                             int64_t vocab, bool deterministic) {
     if (n_ids <= 0 || dim <= 0) return;
     int threads = 128;
     while (threads > dim && threads > 32) threads >>= 1;
-    embedding_bwd_kernel<<<int(n_ids), threads>>>(dy, ids, dweight, n_ids, dim, vocab);
+    if (deterministic) {
+        embedding_bwd_kernel_det<<<int(vocab), threads>>>(
+            dy, ids, dweight, n_ids, dim, vocab);
+    } else {
+        embedding_bwd_kernel<<<int(n_ids), threads>>>(
+            dy, ids, dweight, n_ids, dim, vocab);
+    }
 }
 
 // ============================================================
@@ -690,6 +717,9 @@ __global__ void xent_bwd_kernel(const float* __restrict__ log_probs,
         float p = __expf(lp[c]);
         dl[c] = scale * p;
     }
+    // The thread that wrote dl[t] above is not necessarily tid 0;
+    // synchronise so tid 0's read-modify-write sees the final value.
+    __syncthreads();
     if (tid == 0) dl[t] -= scale;
 }
 

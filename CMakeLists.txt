@@ -143,11 +143,6 @@ set(DNN_DYNAMICS_SOURCES
     src/dynamics/trainable_scheduler.cpp
 )
 
-set(DNN_CQRS_SOURCES
-    src/cqrs/command_bus.cpp
-    src/cqrs/query_bus.cpp
-)
-
 set(DNN_IO_SOURCES
     src/io/input_adapter.cpp
     src/io/model_serializer.cpp
@@ -188,7 +183,6 @@ if(DNN_HAS_CUDA)
         ${DNN_SIMD_SOURCES}
         ${DNN_TRAINING_SOURCES}
         ${DNN_DYNAMICS_SOURCES}
-        ${DNN_CQRS_SOURCES}
         ${DNN_IO_SOURCES}
         ${DNN_TRANSFORMER_SOURCES}
         ${DNN_CUDA_SOURCES}
@@ -200,7 +194,6 @@ else()
         ${DNN_SIMD_SOURCES}
         ${DNN_TRAINING_SOURCES}
         ${DNN_DYNAMICS_SOURCES}
-        ${DNN_CQRS_SOURCES}
         ${DNN_IO_SOURCES}
         ${DNN_TRANSFORMER_SOURCES}
     )
@@ -280,20 +273,34 @@ endif()
 # Tests
 if(DNN_BUILD_TESTS)
     enable_testing()
-    find_package(GTest QUIET)
-    if(GTest_FOUND)
-        add_executable(dnn_tests
-            tests/cpp/test_tensor.cpp
-            tests/cpp/test_network.cpp
-            tests/cpp/test_simd.cpp
-        )
-        target_link_libraries(dnn_tests PRIVATE dnn_core GTest::gtest_main)
 
-        include(GoogleTest)
-        gtest_discover_tests(dnn_tests)
-    else()
-        message(STATUS "Google Test not found, tests disabled")
+    # Prefer a system GoogleTest if present; otherwise fetch a pinned release.
+    find_package(GTest QUIET)
+    if(NOT GTest_FOUND)
+        include(FetchContent)
+        FetchContent_Declare(
+            googletest
+            GIT_REPOSITORY https://github.com/google/googletest.git
+            GIT_TAG release-1.12.1
+        )
+        set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+        FetchContent_MakeAvailable(googletest)
     endif()
+
+    add_executable(dnn_tests
+        tests/cpp/test_tensor.cpp
+        tests/cpp/test_network.cpp
+        tests/cpp/test_simd.cpp
+        tests/cpp/test_pool_allocator.cpp
+        tests/cpp/test_layer.cpp
+        tests/cpp/test_optimizer.cpp
+        tests/cpp/test_metrics.cpp
+        tests/cpp/test_layer_similarity.cpp
+    )
+    target_link_libraries(dnn_tests PRIVATE dnn_core GTest::gtest_main)
+
+    include(GoogleTest)
+    gtest_discover_tests(dnn_tests)
 endif()
 
 # Examples

@@ -522,8 +522,9 @@ private:
     }
 
     /**
-     * Apply the layer's activation backward on device. Returns false when
-     * no GPU kernel exists (notably Softmax — no cuda_softmax_backward).
+     * Apply the layer's activation backward on device. ReLU/Sigmoid/
+     * Tanh/Softmax run on-device; returns false only for activations
+     * with no GPU backward kernel (host fallback).
      */
     bool apply_activation_backward_gpu_(const cuda::CudaTensor<T>& pre_act,
                                          const cuda::CudaTensor<T>& post_act,
@@ -539,6 +540,9 @@ private:
             case ActivationType::Tanh:
                 cuda::cuda_tanh_backward(post_act, grad_out, grad_in);
                 return true;
+            case ActivationType::Softmax:
+                cuda::cuda_softmax_backward(post_act, grad_out, grad_in);
+                return true;
             default:
                 return false;
         }
@@ -553,20 +557,11 @@ private:
         const size_t rank = pre_act.ndim();
         const size_t row_size = (rank == 2) ? pre_act.shape()[1] : pre_act.size();
         if (row_size != output_size_) return;
-        // The cheapest portable path: D2H the whole tensor then read its
-        // first row. For rank-1 this IS the whole tensor; for rank-2 the
-        // tensor is at most (B, O) — typically small enough that the D2H
-        // cost is bounded by the same kernel-launch granularity. A future
-        // CudaTensor::copy_row_to_host(0, dst, n) helper can reduce this
-        // further; not required for correctness.
+        // Row 0 is the first row_size contiguous elements (row-major) for
+        // both rank-1 and rank-2; copy exactly those instead of D2H-ing
+        // the whole (B, O) tensor.
         Tensor<T> host_row(std::vector<size_t>{row_size});
-        if (rank == 1) {
-            Tensor<T> full = pre_act.to_host();
-            for (size_t i = 0; i < row_size; ++i) host_row[i] = full[i];
-        } else {
-            Tensor<T> full = pre_act.to_host();
-            for (size_t i = 0; i < row_size; ++i) host_row[i] = full.at(0, i);
-        }
+        pre_act.copy_to_host_strided(host_row.data(), 0, row_size);
         for (size_t i = 0; i < output_size_; ++i) {
             nodes_[i].record_activation(static_cast<float>(host_row[i]));
         }
@@ -580,13 +575,7 @@ private:
         const size_t row_size = (rank == 2) ? grad_act.shape()[1] : grad_act.size();
         if (row_size != output_size_) return;
         Tensor<T> host_row(std::vector<size_t>{row_size});
-        if (rank == 1) {
-            Tensor<T> full = grad_act.to_host();
-            for (size_t i = 0; i < row_size; ++i) host_row[i] = full[i];
-        } else {
-            Tensor<T> full = grad_act.to_host();
-            for (size_t i = 0; i < row_size; ++i) host_row[i] = full.at(0, i);
-        }
+        grad_act.copy_to_host_strided(host_row.data(), 0, row_size);
         for (size_t i = 0; i < output_size_; ++i) {
             nodes_[i].record_gradient(static_cast<float>(host_row[i]));
         }
@@ -745,6 +734,65 @@ public:
      * Apply accumulated gradients and update weights.
      * @param learning_rate Learning rate for update
      */
+    /**
+     * Clamp every accumulated gradient element to [-clip_value,
+     * +clip_value]. Clips the same buffers apply_gradients() will
+     * consume: the GPU gradient mirrors on the CUDA path, the host
+     * accumulators on the CPU path.
+     */
+    void clip_gradients(T clip_value) {
+        if (clip_value <= T(0)) return;
+#ifdef DNN_ENABLE_CUDA
+        if (device_ == Device::CUDA && gpu_weight_gradients_
+            && gpu_bias_gradients_) {
+            cuda::launch_gradient_clip(
+                static_cast<T*>(gpu_weight_gradients_->device_data()),
+                clip_value, gpu_weight_gradients_->size());
+            cuda::launch_gradient_clip(
+                static_cast<T*>(gpu_bias_gradients_->device_data()),
+                clip_value, gpu_bias_gradients_->size());
+            return;
+        }
+#endif
+        if (!weight_gradients_.empty()) {
+            T* w = weight_gradients_.data();
+            for (size_t k = 0; k < weight_gradients_.size(); ++k) {
+                w[k] = std::max(-clip_value, std::min(clip_value, w[k]));
+            }
+        }
+        if (!bias_gradients_.empty()) {
+            T* b = bias_gradients_.data();
+            for (size_t k = 0; k < bias_gradients_.size(); ++k) {
+                b[k] = std::max(-clip_value, std::min(clip_value, b[k]));
+            }
+        }
+    }
+
+    /**
+     * Add zero-mean Gaussian noise (stddev = `stddev`) to every weight
+     * in the given active node's row. Used by the Phase-3 random
+     * perturbation. Does not touch inactive nodes. Caller must invoke
+     * mark_weights_dirty() afterwards so the GPU mirrors reupload.
+     */
+    void perturb_node(size_t node_idx, T stddev, Random& rng) {
+        if (node_idx >= output_size_ || stddev <= T(0)) return;
+        if (!is_node_active(node_idx)) return;
+        for (size_t j = 0; j < input_size_; ++j) {
+            weights_.at(node_idx, j) += rng.template normal<T>(T(0), stddev);
+        }
+    }
+
+    /**
+     * Invalidate device-resident weight/bias mirrors after a direct
+     * host-side weight mutation (e.g. perturbation) so the next forward
+     * reuploads.
+     */
+    void mark_weights_dirty() {
+#ifdef DNN_ENABLE_CUDA
+        invalidate_gpu_mirrors_();
+#endif
+    }
+
     void apply_gradients(T learning_rate) {
 #ifdef DNN_ENABLE_CUDA
         if (device_ == Device::CUDA && gpu_weights_ && gpu_biases_
@@ -815,6 +863,10 @@ public:
     const Tensor<T>& weights() const { return weights_; }
     Tensor<T>& biases() { return biases_; }
     const Tensor<T>& biases() const { return biases_; }
+    Tensor<T>& weight_gradients() { return weight_gradients_; }
+    const Tensor<T>& weight_gradients() const { return weight_gradients_; }
+    Tensor<T>& bias_gradients() { return bias_gradients_; }
+    const Tensor<T>& bias_gradients() const { return bias_gradients_; }
 
     std::vector<Node>& nodes() { return nodes_; }
     const std::vector<Node>& nodes() const { return nodes_; }
@@ -937,14 +989,21 @@ public:
     void compute_initial_variance_zscores() {
         if (nodes_.empty()) return;
 
-        // Collect all node variances
+        // Collect variances of active nodes only. Inactive (soft-removed)
+        // nodes never see activations, so their default-zero variance
+        // would skew the mean/std and make active nodes look like outliers.
+        std::vector<size_t> active_idx;
         std::vector<double> variances;
+        active_idx.reserve(nodes_.size());
         variances.reserve(nodes_.size());
 
-        for (const auto& node : nodes_) {
-            auto metrics = node.compute_metrics();
-            variances.push_back(metrics.activation_variance);
+        for (size_t i = 0; i < nodes_.size(); ++i) {
+            if (!is_node_active(i)) continue;
+            active_idx.push_back(i);
+            variances.push_back(nodes_[i].compute_metrics().activation_variance);
         }
+
+        if (variances.empty()) return;
 
         // Compute mean
         double sum = 0.0;
@@ -965,10 +1024,10 @@ public:
             std_dev = 1e-8;
         }
 
-        // Compute z-scores and adapt variance weights
-        for (size_t i = 0; i < nodes_.size(); ++i) {
-            double z = (variances[i] - mean) / std_dev;
-            nodes_[i].adapt_variance_weight(z);
+        // Compute z-scores and adapt variance weights (active nodes only)
+        for (size_t k = 0; k < active_idx.size(); ++k) {
+            double z = (variances[k] - mean) / std_dev;
+            nodes_[active_idx[k]].adapt_variance_weight(z);
         }
     }
 
@@ -979,13 +1038,17 @@ public:
     double compute_gradient_threshold() const {
         if (nodes_.empty()) return 0.1;
 
+        // Active nodes only: inactive nodes have no gradient history and
+        // would drag the threshold toward zero.
         std::vector<double> grad_mags;
         grad_mags.reserve(nodes_.size());
 
-        for (const auto& node : nodes_) {
-            auto metrics = node.compute_metrics();
-            grad_mags.push_back(metrics.gradient_magnitude_avg);
+        for (size_t i = 0; i < nodes_.size(); ++i) {
+            if (!is_node_active(i)) continue;
+            grad_mags.push_back(nodes_[i].compute_metrics().gradient_magnitude_avg);
         }
+
+        if (grad_mags.empty()) return 0.1;
 
         // Compute mean
         double sum = 0.0;
@@ -1018,8 +1081,9 @@ public:
      * Should be called each epoch after training.
      */
     void adapt_node_weights() {
-        for (auto& node : nodes_) {
-            node.adapt_gradient_weight();
+        for (size_t i = 0; i < nodes_.size(); ++i) {
+            if (!is_node_active(i)) continue;
+            nodes_[i].adapt_gradient_weight();
         }
     }
 
@@ -1246,7 +1310,17 @@ public:
     }
 
     /**
-     * Clone the layer.
+     * Clone the layer's *inference* state.
+     *
+     * Copies: weights_, biases_, nodes_ (per-node metrics/efficiency
+     * weights), active_mask_, layer_active_, topology_version_.
+     *
+     * Does NOT copy: weight_gradients_ / bias_gradients_, the forward
+     * caches (cached_input_/pre_activation_/output_), or any GPU
+     * mirrors. A clone taken mid-training therefore has no gradient
+     * state — it is intended for inheritance / inference, not for
+     * resuming a backward pass. Use clone_with_state() if you need the
+     * gradient accumulators (e.g. checkpointing a training run).
      */
     std::unique_ptr<Layer> clone() const {
         auto copy = std::make_unique<Layer>(input_size_, output_size_,
@@ -1257,6 +1331,19 @@ public:
         copy->active_mask_ = active_mask_;
         copy->layer_active_ = layer_active_;
         copy->topology_version_ = topology_version_;
+        return copy;
+    }
+
+    /**
+     * Like clone(), additionally copying the host gradient accumulators
+     * (weight_gradients_ / bias_gradients_) so a checkpoint can resume
+     * mid-training. GPU mirrors and forward caches are still not copied
+     * (they are rebuilt lazily on the next forward).
+     */
+    std::unique_ptr<Layer> clone_with_state() const {
+        auto copy = clone();
+        copy->weight_gradients_ = weight_gradients_.clone();
+        copy->bias_gradients_ = bias_gradients_.clone();
         return copy;
     }
 

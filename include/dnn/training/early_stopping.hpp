@@ -2,6 +2,7 @@
 
 #include "../core/network.hpp"
 #include <vector>
+#include <deque>
 #include <cmath>
 #include <algorithm>
 #include <string>
@@ -76,7 +77,7 @@ public:
 
         // Store recent history for stability calculation
         if (recent_efficiencies_.size() >= 10) {
-            recent_efficiencies_.erase(recent_efficiencies_.begin());
+            recent_efficiencies_.pop_front();
         }
         recent_efficiencies_.push_back(metrics.overall_efficiency);
     }
@@ -254,7 +255,7 @@ private:
 
     std::vector<double> cost_history_;
     std::vector<double> efficiency_history_;
-    std::vector<double> recent_efficiencies_;
+    std::deque<double> recent_efficiencies_;
 
     double best_efficiency_;
     size_t epochs_without_improvement_;
