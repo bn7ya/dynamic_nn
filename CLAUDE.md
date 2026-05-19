@@ -129,7 +129,6 @@ how to engage it.
 | Memory pooling (CPU + GPU) | [`include/dnn/memory/`](include/dnn/memory/CLAUDE.md), [`include/dnn/cuda/`](include/dnn/cuda/CLAUDE.md) | Always on |
 | CUDA Unified Memory mode (VRAM→RAM→disk paging) | [`include/dnn/cuda/`](include/dnn/cuda/CLAUDE.md) | `pydnn.set_cuda_memory_mode("managed")` before constructing the network |
 | Batched trainer forward (rank-2 forward+backward per batch) | [`include/dnn/training/`](include/dnn/training/CLAUDE.md) | **On by default**; `TrainerConfig.batched_train_forward = False` to opt out |
-| CQRS command/query dispatch | [`include/dnn/cqrs/`](include/dnn/cqrs/CLAUDE.md) | Scaffolding only — currently dormant |
 | Dynamic batch sizing | [`include/dnn/training/`](include/dnn/training/CLAUDE.md) | `BatchConfig` in `TrainerConfig` |
 | Early stopping | [`include/dnn/training/`](include/dnn/training/CLAUDE.md) | `enable_early_stopping` |
 | Adaptive weight initialisation | [`include/dnn/core/`](include/dnn/core/CLAUDE.md) | Auto on first `fit()` |

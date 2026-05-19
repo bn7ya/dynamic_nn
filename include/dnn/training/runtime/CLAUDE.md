@@ -94,9 +94,6 @@ instantiation so latent type errors surface at link time.
   own worker thread; it's still feasible and the API is ready, but
   the current `train_phased_runtime` runs phases in the calling
   thread and uses workers only for the parallel observer.
-- The CQRS bus in [`include/dnn/cqrs/CLAUDE.md`](../../cqrs/CLAUDE.md)
-  is the planned dispatch backbone for this runtime — promotion is a
-  follow-up.
 
 ## Memory & reliability notes
 
@@ -127,8 +124,6 @@ instantiation so latent type errors surface at link time.
 - The Python parallel observer that mirrors this on the
   pure-Python fallback:
   [`python/pydnn/CLAUDE.md`](../../../../python/pydnn/CLAUDE.md).
-- Dormant CQRS infrastructure that may eventually back this:
-  [`include/dnn/cqrs/CLAUDE.md`](../../cqrs/CLAUDE.md).
 
 ## Updating this file
 

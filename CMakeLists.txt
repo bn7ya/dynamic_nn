@@ -143,11 +143,6 @@ set(DNN_DYNAMICS_SOURCES
     src/dynamics/trainable_scheduler.cpp
 )
 
-set(DNN_CQRS_SOURCES
-    src/cqrs/command_bus.cpp
-    src/cqrs/query_bus.cpp
-)
-
 set(DNN_IO_SOURCES
     src/io/input_adapter.cpp
     src/io/model_serializer.cpp
@@ -188,7 +183,6 @@ if(DNN_HAS_CUDA)
         ${DNN_SIMD_SOURCES}
         ${DNN_TRAINING_SOURCES}
         ${DNN_DYNAMICS_SOURCES}
-        ${DNN_CQRS_SOURCES}
         ${DNN_IO_SOURCES}
         ${DNN_TRANSFORMER_SOURCES}
         ${DNN_CUDA_SOURCES}
@@ -200,7 +194,6 @@ else()
         ${DNN_SIMD_SOURCES}
         ${DNN_TRAINING_SOURCES}
         ${DNN_DYNAMICS_SOURCES}
-        ${DNN_CQRS_SOURCES}
         ${DNN_IO_SOURCES}
         ${DNN_TRANSFORMER_SOURCES}
     )
