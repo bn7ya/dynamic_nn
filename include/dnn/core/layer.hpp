@@ -779,6 +779,31 @@ public:
         }
     }
 
+    /**
+     * Add zero-mean Gaussian noise (stddev = `stddev`) to every weight
+     * in the given active node's row. Used by the Phase-3 random
+     * perturbation. Does not touch inactive nodes. Caller must invoke
+     * mark_weights_dirty() afterwards so the GPU mirrors reupload.
+     */
+    void perturb_node(size_t node_idx, T stddev, Random& rng) {
+        if (node_idx >= output_size_ || stddev <= T(0)) return;
+        if (!is_node_active(node_idx)) return;
+        for (size_t j = 0; j < input_size_; ++j) {
+            weights_.at(node_idx, j) += rng.template normal<T>(T(0), stddev);
+        }
+    }
+
+    /**
+     * Invalidate device-resident weight/bias mirrors after a direct
+     * host-side weight mutation (e.g. perturbation) so the next forward
+     * reuploads.
+     */
+    void mark_weights_dirty() {
+#ifdef DNN_ENABLE_CUDA
+        invalidate_gpu_mirrors_();
+#endif
+    }
+
     void apply_gradients(T learning_rate) {
 #ifdef DNN_ENABLE_CUDA
         if (device_ == Device::CUDA && gpu_weights_ && gpu_biases_

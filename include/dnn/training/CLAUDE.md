@@ -82,6 +82,17 @@ sequential body and the helpers shared between both paths.
   rewinds, Phase 1 reactivation), the place is
   `trainer.hpp` `train_phased_runtime` and the observer in
   [runtime/CLAUDE.md](runtime/CLAUDE.md).
+- `Trainer::apply_random_perturbation(fraction)` is now implemented
+  (was a no-op that still incremented `result.perturbations_applied`).
+  It picks `max(1, total_nodes*fraction)` random (layer, active-node)
+  pairs via a Trainer-owned `perturb_rng_` (seeded from
+  `network.config().seed`, deterministic) and adds zero-mean Gaussian
+  noise (stddev `TrainerConfig::perturbation_scale`, default 0.01) to
+  each chosen node's weight row, then marks those layers' GPU mirrors
+  dirty. New field `perturbation_scale` is additive on `TrainerConfig`
+  — add the matching row in `_bindings.cpp` in a pybind-host session.
+  Phase 3 cost trajectory now genuinely changes when perturbation
+  fires (expected, Tier 1).
 - `Trainer::clip_gradients()` is now implemented (was a no-op). It
   iterates `network_.layers()` and calls `Layer::clip_gradients(value)`,
   which clamps the accumulated gradients in place to

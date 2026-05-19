@@ -159,6 +159,10 @@ struct TrainerConfig {
     double gradient_clip_value = 1.0;
     bool enable_gradient_clipping = true;
 
+    // Phase-3 random perturbation: stddev of the zero-mean Gaussian
+    // noise added to a perturbed node's weight row.
+    double perturbation_scale = 0.01;
+
     // Normalization (auto-normalize data even if not pre-normalized)
     NormalizationConfig normalization;
 
@@ -243,7 +247,8 @@ public:
         , trainable_scheduler_(network, config.trainable_config)
         , early_stopping_(config.patience, config.min_improvement,
                           config.min_epochs_for_early_stop)
-        , learning_rate_(config.initial_learning_rate) {
+        , learning_rate_(config.initial_learning_rate)
+        , perturb_rng_(network.config().seed + 0x9E3779B9ULL) {
         // Initialize normalization params
         norm_params_.method = config.normalization.method;
         norm_params_.epsilon = static_cast<T>(config.normalization.epsilon);
@@ -1163,11 +1168,33 @@ public:
      * Apply random perturbation to fraction of nodes.
      */
     void apply_random_perturbation(double fraction) {
-        // This is a placeholder - full implementation would modify network weights
-        // The actual perturbation happens at the network level
+        auto& layers = network_.layers();
+        if (layers.empty()) return;
+
         size_t total_nodes = network_.num_nodes();
-        size_t num_to_perturb = std::max(size_t(1), static_cast<size_t>(total_nodes * fraction));
-        // Network-level perturbation would be implemented here
+        if (total_nodes == 0) return;
+        size_t num_to_perturb = std::max(
+            size_t(1), static_cast<size_t>(total_nodes * fraction));
+
+        const T stddev = static_cast<T>(config_.perturbation_scale);
+        std::vector<bool> layer_touched(layers.size(), false);
+
+        for (size_t n = 0; n < num_to_perturb; ++n) {
+            size_t li = static_cast<size_t>(
+                perturb_rng_.randint(0, static_cast<int>(layers.size()) - 1));
+            auto& layer = *layers[li];
+            size_t out = layer.output_size();
+            if (out == 0) continue;
+            size_t node = static_cast<size_t>(
+                perturb_rng_.randint(0, static_cast<int>(out) - 1));
+            layer.perturb_node(node, stddev, perturb_rng_);
+            layer_touched[li] = true;
+        }
+
+        // Reupload mutated weights to the GPU mirrors once per layer.
+        for (size_t li = 0; li < layers.size(); ++li) {
+            if (layer_touched[li]) layers[li]->mark_weights_dirty();
+        }
     }
 
     /**
@@ -1587,6 +1614,7 @@ private:
     TrainableScheduler<T> trainable_scheduler_;
     EarlyStopping<T> early_stopping_;
     double learning_rate_;
+    core::Random perturb_rng_;
     EpochCallback<T> epoch_callback_;
     NormalizationParams<T> norm_params_;
 };

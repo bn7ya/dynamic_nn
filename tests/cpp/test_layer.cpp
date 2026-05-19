@@ -4,9 +4,11 @@
 #include <vector>
 
 #include "dnn/core/layer.hpp"
+#include "dnn/core/random.hpp"
 
 using dnn::core::ActivationType;
 using dnn::core::Layer;
+using dnn::core::Random;
 
 // 1.12: compute_gradient_threshold must ignore soft-removed nodes.
 // Stamp small gradients on nodes 0..2 and huge gradients on 3..5, then
@@ -54,4 +56,37 @@ TEST(Layer, ClipGradientsClampsExtremeValues) {
     }
     for (size_t k = 0; k < bg.size(); ++k)
         EXPECT_NEAR(bg.data()[k], -clip, 1e-6);
+}
+
+// 1.2: perturb_node is seeded-deterministic and skips inactive nodes.
+TEST(Layer, PerturbNodeDeterministicAndSkipsInactive) {
+    auto build = []() {
+        auto l = std::make_unique<Layer<float>>(4, 3, ActivationType::ReLU, 5);
+        for (size_t i = 0; i < 3; ++i)
+            for (size_t j = 0; j < 4; ++j)
+                l->weights().at(i, j) = static_cast<float>(i + j);
+        return l;
+    };
+
+    auto a = build();
+    auto b = build();
+    a->remove_nodes({1});  // soft-remove node 1
+    b->remove_nodes({1});
+
+    Random ra(123), rb(123);
+    for (size_t node = 0; node < 3; ++node) {
+        a->perturb_node(node, 0.05f, ra);
+        b->perturb_node(node, 0.05f, rb);
+    }
+
+    // Inactive node 1 untouched.
+    for (size_t j = 0; j < 4; ++j)
+        EXPECT_FLOAT_EQ(a->weights().at(1, j), static_cast<float>(1 + j));
+    // Active nodes 0 and 2 changed.
+    EXPECT_NE(a->weights().at(0, 0), 0.0f);
+    EXPECT_NE(a->weights().at(2, 0), 2.0f);
+    // Same seed -> identical perturbation.
+    for (size_t i = 0; i < 3; ++i)
+        for (size_t j = 0; j < 4; ++j)
+            EXPECT_FLOAT_EQ(a->weights().at(i, j), b->weights().at(i, j));
 }
