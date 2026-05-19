@@ -198,7 +198,11 @@ private:
         while (observer_running_.load()) {
             {
                 std::unique_lock<std::mutex> lock(observer_mu_);
-                observer_cv_.wait_for(lock, std::chrono::milliseconds(50));
+                // 5 ms fallback only: notify_observer() wakes this
+                // immediately on each publish_metric. The short timeout
+                // bounds stall/efficiency-drop detection latency on fast
+                // models (was 50 ms ~= one epoch of lag at 20 epochs/s).
+                observer_cv_.wait_for(lock, std::chrono::milliseconds(5));
             }
             if (!observer_running_.load()) break;
 

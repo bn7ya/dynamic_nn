@@ -16,6 +16,7 @@
 #include "runtime/topology_lock.hpp"
 #include <functional>
 #include <chrono>
+#include <future>
 #include <memory>
 
 namespace dnn {
@@ -172,6 +173,12 @@ struct TrainerConfig {
     bool use_optimizer = false;
     OptimizerConfig optimizer_config;
 
+    // When true, the epoch callback runs on a background thread against
+    // a network *clone* (single-slot: dropped if the previous callback
+    // is still running) so a slow callback can't stall training. Default
+    // false keeps the synchronous, live-network behaviour bit-for-bit.
+    bool async_callback = false;
+
     // Normalization (auto-normalize data even if not pre-normalized)
     NormalizationConfig normalization;
 
@@ -261,6 +268,10 @@ public:
         // Initialize normalization params
         norm_params_.method = config.normalization.method;
         norm_params_.epsilon = static_cast<T>(config.normalization.epsilon);
+    }
+
+    ~Trainer() {
+        if (cb_future_.valid()) cb_future_.wait();  // no leaked threads
     }
 
     /**
@@ -360,9 +371,8 @@ public:
             batch_manager_.adjust_for_efficiency(efficiency_metrics.overall_efficiency);
 
             // Callback
-            if (epoch_callback_) {
-                epoch_callback_(epoch, val_cost, efficiency_metrics.overall_efficiency, network_);
-            }
+            invoke_epoch_callback(epoch, val_cost,
+                                  efficiency_metrics.overall_efficiency);
 
             previous_cost = val_cost;
             result.epochs_completed = epoch + 1;
@@ -691,10 +701,8 @@ public:
                 }
 
                 // Callback
-                if (epoch_callback_) {
-                    epoch_callback_(20 + result.estimated_epochs + epoch,
-                                   epoch_cost, efficiency, network_);
-                }
+                invoke_epoch_callback(20 + result.estimated_epochs + epoch,
+                                      epoch_cost, efficiency);
 
                 // Early stopping check
                 if (patience_counter >= config_.phase4_patience) {
@@ -1348,14 +1356,44 @@ public:
      */
     double evaluate(const std::vector<Tensor<T>>& inputs,
                     const std::vector<Tensor<T>>& targets) {
+        if (inputs.empty()) return 0.0;
         double total_cost = 0.0;
+
+        if (config_.batched_train_forward) {
+            const size_t N = inputs.size();
+            const size_t input_dim = inputs[0].size();
+            const size_t target_dim = targets[0].size();
+
+            Tensor<T> input_2d(std::vector<size_t>{N, input_dim});
+            for (size_t b = 0; b < N; ++b)
+                for (size_t j = 0; j < input_dim; ++j)
+                    input_2d.at(b, j) = inputs[b][j];
+
+            auto output_2d = network_.forward(input_2d);
+            if (output_2d.rank() != 2) {
+                throw exceptions::ShapeException("evaluate",
+                    "batched forward did not return a rank-2 tensor");
+            }
+            const size_t output_dim = output_2d.shape()[1];
+
+            Tensor<T> output_row(std::vector<size_t>{output_dim});
+            Tensor<T> target_row(std::vector<size_t>{target_dim});
+            for (size_t b = 0; b < N; ++b) {
+                for (size_t j = 0; j < output_dim; ++j)
+                    output_row[j] = output_2d.at(b, j);
+                for (size_t j = 0; j < target_dim; ++j)
+                    target_row[j] = targets[b][j];
+                total_cost += static_cast<double>(
+                    cost_function_->compute(output_row, target_row));
+            }
+            return total_cost / N;
+        }
 
         for (size_t i = 0; i < inputs.size(); ++i) {
             auto output = network_.forward(inputs[i]);
             T sample_cost = cost_function_->compute(output, targets[i]);
             total_cost += static_cast<double>(sample_cost);
         }
-
         return total_cost / inputs.size();
     }
 
@@ -1536,6 +1574,32 @@ private:
     }
 
     /**
+     * Dispatch the epoch callback. Synchronous by default; when
+     * config_.async_callback is set, runs on a background thread against
+     * a network clone with single-slot semantics (a new dispatch is
+     * dropped while the previous one is still running) so a slow user
+     * callback never blocks training.
+     */
+    void invoke_epoch_callback(uint64_t epoch, double cost, double eff) {
+        if (!epoch_callback_) return;
+        if (!config_.async_callback) {
+            epoch_callback_(epoch, cost, eff, network_);
+            return;
+        }
+        if (cb_future_.valid() &&
+            cb_future_.wait_for(std::chrono::seconds(0)) !=
+                std::future_status::ready) {
+            return;  // single-slot: previous callback still running
+        }
+        auto snapshot = network_.clone();  // stable, read-only copy
+        cb_future_ = std::async(
+            std::launch::async,
+            [this, epoch, cost, eff, snap = std::move(snapshot)]() {
+                epoch_callback_(epoch, cost, eff, *snap);
+            });
+    }
+
+    /**
      * Compute and store normalization parameters from training data.
      */
     void compute_normalization_params(const std::vector<Tensor<T>>& inputs,
@@ -1553,29 +1617,26 @@ private:
             norm_params_.input_min.resize(input_size, std::numeric_limits<T>::max());
             norm_params_.input_max.resize(input_size, std::numeric_limits<T>::lowest());
 
-            // Compute mean, min, max
+            // Single-pass Welford: mean + M2 (sum of squared deviations)
+            // alongside min/max. Numerically stabler than the old
+            // two-pass sum-of-squares and halves the data traversal.
+            std::vector<T> m2(input_size, T(0));
+            size_t cnt = 0;
             for (const auto& input : inputs) {
                 const T* data = input.data();
+                ++cnt;
                 for (size_t i = 0; i < input_size; ++i) {
-                    norm_params_.input_mean[i] += data[i];
-                    norm_params_.input_min[i] = std::min(norm_params_.input_min[i], data[i]);
-                    norm_params_.input_max[i] = std::max(norm_params_.input_max[i], data[i]);
+                    T x = data[i];
+                    T delta = x - norm_params_.input_mean[i];
+                    norm_params_.input_mean[i] += delta / static_cast<T>(cnt);
+                    m2[i] += delta * (x - norm_params_.input_mean[i]);
+                    norm_params_.input_min[i] = std::min(norm_params_.input_min[i], x);
+                    norm_params_.input_max[i] = std::max(norm_params_.input_max[i], x);
                 }
             }
             for (size_t i = 0; i < input_size; ++i) {
-                norm_params_.input_mean[i] /= n_samples;
-            }
-
-            // Compute std
-            for (const auto& input : inputs) {
-                const T* data = input.data();
-                for (size_t i = 0; i < input_size; ++i) {
-                    T diff = data[i] - norm_params_.input_mean[i];
-                    norm_params_.input_std[i] += diff * diff;
-                }
-            }
-            for (size_t i = 0; i < input_size; ++i) {
-                norm_params_.input_std[i] = std::sqrt(norm_params_.input_std[i] / n_samples) + norm_params_.epsilon;
+                norm_params_.input_std[i] =
+                    std::sqrt(m2[i] / n_samples) + norm_params_.epsilon;
             }
 
             norm_params_.input_normalized = true;
@@ -1593,29 +1654,24 @@ private:
             norm_params_.output_min.resize(output_size, std::numeric_limits<T>::max());
             norm_params_.output_max.resize(output_size, std::numeric_limits<T>::lowest());
 
-            // Compute mean, min, max
+            // Single-pass Welford (see input block above).
+            std::vector<T> m2(output_size, T(0));
+            size_t cnt = 0;
             for (const auto& target : targets) {
                 const T* data = target.data();
+                ++cnt;
                 for (size_t i = 0; i < output_size; ++i) {
-                    norm_params_.output_mean[i] += data[i];
-                    norm_params_.output_min[i] = std::min(norm_params_.output_min[i], data[i]);
-                    norm_params_.output_max[i] = std::max(norm_params_.output_max[i], data[i]);
+                    T x = data[i];
+                    T delta = x - norm_params_.output_mean[i];
+                    norm_params_.output_mean[i] += delta / static_cast<T>(cnt);
+                    m2[i] += delta * (x - norm_params_.output_mean[i]);
+                    norm_params_.output_min[i] = std::min(norm_params_.output_min[i], x);
+                    norm_params_.output_max[i] = std::max(norm_params_.output_max[i], x);
                 }
             }
             for (size_t i = 0; i < output_size; ++i) {
-                norm_params_.output_mean[i] /= n_samples;
-            }
-
-            // Compute std
-            for (const auto& target : targets) {
-                const T* data = target.data();
-                for (size_t i = 0; i < output_size; ++i) {
-                    T diff = data[i] - norm_params_.output_mean[i];
-                    norm_params_.output_std[i] += diff * diff;
-                }
-            }
-            for (size_t i = 0; i < output_size; ++i) {
-                norm_params_.output_std[i] = std::sqrt(norm_params_.output_std[i] / n_samples) + norm_params_.epsilon;
+                norm_params_.output_std[i] =
+                    std::sqrt(m2[i] / n_samples) + norm_params_.epsilon;
             }
 
             norm_params_.output_normalized = true;
@@ -1685,6 +1741,7 @@ private:
     NormalizationParams<T> norm_params_;
     std::vector<std::unique_ptr<Optimizer<T>>> optimizers_;
     uint64_t optimizer_topology_version_ = UINT64_MAX;
+    std::future<void> cb_future_;
 };
 
 // Out-of-line definition of RuntimeAdaptiveConfig::apply_static_config.

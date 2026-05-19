@@ -113,6 +113,24 @@ sequential body and the helpers shared between both paths.
   — add the matching row in `_bindings.cpp` in a pybind-host session.
   Phase 3 cost trajectory now genuinely changes when perturbation
   fires (expected, Tier 1).
+- `Trainer::evaluate` now uses the batched rank-2 forward when
+  `batched_train_forward` is true (no backward), matching `train_epoch`.
+  Numerically equivalent to the per-sample loop modulo matmul summation
+  order; the per-sample path stays reachable via the same flag.
+- `compute_normalization_params` is single-pass Welford (mean + M2 +
+  min/max in one traversal) instead of two passes. Same std values
+  within fp tolerance, numerically stabler.
+- `TrainerConfig::async_callback` (default false) runs the epoch
+  callback on a background thread against a `network_.clone()` with
+  single-slot drop semantics; `~Trainer()` joins any in-flight
+  callback. Default false keeps the synchronous live-network behaviour
+  bit-for-bit. Additive field — flag `_bindings.cpp` for pybind host.
+- 2.3 (forward_cpu weights_t per-forward transpose) was intentionally
+  NOT cached: the optimizer mutates `weights_` through the public
+  `weights()` accessor, so no internal version counter can correctly
+  invalidate a cached transpose, and changing the `SIMDOps::matmul`
+  virtual interface risks Tier-2 numerical identity across SIMD
+  backends. Left as-is for correctness.
 - `Trainer::clip_gradients()` is now implemented (was a no-op). It
   iterates `network_.layers()` and calls `Layer::clip_gradients(value)`,
   which clamps the accumulated gradients in place to

@@ -61,8 +61,15 @@ instantiation so latent type errors surface at link time.
   training forever.
 - **`MetricsBus::publish` is single-producer per stage, MPSC overall.**
   The controller thread and observer thread are both readers. The
-  ring is mutex-guarded; that's intentional and adequate for ~1
-  publish per epoch.
+  ring is now lock-free: `publish` reserves a unique slot via an
+  atomic fetch-add and release-publishes the count; readers acquire-
+  load it. A rare slightly-stale read is acceptable — the observer
+  re-polls every few ms and only needs the recent trend. Don't
+  reintroduce the mutex.
+- **The observer poll fallback is 5 ms** (was 50 ms).
+  `notify_observer()` still wakes it immediately on every
+  `publish_metric`; the timeout only bounds detection latency if a
+  notification is missed.
 
 ## Maintenance notes
 
