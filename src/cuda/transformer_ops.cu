@@ -690,6 +690,9 @@ __global__ void xent_bwd_kernel(const float* __restrict__ log_probs,
         float p = __expf(lp[c]);
         dl[c] = scale * p;
     }
+    // The thread that wrote dl[t] above is not necessarily tid 0;
+    // synchronise so tid 0's read-modify-write sees the final value.
+    __syncthreads();
     if (tid == 0) dl[t] -= scale;
 }
 

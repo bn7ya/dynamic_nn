@@ -118,13 +118,19 @@ __global__ void reduce_sum_kernel(const T* input, T* output, size_t n) {
  */
 __device__ __forceinline__ void atomicMaxFloat(float* address, float val) {
     int* address_as_int = (int*)address;
+    // NaN propagation (numpy semantics): any NaN poisons the result.
+    if (isnan(val)) {
+        atomicExch(address_as_int, __float_as_int(nanf("")));
+        return;
+    }
     int old = *address_as_int;
     int assumed;
-
     do {
         assumed = old;
-        old = atomicCAS(address_as_int, assumed,
-            __float_as_int(max(val, __int_as_float(assumed))));
+        float cur = __int_as_float(assumed);
+        if (isnan(cur)) return;  // already NaN -> stays NaN
+        float newv = val > cur ? val : cur;
+        old = atomicCAS(address_as_int, assumed, __float_as_int(newv));
     } while (assumed != old);
 }
 
@@ -238,13 +244,19 @@ __global__ void reduce_max_kernel<double>(const double* input, double* output, s
  */
 __device__ __forceinline__ void atomicMinFloat(float* address, float val) {
     int* address_as_int = (int*)address;
+    // NaN propagation (numpy semantics): any NaN poisons the result.
+    if (isnan(val)) {
+        atomicExch(address_as_int, __float_as_int(nanf("")));
+        return;
+    }
     int old = *address_as_int;
     int assumed;
-
     do {
         assumed = old;
-        old = atomicCAS(address_as_int, assumed,
-            __float_as_int(min(val, __int_as_float(assumed))));
+        float cur = __int_as_float(assumed);
+        if (isnan(cur)) return;  // already NaN -> stays NaN
+        float newv = val < cur ? val : cur;
+        old = atomicCAS(address_as_int, assumed, __float_as_int(newv));
     } while (assumed != old);
 }
 

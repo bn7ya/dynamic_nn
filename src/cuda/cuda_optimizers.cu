@@ -70,7 +70,11 @@ __global__ void gradient_clip_kernel(
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n) {
         T g = gradients[idx];
-        gradients[idx] = fmaxf(-clip_value, fminf(clip_value, g));
+        // Type-generic clamp: fmaxf/fminf are float-only and silently
+        // narrow double through float. An inline ternary keeps full
+        // precision for the double instantiation and needs no overload.
+        g = g > clip_value ? clip_value : (g < -clip_value ? -clip_value : g);
+        gradients[idx] = g;
     }
 }
 

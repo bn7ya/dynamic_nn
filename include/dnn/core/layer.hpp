@@ -522,8 +522,9 @@ private:
     }
 
     /**
-     * Apply the layer's activation backward on device. Returns false when
-     * no GPU kernel exists (notably Softmax — no cuda_softmax_backward).
+     * Apply the layer's activation backward on device. ReLU/Sigmoid/
+     * Tanh/Softmax run on-device; returns false only for activations
+     * with no GPU backward kernel (host fallback).
      */
     bool apply_activation_backward_gpu_(const cuda::CudaTensor<T>& pre_act,
                                          const cuda::CudaTensor<T>& post_act,
@@ -538,6 +539,9 @@ private:
                 return true;
             case ActivationType::Tanh:
                 cuda::cuda_tanh_backward(post_act, grad_out, grad_in);
+                return true;
+            case ActivationType::Softmax:
+                cuda::cuda_softmax_backward(post_act, grad_out, grad_in);
                 return true;
             default:
                 return false;
