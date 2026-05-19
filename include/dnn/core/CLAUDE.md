@@ -115,10 +115,13 @@ instantiations for `float` and `double`; behaviour lives in the headers.
   gates on `is_node_active(i)`, but the GPU/CPU split is a known perf
   cost. Worth migrating the accumulation onto GPU eventually; preserve
   the active-mask gating when you do.
-- `Network<T>::compact()` includes a fan-in repair pass that **resets
-  the rebuilt layer's weights**. This is acceptable because compaction
-  is end-of-training; calling it mid-training would silently regress
-  weights. Guarded by `Network<T>::training_in_progress_`: the
+- `Network<T>::compact()` (and `insert_layer` / `remove_layer`) rebuild
+  a fan-in-changed layer via `rebuild_layer_preserving_`, which copies
+  the first `min(old,new)` weight rows/cols, the matching biases, and
+  the per-node active mask. Trained parameters for surviving
+  connections are preserved; only genuinely new rows/cols are fresh.
+  `compact()` is still guarded by `Network<T>::training_in_progress_`
+  (mid-training topology rebuilds remain disallowed by default): the
   trainer's `TrainingInProgressGuard` (RAII in
   `include/dnn/training/trainer.hpp`) flips the flag for the duration
   of `train_phased{,_runtime}`, and `compact()` throws
