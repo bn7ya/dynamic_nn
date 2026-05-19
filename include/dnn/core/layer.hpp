@@ -557,20 +557,11 @@ private:
         const size_t rank = pre_act.ndim();
         const size_t row_size = (rank == 2) ? pre_act.shape()[1] : pre_act.size();
         if (row_size != output_size_) return;
-        // The cheapest portable path: D2H the whole tensor then read its
-        // first row. For rank-1 this IS the whole tensor; for rank-2 the
-        // tensor is at most (B, O) — typically small enough that the D2H
-        // cost is bounded by the same kernel-launch granularity. A future
-        // CudaTensor::copy_row_to_host(0, dst, n) helper can reduce this
-        // further; not required for correctness.
+        // Row 0 is the first row_size contiguous elements (row-major) for
+        // both rank-1 and rank-2; copy exactly those instead of D2H-ing
+        // the whole (B, O) tensor.
         Tensor<T> host_row(std::vector<size_t>{row_size});
-        if (rank == 1) {
-            Tensor<T> full = pre_act.to_host();
-            for (size_t i = 0; i < row_size; ++i) host_row[i] = full[i];
-        } else {
-            Tensor<T> full = pre_act.to_host();
-            for (size_t i = 0; i < row_size; ++i) host_row[i] = full.at(0, i);
-        }
+        pre_act.copy_to_host_strided(host_row.data(), 0, row_size);
         for (size_t i = 0; i < output_size_; ++i) {
             nodes_[i].record_activation(static_cast<float>(host_row[i]));
         }
@@ -584,13 +575,7 @@ private:
         const size_t row_size = (rank == 2) ? grad_act.shape()[1] : grad_act.size();
         if (row_size != output_size_) return;
         Tensor<T> host_row(std::vector<size_t>{row_size});
-        if (rank == 1) {
-            Tensor<T> full = grad_act.to_host();
-            for (size_t i = 0; i < row_size; ++i) host_row[i] = full[i];
-        } else {
-            Tensor<T> full = grad_act.to_host();
-            for (size_t i = 0; i < row_size; ++i) host_row[i] = full.at(0, i);
-        }
+        grad_act.copy_to_host_strided(host_row.data(), 0, row_size);
         for (size_t i = 0; i < output_size_; ++i) {
             nodes_[i].record_gradient(static_cast<float>(host_row[i]));
         }
