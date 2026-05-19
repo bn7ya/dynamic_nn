@@ -173,6 +173,7 @@ private:
         if (!pool.free_list.empty()) {
             void* ptr = pool.free_list.back();
             pool.free_list.pop_back();
+            block_classes_[ptr] = class_idx;
             return ptr;
         }
 
@@ -182,27 +183,27 @@ private:
             pool.blocks_allocated++;
             total_allocated_ += block_size;
             peak_allocated_ = std::max(peak_allocated_, total_allocated_.load());
+            block_classes_[ptr] = class_idx;
         }
         return ptr;
     }
 
     void deallocate_to_pool(void* ptr) {
-        // We need to know the size class - store it in the allocation header
-        // For simplicity, we'll iterate to find which pool it might belong to
-        // In production, we'd store metadata with the allocation
-
         std::lock_guard<std::mutex> lock(pool_mutex_);
 
-        // Add to the first non-full pool (heuristic)
-        // In a real implementation, we'd track the size class
-        for (size_t i = 0; i < NUM_SIZE_CLASSES; ++i) {
-            if (pools_[i].blocks_allocated > 0) {
-                pools_[i].free_list.push_back(ptr);
-                return;
-            }
+        // Return the block to the exact size class it was allocated from.
+        // Tracking the class per pointer is required: pushing a block onto
+        // the wrong free list hands a mis-sized buffer to the next caller
+        // of that class and makes bytes_in_pools()/peak_usage() inconsistent.
+        auto it = block_classes_.find(ptr);
+        if (it != block_classes_.end()) {
+            size_t class_idx = it->second;
+            block_classes_.erase(it);
+            pools_[class_idx].free_list.push_back(ptr);
+            return;
         }
 
-        // Fallback: just free it
+        // Unknown pointer (never handed out by this pool): fall back.
         aligned_free(ptr);
     }
 
@@ -221,6 +222,7 @@ private:
     std::mutex large_mutex_;
     Pool pools_[NUM_SIZE_CLASSES];
     std::unordered_map<void*, size_t> large_allocations_;
+    std::unordered_map<void*, size_t> block_classes_;  // live pooled ptr -> size class
     std::atomic<size_t> total_allocated_{0};
     size_t peak_allocated_{0};
 };

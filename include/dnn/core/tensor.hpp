@@ -8,6 +8,7 @@
 #include <memory>
 #include <numeric>
 #include <cstring>
+#include <cassert>
 #include <initializer_list>
 #include <functional>
 #include <sstream>
@@ -28,6 +29,34 @@ public:
     using value_type = T;
     using size_type = size_t;
     using shape_type = std::vector<size_t>;
+
+    /**
+     * Immutable, non-owning view over a Tensor's storage. Exposes only
+     * const accessors so a const Tensor can be aliased without a
+     * const_cast and without any way to mutate through the alias.
+     */
+    class ConstView {
+    public:
+        ConstView(const T* data, shape_type shape, shape_type strides,
+                  size_t total_size)
+            : data_(data), shape_(std::move(shape)),
+              strides_(std::move(strides)), total_size_(total_size) {}
+
+        const shape_type& shape() const { return shape_; }
+        size_t rank() const { return shape_.size(); }
+        size_t size() const { return total_size_; }
+        const T* data() const { return data_; }
+        const T& operator[](size_t i) const { return data_[i]; }
+        const T& at(size_t i, size_t j) const {
+            return data_[i * strides_[0] + j];
+        }
+
+    private:
+        const T* data_;
+        shape_type shape_;
+        shape_type strides_;
+        size_t total_size_;
+    };
 
     /**
      * Default constructor - creates empty tensor.
@@ -171,10 +200,14 @@ public:
      * 2D access (for matrices).
      */
     T& at(size_t i, size_t j) {
+        assert(rank() == 2 && i < shape_[0] && j < shape_[1] &&
+               "Tensor::at(i,j) index out of bounds");
         return data_[i * strides_[0] + j];
     }
 
     const T& at(size_t i, size_t j) const {
+        assert(rank() == 2 && i < shape_[0] && j < shape_[1] &&
+               "Tensor::at(i,j) index out of bounds");
         return data_[i * strides_[0] + j];
     }
 
@@ -210,16 +243,27 @@ public:
     }
 
     /**
-     * Create a view (non-owning reference to data).
+     * Create a mutable, non-owning view of this tensor. Non-const: a
+     * const Tensor cannot produce a mutable alias of itself. Use
+     * const_view() for read-only aliasing of a const tensor.
      */
-    Tensor view() const {
+    Tensor view() {
         Tensor result;
         result.shape_ = shape_;
         result.strides_ = strides_;
-        result.data_ = const_cast<T*>(data_);
+        result.data_ = data_;
         result.total_size_ = total_size_;
         result.owns_data_ = false;
         return result;
+    }
+
+    /**
+     * Read-only, non-owning view. Genuinely cannot mutate the backing
+     * storage (no non-const data()/at()), so it is safe to obtain from
+     * a const Tensor without const_cast.
+     */
+    ConstView const_view() const {
+        return ConstView(data_, shape_, strides_, total_size_);
     }
 
     // Arithmetic operations (create new tensors)
@@ -368,10 +412,27 @@ public:
             throw exceptions::ShapeException("transpose", "Tensor must be 2D");
         }
 
-        Tensor result(shape_type{shape_[1], shape_[0]});
-        for (size_t i = 0; i < shape_[0]; ++i) {
-            for (size_t j = 0; j < shape_[1]; ++j) {
-                result.at(j, i) = at(i, j);
+        const size_t rows = shape_[0];
+        const size_t cols = shape_[1];
+        Tensor result(shape_type{cols, rows});
+
+        // Cache-blocked transpose: process TILE x TILE sub-blocks so the
+        // strided writes into `result` stay within cache instead of
+        // jumping `rows` elements on every inner step.
+        constexpr size_t TILE = 32;
+        const size_t src_stride = strides_[0];
+        const T* src = data_;
+        T* dst = result.data_;
+        for (size_t ii = 0; ii < rows; ii += TILE) {
+            const size_t i_end = std::min(ii + TILE, rows);
+            for (size_t jj = 0; jj < cols; jj += TILE) {
+                const size_t j_end = std::min(jj + TILE, cols);
+                for (size_t i = ii; i < i_end; ++i) {
+                    const T* src_row = src + i * src_stride;
+                    for (size_t j = jj; j < j_end; ++j) {
+                        dst[j * rows + i] = src_row[j];
+                    }
+                }
             }
         }
         return result;

@@ -35,6 +35,11 @@ tracks peak usage. The GPU equivalent lives in
 
 ## Maintenance notes
 
+- `deallocate` returns a block to the exact size class it came from.
+  `block_classes_` (a `void* -> class` map under `pool_mutex_`) records
+  the class at allocation time. Don't reintroduce the old "push to the
+  first non-empty pool" heuristic — it corrupts pool accounting and
+  hands mis-sized buffers to later callers.
 - `PoolAllocator` doesn't release back to the OS until destruction.
   That's intentional — it keeps the pool warm. If you ever care about
   rss returning to baseline mid-process (e.g. a long-running server),

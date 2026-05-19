@@ -463,6 +463,11 @@ public:
             copy->layers_.push_back(layer->clone());
         }
         copy->state_ = state_;
+        copy->topology_version_ = topology_version_;
+        // Copy the training-in-progress flag so a clone taken mid-training
+        // also refuses compact() — otherwise the clone looks idle and its
+        // weights can be silently regressed.
+        copy->training_in_progress_ = training_in_progress_;
         return copy;
     }
 
