@@ -27,6 +27,7 @@ def _train_torch_model(
     lr: float,
     device: str,
     metric: str,
+    batch_size: int = 64,
 ) -> BaselineResult:
     model = model.to(device)
     X_train = X_train.to(device)
@@ -34,15 +35,19 @@ def _train_torch_model(
     X_test = X_test.to(device)
     y_test = y_test.to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
+    y_idx = (y_train.argmax(1) if y_train.dim() > 1
+              else y_train.long())
     start = time.time()
+    n = X_train.shape[0]
     for _ in range(epochs):
-        opt.zero_grad()
-        logits = model(X_train)
-        loss = nn.functional.cross_entropy(logits, y_train.argmax(1)
-                                            if y_train.dim() > 1
-                                            else y_train.long())
-        loss.backward()
-        opt.step()
+        perm = torch.randperm(n, device=device)
+        for i in range(0, n, batch_size):
+            idx = perm[i:i + batch_size]
+            opt.zero_grad()
+            logits = model(X_train[idx])
+            loss = nn.functional.cross_entropy(logits, y_idx[idx])
+            loss.backward()
+            opt.step()
     elapsed = time.time() - start
     model.eval()
     with torch.no_grad():

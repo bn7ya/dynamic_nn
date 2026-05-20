@@ -46,6 +46,14 @@ void register_modules(py::module_& m) {
         .def("out_features", &ReversibleLinearImpl::out_features)
         .def("active_count", &ReversibleLinearImpl::active_count)
         .def("topology_version", &ReversibleLinearImpl::topology_version)
+        .def("utilization_per_node",
+              [](ReversibleLinearImpl& s) {
+                  return s.metrics.utilization_per_node();
+              })
+        .def("sample_count",
+              [](ReversibleLinearImpl& s) {
+                  return s.metrics.sample_count();
+              })
         .def("parameters",
               [](ReversibleLinearImpl& s) { return s.parameters(); })
         .def("buffers",

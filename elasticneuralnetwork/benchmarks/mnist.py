@@ -27,14 +27,10 @@ def load_mnist():
                             transform=tfm)
     test = datasets.MNIST(str(CACHE_DIR), train=False, download=True,
                             transform=tfm)
-    Xtr = torch.stack([train[i][0].view(-1)
-                        for i in range(len(train))]).float()
-    ytr = torch.tensor([train[i][1] for i in range(len(train))],
-                        dtype=torch.long)
-    Xte = torch.stack([test[i][0].view(-1)
-                        for i in range(len(test))]).float()
-    yte = torch.tensor([test[i][1] for i in range(len(test))],
-                        dtype=torch.long)
+    Xtr = train.data.float().view(-1, 28 * 28) / 255.0
+    ytr = train.targets.long()
+    Xte = test.data.float().view(-1, 28 * 28) / 255.0
+    yte = test.targets.long()
     return Xtr, ytr, Xte, yte
 
 

@@ -84,7 +84,7 @@ def run_enn(X_train, y_train, X_test, y_test, seed: int,
     from elasticneuralnetwork import ElasticNetwork
     model = ElasticNetwork(input_shape=input_shape,
                             output_size=output_size, seed=seed,
-                            hidden_depth=2)
+                            hidden_depth=1)
     start = time.time()
     result = model.fit(X_train, y_train)
     elapsed = time.time() - start

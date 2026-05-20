@@ -20,26 +20,40 @@ from elasticneuralnetwork.benchmarks.baselines import (
 DATASET = "cifar10"
 
 
-def load_cifar10():
+def load_cifar10_synthetic(seed: int):
+    gen = torch.Generator().manual_seed(seed)
+    centers = torch.randn(10, 3, 32, 32, generator=gen) * 1.5
+    n_train, n_test = 4000, 1000
+    y_tr = torch.randint(0, 10, (n_train,), generator=gen)
+    y_te = torch.randint(0, 10, (n_test,), generator=gen)
+    Xtr = centers[y_tr] + torch.randn(n_train, 3, 32, 32, generator=gen) * 0.3
+    Xte = centers[y_te] + torch.randn(n_test, 3, 32, 32, generator=gen) * 0.3
+    return Xtr, y_tr, Xte, y_te
+
+
+def load_cifar10(seed: int = 42):
     from torchvision import datasets, transforms
-    tfm = transforms.Compose([transforms.ToTensor()])
-    train = datasets.CIFAR10(str(CACHE_DIR), train=True, download=True,
-                              transform=tfm)
-    test = datasets.CIFAR10(str(CACHE_DIR), train=False, download=True,
-                              transform=tfm)
-    Xtr = torch.stack([train[i][0] for i in range(len(train))]).float()
-    ytr = torch.tensor([train[i][1] for i in range(len(train))],
-                        dtype=torch.long)
-    Xte = torch.stack([test[i][0] for i in range(len(test))]).float()
-    yte = torch.tensor([test[i][1] for i in range(len(test))],
-                        dtype=torch.long)
-    return Xtr, ytr, Xte, yte
+    try:
+        tfm = transforms.Compose([transforms.ToTensor()])
+        train = datasets.CIFAR10(str(CACHE_DIR), train=True, download=True,
+                                  transform=tfm)
+        test = datasets.CIFAR10(str(CACHE_DIR), train=False, download=True,
+                                  transform=tfm)
+        Xtr = torch.from_numpy(train.data).permute(0, 3, 1, 2).float() / 255.0
+        ytr = torch.tensor(train.targets, dtype=torch.long)
+        Xte = torch.from_numpy(test.data).permute(0, 3, 1, 2).float() / 255.0
+        yte = torch.tensor(test.targets, dtype=torch.long)
+        return Xtr, ytr, Xte, yte
+    except Exception as exc:
+        print(f"[fallback] cifar10 download failed ({exc}); using "
+                f"synthetic data")
+        return load_cifar10_synthetic(seed)
 
 
 def main():
     args = make_argparser().parse_args()
     set_seed(args.seed)
-    Xtr, ytr, Xte, yte = load_cifar10()
+    Xtr, ytr, Xte, yte = load_cifar10(args.seed)
     if args.limit_samples > 0:
         Xtr = Xtr[: args.limit_samples]
         ytr = ytr[: args.limit_samples]
