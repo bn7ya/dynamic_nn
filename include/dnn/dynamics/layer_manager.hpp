@@ -414,6 +414,9 @@ public:
                              const core::Tensor<T>& B, size_t n) {
         return linear_cka_(A, B, n);
     }
+    double compute_layer_similarity_for_testing(size_t i, size_t j) const {
+        return compute_layer_similarity(i, j);
+    }
 
 private:
     bool should_add_layer() const {
@@ -540,16 +543,19 @@ private:
         if (it != sim_cache_.end()) return it->second;
 
         const size_t B = 16;
-        core::Random rng(0xC0FFEE);  // deterministic probe
         // Compute the layer's linear response (W x + b) directly from
         // its parameters — never call forward(): that records per-node
         // activation metrics and would pollute the very efficiency
         // state these decisions read (observers don't mutate observed
-        // state).
+        // state). The RNG is reset before each probe so the shared
+        // input prefix is identical; without reset, layer j would see
+        // RNG state advanced past layer i's draws and two identical
+        // layers would score CKA ~= 0.
         auto probe = [&](size_t layer_idx) {
+            core::Random rng(0xC0FFEE);
             const auto& L = network_.layer(layer_idx);
-            const auto& W = L.weights();   // (out, in)
-            const auto& bs = L.biases();   // (out,)
+            const auto& W = L.weights();
+            const auto& bs = L.biases();
             size_t in = L.input_size();
             size_t out = L.output_size();
             core::Tensor<T> resp(std::vector<size_t>{B, out});

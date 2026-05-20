@@ -630,6 +630,9 @@ private:
             }
             nb[i] = ob[i];
             rebuilt->set_node_active(i, old.is_node_active(i));
+            // Preserve per-node training history (efficiency EMA,
+            // sample counts, trainability) for surviving neurons.
+            rebuilt->nodes()[i] = old.nodes()[i];
         }
         return rebuilt;
     }

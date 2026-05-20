@@ -1402,6 +1402,14 @@ public:
     }
 
     /**
+     * Public test hook: run a single weight-update step using the
+     * currently-configured optimizer path (or the legacy SGD path when
+     * use_optimizer is false). Useful for verifying the soft-delete
+     * mask is honoured by the optimizer step.
+     */
+    void apply_gradients_step_for_testing(T lr) { apply_gradients_step(lr); }
+
+    /**
      * Get current training state.
      */
     const core::TrainingState& state() const {
@@ -1563,9 +1571,34 @@ private:
 #endif
             if (layer.weight_gradients().empty()) continue;
             optimizers_[i]->set_learning_rate(lr);
-            optimizers_[i]->update(layer.weights(), layer.biases(),
-                                   layer.weight_gradients(),
+
+            // Soft-delete contract: inactive / non-trainable rows must
+            // not move. Optimizer::update writes every element (and Adam
+            // momentum can drift even with zero gradient), so snapshot
+            // those rows of weights/biases, run the update, then restore.
+            const size_t O = layer.output_size();
+            const size_t I = layer.input_size();
+            auto& W = layer.weights();
+            auto& B = layer.biases();
+            std::vector<std::pair<size_t, std::vector<T>>> w_snap;
+            std::vector<std::pair<size_t, T>> b_snap;
+            for (size_t r = 0; r < O; ++r) {
+                if (!layer.is_node_active(r) ||
+                    !layer.node(r).is_trainable()) {
+                    std::vector<T> row(I);
+                    for (size_t c = 0; c < I; ++c) row[c] = W.at(r, c);
+                    w_snap.emplace_back(r, std::move(row));
+                    b_snap.emplace_back(r, B[r]);
+                }
+            }
+
+            optimizers_[i]->update(W, B, layer.weight_gradients(),
                                    layer.bias_gradients());
+
+            for (const auto& [r, row] : w_snap)
+                for (size_t c = 0; c < I; ++c) W.at(r, c) = row[c];
+            for (const auto& [r, v] : b_snap) B[r] = v;
+
             layer.zero_gradients();
         }
     }
@@ -1589,10 +1622,16 @@ private:
             return;  // single-slot: previous callback still running
         }
         auto snapshot = network_.clone();  // stable, read-only copy
+        // Snapshot the callable too: if the user calls
+        // set_epoch_callback while this async dispatch is in flight,
+        // reading epoch_callback_ from the lambda would race the
+        // std::function assignment. Capture by value.
+        auto cb = epoch_callback_;
         cb_future_ = std::async(
             std::launch::async,
-            [this, epoch, cost, eff, snap = std::move(snapshot)]() {
-                epoch_callback_(epoch, cost, eff, *snap);
+            [cb = std::move(cb), epoch, cost, eff,
+             snap = std::move(snapshot)]() {
+                cb(epoch, cost, eff, *snap);
             });
     }
 
