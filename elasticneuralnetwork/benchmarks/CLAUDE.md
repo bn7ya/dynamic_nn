@@ -8,6 +8,14 @@ method + a PNG of the cost/utilization trajectories. `report.py`
 aggregates everything and evaluates Phase 11 criterion 4 (ENN beats
 baseline on ≥ 2 of 5 datasets with ≥ 20% parameter reduction).
 
+The PyTorch baselines (`PyTorchMLPBaseline`, `PyTorchCNNBaseline` in
+`baselines.py`) use stock `torch.nn.Sequential` plus
+`torch.optim.Adam` plus a mini-batch SGD loop. That is exactly the
+training loop ENN's `torch.nn.Module` subclasses are designed to slot
+into — the head-to-head comparison shows ENN's reversible-topology
+modules in the same harness as a plain PyTorch MLP, with the only
+difference being the module itself.
+
 ## Files
 
 | File | Role |

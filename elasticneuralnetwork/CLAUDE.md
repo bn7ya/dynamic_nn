@@ -8,6 +8,35 @@ flattens images, dispatches to `PhaseController`, and matches the
 shape of the old `pydnn.DynamicNetwork` public surface (with the
 spec's renamed APIs).
 
+Every class re-exported here is either a pybind11-bound C++
+`torch::nn::Module` (`ReversibleLinear`, `ReversibleNetwork`,
+`AdaptiveConv2d` — expose `forward`, `parameters`, `buffers`) or a
+pybind11-bound POD config / controller (`PlateauConfig`,
+`StabilityMonitor`, `AdaptiveLRConfig`, …). `ElasticNetwork` is a
+thin Python wrapper that composes a `ReversibleNetwork` and calls
+`PhaseController.fit` — advanced users compose the underlying
+modules themselves with `torch.optim.*` and a `DataLoader`. Full
+`torch.nn.Module` Python API parity (`state_dict()`, `.to(device)`,
+`eval()`, `train()`) is recorded as future work.
+
+## Direct-use example
+
+```python
+import torch
+from elasticneuralnetwork import ReversibleNetwork, ReversibleNetworkConfig
+
+cfg = ReversibleNetworkConfig()
+cfg.input_features, cfg.output_features = 16, 4
+cfg.hidden_sizes = [8]
+net = ReversibleNetwork(cfg)
+opt = torch.optim.Adam(net.parameters(), lr=1e-3)
+for _ in range(20):
+    opt.zero_grad()
+    loss = torch.nn.functional.cross_entropy(net.forward(X), y)
+    loss.backward(); opt.step()
+net.compact()
+```
+
 ## Files
 
 | File | Role |
