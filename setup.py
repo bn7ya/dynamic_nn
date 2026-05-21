@@ -1,4 +1,5 @@
 import os
+import sys
 from pathlib import Path
 
 from setuptools import setup
@@ -7,6 +8,8 @@ from torch.utils import cpp_extension
 
 REPO_ROOT = Path(__file__).resolve().parent
 CSRC = REPO_ROOT / "csrc"
+
+_IS_WINDOWS = sys.platform == "win32"
 
 
 def _can_use_cuda() -> bool:
@@ -27,9 +30,11 @@ def build_extension():
     use_cuda = _can_use_cuda()
     sources = _gather_sources(use_cuda)
     include_dirs = [str(CSRC / "include")]
-    extra_compile_args = {
-        "cxx": ["-O3", "-std=c++17"],
-    }
+    if _IS_WINDOWS:
+        cxx_flags = ["/O2", "/std:c++17"]
+    else:
+        cxx_flags = ["-O3", "-std=c++17"]
+    extra_compile_args = {"cxx": cxx_flags}
     if use_cuda:
         extra_compile_args["nvcc"] = ["-O3", "--std=c++17"]
         ext_cls = cpp_extension.CUDAExtension

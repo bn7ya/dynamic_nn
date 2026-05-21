@@ -1,3 +1,6 @@
+#ifdef _WIN32
+#define _USE_MATH_DEFINES
+#endif
 #include "enn/controllers/trainable_scheduler.hpp"
 
 #include <algorithm>

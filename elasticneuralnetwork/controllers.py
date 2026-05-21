@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+from typing import Optional
+
 from elasticneuralnetwork._enn_core import controllers as _c
 
 
@@ -20,7 +24,7 @@ TrainableConfig = _c.TrainableConfig
 
 
 class AdaptiveLRController:
-    def __init__(self, config: AdaptiveLRConfig | None = None) -> None:
+    def __init__(self, config: Optional[AdaptiveLRConfig] = None) -> None:
         self.config = config if config is not None else AdaptiveLRConfig()
         self.state = AdaptiveLRState()
 
