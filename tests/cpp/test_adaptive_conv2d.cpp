@@ -8,7 +8,7 @@ using enn::modules::AdaptiveConv2d;
 
 
 TEST(AdaptiveConv2d, ForwardShape) {
-    AdaptiveConv2d c(3, 8, {3, 5, 7});
+    AdaptiveConv2d c(3, 8, std::vector<std::int64_t>{3, 5, 7});
     auto x = torch::randn({2, 3, 16, 16});
     auto y = c->forward(x);
     EXPECT_EQ(y.size(0), 2);
@@ -16,7 +16,7 @@ TEST(AdaptiveConv2d, ForwardShape) {
 }
 
 TEST(AdaptiveConv2d, PruneKeepsAtLeastOne) {
-    AdaptiveConv2d c(3, 4, {3, 5, 7});
+    AdaptiveConv2d c(3, 4, std::vector<std::int64_t>{3, 5, 7});
     c->prune_smallest_candidate();
     c->prune_smallest_candidate();
     c->prune_smallest_candidate();
@@ -24,7 +24,7 @@ TEST(AdaptiveConv2d, PruneKeepsAtLeastOne) {
 }
 
 TEST(AdaptiveConv2d, TopologyVersionIncrementsOnPrune) {
-    AdaptiveConv2d c(3, 4, {3, 5});
+    AdaptiveConv2d c(3, 4, std::vector<std::int64_t>{3, 5});
     auto v0 = c->topology_version();
     c->prune_smallest_candidate();
     EXPECT_GT(c->topology_version(), v0);
