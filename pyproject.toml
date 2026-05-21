@@ -1,8 +1,37 @@
 [build-system]
-requires = [
-    "setuptools>=64",
-    "wheel",
-    "pybind11>=2.10.0",
-    "cmake>=3.20",
-]
+requires = ["setuptools>=64", "wheel", "torch>=2.0", "pybind11>=2.10"]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "elasticneuralnetwork"
+version = "0.1.0"
+description = "Elastic neural network with reversible topology, built on libtorch"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = [
+    "torch>=2.0",
+    "numpy>=1.20",
+]
+
+[project.optional-dependencies]
+benchmarks = [
+    "torchvision>=0.15",
+    "lightgbm>=3.3",
+    "pandas>=1.5",
+    "pyarrow>=10.0",
+    "matplotlib>=3.5",
+    "scikit-learn>=1.0",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-xdist>=3.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["elasticneuralnetwork*"]
+exclude = ["pydnn*", "tests*", "build*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
+addopts = "-ra -q"

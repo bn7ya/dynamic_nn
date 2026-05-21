@@ -247,22 +247,9 @@ from .model_generator import (
     generate_models,
 )
 
-# Transformer / MoE / LLM building blocks (pure-Python, NumPy-backed).
-# Importing the submodule also makes it accessible as ``pydnn.transformer``.
-from . import transformer
-from .transformer import (
-    TransformerConfig,
-    EncoderOnlyModel,
-    DecoderOnlyModel,
-    Seq2SeqModel,
-    Transformer,
-    DynamicTransformer,
-    MultiHeadAttention,
-    GroupedQueryAttention,
-    MixtureOfExperts,
-    CausalLMTrainer,
-    AdamW,
-)
+# Transformer code removed in Phase 8 of the elasticneuralnetwork
+# refactor; the modern equivalents live in the new top-level
+# `elasticneuralnetwork` package.
 
 # Available cost functions
 COST_FUNCTIONS = [
@@ -306,19 +293,6 @@ __all__ = [
     "ModelStrategy",
     "GeneratorConfig",
     "generate_models",
-    # Transformer / MoE
-    "transformer",
-    "TransformerConfig",
-    "EncoderOnlyModel",
-    "DecoderOnlyModel",
-    "Seq2SeqModel",
-    "Transformer",
-    "DynamicTransformer",
-    "MultiHeadAttention",
-    "GroupedQueryAttention",
-    "MixtureOfExperts",
-    "CausalLMTrainer",
-    "AdamW",
     # Constants
     "COST_FUNCTIONS",
     # Version

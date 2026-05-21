@@ -16,3 +16,9 @@ python/pydnn/*.so
 notebooks/text_to_image/models/*.pth
 examples/
 notebooks/beanchmark/mnist_data/
+elasticneuralnetwork/*.so
+elasticneuralnetwork/_enn_core*.so
+.pytest_cache/
+__pycache__/
+elasticneuralnetwork.egg-info/
+results/

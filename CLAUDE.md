@@ -1,38 +1,44 @@
-# CLAUDE.md — dynamic_nn root
+# CLAUDE.md — elasticneuralnetwork root
 
 > Maintenance scaffolding for AI sessions. **Read this file first** when
 > opening this repo. Per-directory CLAUDE.md files supply the local detail.
 
 ## Project overview
 
-dynamic_nn is a neural network that grows and prunes itself during training.
-A C++17 core (with optional CUDA + SIMD acceleration) is exposed to Python
-via pybind11 as the `pydnn` package. The training pipeline runs four
-stages — Exploration / Estimation / Main / Standard — that can be driven
-either sequentially (legacy default) or as concurrent stage workers
-behind a `StageController` with a parallel cost-trend observer
-(`runtime_enabled=True`). Mid-training "remove node" / "remove layer"
-flips an active mask without erasing weights; hard removal happens once
-at end-of-training via `Network::compact()`.
+`elasticneuralnetwork` (`enn`) is a dynamic neural network library built
+on top of libtorch (PyTorch C++ API). It grows and prunes itself during
+training: a `ReversibleNetwork` of `ReversibleLinear` layers holds an
+`active_mask` buffer per layer, and topology mutations (add/prune nodes,
+insert/remove layers, expand kernels) are reversible until end-of-training
+`compact()` performs the only hard erasure.
+
+Training runs four phases driven by a `PhaseController`:
+
+1. **TopologyDiscovery** — start small, grow on plateau.
+2. **ConvergenceRateEstimation** — measure the slope to estimate the
+   remaining epoch budget.
+3. **AdaptiveTraining** — `StabilityMonitor` + `AdaptiveLRController`
+   throttle the learning rate based on data-driven thresholds.
+4. **FrozenArchitectureFinetuning** — topology locked, only weights move.
+
+All controller thresholds (`StabilityConfig`, `AdaptiveLRConfig`,
+`PruningConfig`, `PhaseScheduleConfig`) are produced by
+`derive_*` functions in `csrc/training/data_driven_config.cpp` from
+`DatasetStatistics` computed at the start of `fit()`. No arbitrary
+multiplicative constants are baked into the code.
 
 ## How to use these CLAUDE.md files
 
 - **Each directory that owns a feature has its own CLAUDE.md.** It tells
-  you what files do what, what's invariant, what's actively maintained,
+  you what files do what, what is invariant, what is actively maintained,
   and how the directory connects to the rest.
-- **Update them in the same commit as code changes.** When you add /
-  remove / rename a file, edit the relevant CLAUDE.md so the table
-  stays accurate. When you change a contract (e.g. soft-delete
-  semantics), revise the invariants section.
+- **Update them in the same commit as code changes.**
 - **Tags used in file tables:**
-  - `[invariant]` — changing this without careful review breaks
-    contracts other code relies on.
-  - `[hot]` — runs in the per-batch / per-epoch loop. Watch for
-    allocations and quadratic behaviour.
-  - `[scaffolding]` — wired in but not yet driving anything; safe to
-    extend, but don't delete without checking what depends on it.
-  - `[fallback]` — only used when CUDA is off; keep behaviour
-    equivalent to the GPU path.
+  - `[invariant]` — changing this without careful review breaks contracts
+    other code relies on.
+  - `[hot]` — runs in the per-batch / per-epoch loop.
+  - `[novel]` — the only kind of custom CUDA/CPU op we keep; everything
+    else routes through libtorch.
 
 ## Maintenance principles
 
@@ -41,182 +47,81 @@ efficiency** — translate into the following operational rules. Every
 CLAUDE.md sub-file refers back here.
 
 ### Stability
-- **Public surfaces don't break.** `DynamicNetwork.fit()`,
-  `network.predict()`, `network.compact()`, `TrainerConfig`, and the
-  pybind class layouts in `python/pydnn/_bindings.cpp` are external
-  contracts. Add fields, don't remove them; add overloads, don't
-  rename existing ones.
-- **Both build configurations stay green** — `DNN_ENABLE_CUDA=ON` and
-  `DNN_ENABLE_CUDA=OFF`. The CPU-only path is the smoke-test floor.
-- **Defaults are sticky.** `runtime_enabled=False` keeps the legacy
-  sequential `train_phased` body. Don't flip a default without
-  flagging it in the relevant CLAUDE.md and the commit message.
-  - **Documented exception:** `dynamic_thresholds=True` is the
-    default for `DynamicNetwork`. The dataset-derived thresholds
-    are computed once before training; setting `dynamic_thresholds=False`
-    reproduces the legacy static-default path bit-for-bit. See
-    `python/pydnn/CLAUDE.md` and the feature row below.
-- **Branch convention:** all work lands on
-  `claude/<topic>-<id>` — never push directly to `main`.
+- **Public Python surfaces don't break.** `ElasticNetwork.fit()`,
+  `.predict()`, `.compact()`, and the dataclass configs are external
+  contracts.
+- **CPU and CUDA builds stay green** — `_can_use_cuda()` falls back to
+  `CppExtension` when `nvcc` is absent.
+- **No anthropomorphic naming.** All renames per the rename table in
+  the project plan; if a name is unclear, rename.
 
 ### Reliability
-- **Soft-delete topology.** Mid-training mutations *never* erase
-  weights. Only `Network::compact()` (called once after training)
-  is allowed to do dense erasure. See
-  `include/dnn/core/CLAUDE.md`.
-- **Gate every parallel write.** Topology mutations under
-  `runtime_enabled=True` go through `TopologyLock` in write mode.
-  Read-only forward/backward holds it in shared mode. See
-  `include/dnn/training/runtime/CLAUDE.md`.
-- **Observers don't mutate state they observe.** The Python and C++
-  cost-trend observers only *read* metric history; they signal via
-  flags, not by reaching into worker state.
-- **Fail loudly at boundaries, gracefully inside.** Exceptions live
-  at the C++/Python edge (`_bindings.cpp`); internal errors propagate
-  as exceptions, not silent skipped epochs.
+- **Reversible topology (soft-delete).** Mid-training mutations never
+  erase weights. Only `ReversibleLinear::compact()` and
+  `ReversibleNetwork::compact()` perform hard erasure. See
+  `csrc/include/enn/modules/CLAUDE.md`.
+- **`topology_version()` monotonic.** Every add/prune/compact bumps the
+  version; observers gate on it.
+- **Observers don't mutate state they observe.** `PlateauDetector` and
+  `StabilityMonitor` consume scalar histories and emit decisions; they
+  do not touch `ReversibleNetwork` internals.
 
 ### Memory efficiency
-- **Singleton pools.** All GPU allocations go through
-  `cuda::CudaMemoryPool::instance()` (see
-  `include/dnn/cuda/CLAUDE.md`). All large CPU allocations go through
-  `dnn::memory::PoolAllocator` (see `include/dnn/memory/CLAUDE.md`).
-  Don't introduce parallel allocator paths.
-- **Compact at end-of-training.** `DynamicNetwork.fit()` calls
-  `network.compact()` when the C++ path returns; this is what makes
-  soft-pruning actually save FLOPs at inference time. Don't skip it.
-- **Bounded histories.** `cost_history`, `efficiency_history`,
-  `cancer_score_history`, `alzheimer_score_history`,
-  `architecture_history`, `learning_rate_history`,
-  `emotional_state_history` all grow per epoch and are now capped:
-  the C++ trainer reserves `Trainer::kDefaultHistoryReserve = 500`
-  (and bumps to `max(500, max_epochs)` on the runtime path), and
-  the Python fallback trims to `MAX_HISTORY = 500` via
-  `_append_capped`. The four `EmotionalState` deques cap at
-  `EmotionalState::kHistoryWindow = 500` via `push_capped`. Older
-  entries fall off the front; the most recent 500 are kept. If you
-  raise `max_epochs` past 500 expect the earliest entries to be
-  dropped — bump `kDefaultHistoryReserve`/`MAX_HISTORY` in lockstep
-  if you need a longer window.
-- **GIL released around long C++ work.**
-  `python/pydnn/_bindings.cpp` does this in `PyTrainer::train` via
-  `py::gil_scoped_release`. Preserve this on any new long-running
-  binding.
-- **No per-epoch allocations on the hot path** if avoidable. Layer
-  forward/backward already reuses `cached_input_`,
-  `cached_pre_activation_`, `cached_output_`. Don't replace these
-  with per-call temporaries.
+- **Single allocator path.** All tensors come from libtorch's caching
+  allocator; we do not introduce parallel pools.
+- **Compact at end-of-training.** `PhaseController::fit()` calls
+  `compact()` on the network when the final phase returns.
+- **Bounded histories.** Cost / utilization / stability_state trajectories
+  cap at `kHistoryWindow = 1024` entries; older entries fall off the
+  front.
 
 ## Feature index
 
-Every named feature in the project, the subsystem that owns it, and
-how to engage it.
-
-| Feature | Owner | Engage / opt-in |
+| Feature | Owner | Engage |
 |---|---|---|
-| Soft topology (active masks, no mid-training erase) | [`include/dnn/core/`](include/dnn/core/CLAUDE.md) | Always on; transparent to callers |
-| `Network::compact()` end-of-training cleanup | [`include/dnn/core/`](include/dnn/core/CLAUDE.md) | Auto-called from `fit()` |
-| Concurrent stage pipeline (StageController + observer) | [`include/dnn/training/runtime/`](include/dnn/training/runtime/CLAUDE.md) | `DynamicNetwork(runtime_enabled=True)` |
-| Adaptive learning hyperparameters | [`include/dnn/training/runtime/`](include/dnn/training/runtime/CLAUDE.md) | Active when `runtime_enabled=True` |
-| Reward/penalty + emotional state | [`include/dnn/training/`](include/dnn/training/CLAUDE.md) | Always on in Phase 3 |
-| Layer/node efficiency tracking | [`include/dnn/dynamics/`](include/dnn/dynamics/CLAUDE.md) | Always on; drives architecture mutation |
-| Local-maximum efficiency gate (defers shrinks until E(t) plateaus) | [`include/dnn/dynamics/`](include/dnn/dynamics/CLAUDE.md) | **On by default**; `TrainerConfig.layer_manager_config.shrink_requires_plateau = False` to opt out |
-| Per-node efficiency EMA + sample warmup | [`include/dnn/core/`](include/dnn/core/CLAUDE.md) | Always on; `Node::kEmaAlpha=0.2`, `kMinSamplesForEfficiency=16` |
-| Cancer / Alzheimer health monitoring | [`include/dnn/dynamics/`](include/dnn/dynamics/CLAUDE.md) | Always on; thresholds in `TrainerConfig` |
-| SIMD CPU acceleration (AVX/AVX2/AVX512/SSE) | [`include/dnn/simd/`](include/dnn/simd/CLAUDE.md) | Auto-detected at runtime |
-| OpenMP parallelism (CPU batch loops, matmul) | [`include/dnn/simd/`](include/dnn/simd/CLAUDE.md) | Compile-time `DNN_HAS_OPENMP` |
-| CUDA GPU acceleration | [`include/dnn/cuda/`](include/dnn/cuda/CLAUDE.md) | `device="cuda"` + `DNN_ENABLE_CUDA` |
-| Per-tensor CUDA stream binding | [`include/dnn/cuda/`](include/dnn/cuda/CLAUDE.md) | `CudaTensor::set_stream(s)` |
-| Memory pooling (CPU + GPU) | [`include/dnn/memory/`](include/dnn/memory/CLAUDE.md), [`include/dnn/cuda/`](include/dnn/cuda/CLAUDE.md) | Always on |
-| CUDA Unified Memory mode (VRAM→RAM→disk paging) | [`include/dnn/cuda/`](include/dnn/cuda/CLAUDE.md) | `pydnn.set_cuda_memory_mode("managed")` before constructing the network |
-| Batched trainer forward (rank-2 forward+backward per batch) | [`include/dnn/training/`](include/dnn/training/CLAUDE.md) | **On by default**; `TrainerConfig.batched_train_forward = False` to opt out |
-| Dynamic batch sizing | [`include/dnn/training/`](include/dnn/training/CLAUDE.md) | `BatchConfig` in `TrainerConfig` |
-| Early stopping | [`include/dnn/training/`](include/dnn/training/CLAUDE.md) | `enable_early_stopping` |
-| Adaptive weight initialisation | [`include/dnn/core/`](include/dnn/core/CLAUDE.md) | Auto on first `fit()` |
-| Cost functions | [`include/dnn/training/`](include/dnn/training/CLAUDE.md) | `cost_function="..."` |
-| Optimizer types (SGD/Momentum/Adam/RMSprop) | [`include/dnn/training/`](include/dnn/training/CLAUDE.md) | `OptimizerConfig` |
-| Architecture mutation (add/remove nodes/layers) | [`include/dnn/dynamics/`](include/dnn/dynamics/CLAUDE.md) | Always on; controlled by efficiency thresholds |
-| ThreeModelGenerator (efficient/balanced/accurate) | [`python/pydnn/`](python/pydnn/CLAUDE.md) | `from pydnn import ThreeModelGenerator` |
-| CPU/GPU device dispatch | [`include/dnn/core/`](include/dnn/core/CLAUDE.md) | `device="cpu"\|"cuda"` |
-| Python parallel cost-trend observer | [`python/pydnn/`](python/pydnn/CLAUDE.md) | `runtime_enabled=True` (Python fallback path) |
-| Dynamic data-driven thresholds (variance + complexity) | [`python/pydnn/`](python/pydnn/CLAUDE.md) | **On by default**; `DynamicNetwork(dynamic_thresholds=False)` to opt out |
-| Transformer / MoE / LLM building blocks | [`python/pydnn/transformer/`](python/pydnn/transformer/CLAUDE.md) | `from pydnn import transformer` (or `pydnn.DecoderOnlyModel`, `pydnn.Transformer`, `pydnn.MixtureOfExperts`, …) |
-| Dynamic (grow/prune) Transformer | [`python/pydnn/transformer/`](python/pydnn/transformer/CLAUDE.md) | `from pydnn import DynamicTransformer` |
+| Reversible topology (active_mask, no mid-training erase) | `csrc/modules/` | Always on |
+| `compact()` end-of-training cleanup | `csrc/modules/` | Auto-called from `PhaseController::fit()` |
+| Four-phase training | `csrc/training/phase_controller.cpp` | Always on |
+| `StabilityMonitor` (growth_anomaly / capacity_loss) | `csrc/controllers/stability_monitor.cpp` | Always on |
+| `AdaptiveLRController` (reward / penalty / reset) | `csrc/controllers/adaptive_lr_controller.cpp` | Always on |
+| `PlateauDetector` (slope/curvature gate) | `csrc/controllers/plateau_detector.cpp` | Always on |
+| Data-driven config derivation | `csrc/training/data_driven_config.cpp` | Always on |
+| `AdaptiveConv2d` (architecture search + growing kernels) | `csrc/modules/adaptive_conv2d.cpp` | When input shape is image-like |
+| Benchmark suite (MNIST, CIFAR-10, Adult, Covertype, Higgs) | `elasticneuralnetwork/benchmarks/` | `python -m elasticneuralnetwork.benchmarks.<dataset>` |
 
-## Build & smoke-test recipe
-
-Verified working in this session:
+## Build & smoke-test
 
 ```bash
-# CPU-only build (no CUDA, no Python bindings)
-rm -rf build_test
-cmake -S . -B build_test \
-    -DDNN_ENABLE_CUDA=OFF \
-    -DDNN_BUILD_PYTHON=OFF \
-    -DDNN_BUILD_EXAMPLES=OFF
-cmake --build build_test -j
+pip install torch
+pip install -e .
 
-# C++ unit tests (GoogleTest is auto-fetched if no system GTest;
-# first configure needs github egress). See tests/CLAUDE.md.
-ctest --test-dir build_test --output-on-failure
-
-# Python extension build (requires pybind11)
-PYBIND11_DIR="$(python3 -c 'import pybind11; print(pybind11.get_cmake_dir())')"
-cmake -S . -B build_smoke \
-    -DDNN_ENABLE_CUDA=OFF \
-    -DDNN_BUILD_PYTHON=ON \
-    -DDNN_BUILD_EXAMPLES=OFF \
-    -Dpybind11_DIR="$PYBIND11_DIR"
-cmake --build build_smoke -j
-cp build_smoke/_dnn_core.cpython-*.so python/pydnn/
-
-# End-to-end smoke test (the C++ runtime path through Python)
-python3 -c "
-import sys; sys.path.insert(0, 'python')
-from pydnn import DynamicNetwork
-import numpy as np
-rng = np.random.default_rng(0)
-X = rng.standard_normal((64, 16)).astype(np.float32)
-y = np.eye(4)[rng.integers(0, 4, size=64)].astype(np.float32)
-net = DynamicNetwork(input_shape=(16,), output_size=4, seed=42,
-                    cost_function='CrossEntropy', runtime_enabled=True)
-# dynamic_thresholds=True is the default; pass False to reproduce
-# the legacy static-default path bit-for-bit.
-result = net.fit(X, y, verbose=True)
-preds = net.predict(X[:4])
-print('OK', result.epochs_completed, preds.shape)
-print('signals:', net._last_data_signals.variance_score,
-      net._last_data_signals.complexity_score)
-"
+python -c "from elasticneuralnetwork import ElasticNetwork; import torch
+X = torch.randn(64, 16); y = torch.eye(4)[torch.randint(0, 4, (64,))]
+model = ElasticNetwork(input_shape=(16,), output_size=4, seed=42)
+r = model.fit(X, y); print('OK', r.epochs_completed)"
 ```
 
-Run the unit tests for the dynamic-threshold module:
-
+For C++ tests:
 ```bash
-python3 python/tests/test_dynamic_thresholds.py
+cmake -S . -B build -DCMAKE_PREFIX_PATH=$(python -c 'import torch; print(torch.utils.cmake_prefix_path)')
+cmake --build build -j
+ctest --test-dir build --output-on-failure
 ```
 
-If the smoke test stops working, the most likely break points are:
-the `_fit_cpp` ↔ `_bindings.cpp` API contract (numpy arrays in,
-numpy arrays out — see `python/pydnn/CLAUDE.md`), or the
-`StageController` observer thread (see
-`include/dnn/training/runtime/CLAUDE.md`).
+For the full benchmark gate:
+```bash
+for d in mnist cifar10 tabular_adult tabular_covertype tabular_higgs; do
+    python -m elasticneuralnetwork.benchmarks.$d --seed 42 --device cpu
+done
+python -m elasticneuralnetwork.benchmarks.report
+```
 
-## Hierarchy update protocol
+## Out of scope (future work)
 
-- **Adding a new subdirectory under `include/dnn/` or `python/pydnn/`:**
-  add a CLAUDE.md to it that follows the standard template. Add a
-  row to the feature index above if it owns a user-facing feature.
-- **Removing or collapsing a subsystem:** delete its CLAUDE.md and
-  remove references from this file's feature index.
-- **Renaming a feature:** update the feature-index row, the owner's
-  CLAUDE.md, and any cross-references.
-- **Promoting `[scaffolding]` to live code:** drop the tag in the
-  owner's CLAUDE.md *file table*, and check whether any maintenance
-  notes are now obsolete.
+Distributed training, mixed precision (fp16 / bf16), quantization, mobile
+deployment, pretrained model loading, ONNX export, recurrent /
+attention layers.
 
 ## Updating this file
 
-When you change anything that affects the feature index, the
-maintenance principles, or the build recipe, update this file in the
-same commit. Keep the file under ~250 lines — push detail down into
-per-subsystem CLAUDE.md files.
+Keep under ~250 lines. Push detail into per-subsystem CLAUDE.md files.
