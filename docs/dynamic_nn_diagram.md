@@ -1,705 +1,163 @@
-# Dynamic Neural Network Architecture Diagram
+# elasticneuralnetwork — PyTorch extension architecture
 
-## High-Level Architecture Overview
+## High-level overview
+
+```
+┌───────────────────────────────────────────────────────────────────────────────────────┐
+│                        elasticneuralnetwork — PyTorch C++ extension                    │
+├───────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                        │
+│   Python                                              C++ (libtorch)                   │
+│   ─────────────────────────────                       ─────────────────────────────    │
+│                                                                                        │
+│   ReversibleNetwork  ◀──── pybind11 ────▶  torch::nn::Module                           │
+│   ReversibleLinear   ◀──── pybind11 ────▶    ReversibleNetworkImpl                     │
+│   AdaptiveConv2d     ◀──── pybind11 ────▶    ReversibleLinearImpl                      │
+│   PhaseController    ◀──── pybind11 ────▶    AdaptiveConv2dImpl                        │
+│                                              PhaseController                           │
+│                                                                                        │
+│   torch.optim.Adam ────────────▶ net.parameters() ◀────── register_parameter(...)      │
+│   torch.utils.data.DataLoader                                                          │
+│                                                                                        │
+└───────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+Built via `torch.utils.cpp_extension.CUDAExtension` (CPU fallback
+`CppExtension`); the C++ TUs link into a single `_enn_core.so` that
+ships alongside the Python package.
+
+## Module hierarchy
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────┐
-│                           DYNAMIC NEURAL NETWORK                                     │
+│                              ReversibleNetwork                                       │
 ├─────────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                      │
-│   ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐          │
-│   │   INPUT     │    │   HIDDEN    │    │   HIDDEN    │    │   OUTPUT    │          │
-│   │   LAYER     │───▶│   LAYER 1   │───▶│   LAYER N   │───▶│   LAYER     │          │
-│   │             │    │   (ReLU)    │    │   (ReLU)    │    │  (Softmax)  │          │
-│   │  Fixed Size │    │  Dynamic ↕  │    │  Dynamic ↕  │    │  Fixed Size │          │
-│   └─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘          │
-│         │                  │ ▲                │ ▲                │                   │
-│         │                  │ │                │ │                │                   │
-│         │            ┌─────┴─┴────────────────┴─┴─────┐          │                   │
-│         │            │      LAYER MANAGER             │          │                   │
-│         │            │  • Saturation Detection        │          │                   │
-│         │            │  • Node Addition/Removal       │          │                   │
-│         │            │  • Layer Addition/Removal      │          │                   │
-│         │            │  • Adaptive Thresholds         │          │                   │
-│         │            └────────────────────────────────┘          │                   │
-│         │                         │                              │                   │
-│         │            ┌────────────┴────────────┐                 │                   │
-│         │            ▼                         ▼                 │                   │
-│         │   ┌────────────────────┐   ┌────────────────────┐      │                   │
-│         │   │   HEALTH MONITOR   │   │  EMOTIONAL STATE   │      │                   │
-│         │   │  • Cancer Score    │   │  • Depression Ratio│      │                   │
-│         │   │  • Alzheimer Score │   │  • Excitement Ratio│      │                   │
-│         │   │  • Overall Health  │   │  • Reward/Penalty  │      │                   │
-│         │   └────────────────────┘   └────────────────────┘      │                   │
-│         │                                                        │                   │
-│         └────────────────────────────────────────────────────────┘                   │
+│   ┌─────────────┐    ┌──────────────────┐    ┌──────────────────┐    ┌────────────┐ │
+│   │   INPUT     │    │  ReversibleLinear │    │  ReversibleLinear │    │  OUTPUT    │ │
+│   │   (X)       │───▶│  + ReLU           │───▶│  + ReLU           │───▶│  logits    │ │
+│   │             │    │  active_mask: 1s  │    │  active_mask: 1s  │    │            │ │
+│   │ fixed shape │    │  weight, bias     │    │  weight, bias     │    │ fixed shape│ │
+│   └─────────────┘    └──────────────────┘    └──────────────────┘    └────────────┘ │
+│                              │                        │                              │
+│                              │  add_nodes / prune_nodes / compact                    │
+│                              ▼                        ▼                              │
+│                       ┌────────────────────────────────────┐                         │
+│                       │            LayerManager            │                         │
+│                       │  • PlateauDetector gate            │                         │
+│                       │  • StabilityMonitor gate           │                         │
+│                       │  • analyze_with_utilization → Action│                        │
+│                       │  • execute(decision) → mutations    │                        │
+│                       └────────────────────────────────────┘                         │
+│                                       │                                              │
+│                       ┌───────────────┴───────────────┐                              │
+│                       ▼                               ▼                              │
+│              ┌────────────────────┐         ┌────────────────────┐                  │
+│              │  StabilityMonitor  │         │ AdaptiveLRController│                 │
+│              │  growth_anomaly    │         │  improvement_signals │                 │
+│              │  capacity_loss     │         │  regression_signals  │                 │
+│              │  states:           │         │  step() →            │                 │
+│              │   Stable           │         │   reward / penalty / │                 │
+│              │   ExcessiveGrowth  │         │   reset              │                 │
+│              │   PathologicalGrow │         └────────────────────┘                  │
+│              │   ExcessivePrune   │                                                  │
+│              │   PathologicalPrune│                                                  │
+│              │   Critical         │                                                  │
+│              └────────────────────┘                                                  │
 │                                                                                      │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Concurrent Stage Training (StageController + StageWorkers)
+The arrows above pointing at the inner box are the only direction
+mutation flows. `StabilityMonitor` and `AdaptiveLRController` are
+read-only observers; they consume scalar histories and emit
+decisions, never reaching into the `torch::nn::Module` graph
+themselves.
 
-Training is no longer four sequential phases. The four stages run as
-**long-lived stage workers** managed by a `StageController` that observes a
-shared `MetricsBus` and decides which workers to wake or suspend. Stages
-keep their per-stage state (learning rate, emotional counters, epoch index)
-across suspend/resume cycles, so the controller can rewind ("Stage 3
-stalled → wake Stage 2 to re-estimate → Stage 2 may wake Stage 1 to
-re-explore") without losing any progress.
+## Four-phase training schedule
 
 ```
-┌────────────────────────────────────────────────────────────────────────────────────┐
-│                       CONCURRENT STAGE WORKERS (with feedback)                      │
-├────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                     │
-│   ┌────────────┐    ┌────────────┐    ┌────────────┐    ┌────────────┐             │
-│   │ STAGE 1    │    │ STAGE 2    │    │ STAGE 3    │    │ STAGE 4    │             │
-│   │ Exploration│    │ Estimation │    │ Main       │    │ Standard   │             │
-│   │ (worker)   │    │ (observer) │    │ (worker)   │    │ (worker)   │             │
-│   └─────┬──────┘    └─────┬──────┘    └─────┬──────┘    └─────┬──────┘             │
-│         │ cost samples    │ trend signals   │ cost samples    │ cost samples       │
-│         ▼                 ▼                 ▼                 ▼                     │
-│   ┌──────────────────────────────────────────────────────────────────┐             │
-│   │                       METRICS BUS (ring buffer)                  │             │
-│   └─────────────────────────────┬────────────────────────────────────┘             │
-│                                 │                                                   │
-│                                 ▼                                                   │
-│         ┌────────────────────────────────────────────────────────┐                  │
-│         │                   STAGE CONTROLLER                     │                  │
-│         │                                                        │                  │
-│         │ • activate() / suspend() / reset() / finish()          │                  │
-│         │ • feedback rules: cost rising → wake earlier stage     │                  │
-│         │ • nudges RuntimeAdaptiveConfig scalars per epoch       │                  │
-│         └────────────────────────────────────────────────────────┘                  │
-│                                                                                     │
-│   Topology mutations go through TopologyLock (shared_mutex) so workers              │
-│   doing forward/backward never observe a half-applied add/remove.                   │
-└────────────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                            PhaseController.fit(X, y)                                 │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                      │
+│   compute_dataset_statistics(X, y)                                                   │
+│        │                                                                             │
+│        ▼                                                                             │
+│   derive_phase_schedule / derive_adaptive_lr_config / derive_stability_config        │
+│        │                                                                             │
+│        ▼                                                                             │
+│   ┌──────────────────────┐                                                           │
+│   │  TopologyDiscovery   │  LR = schedule.topology_discovery_lr                      │
+│   │                      │  optimizer = torch::optim::Adam                           │
+│   │  plateau → grow      │  hook: PlateauDetector + LayerManager.auto_adjust()       │
+│   └──────────┬───────────┘                                                           │
+│              ▼                                                                       │
+│   ┌──────────────────────┐                                                           │
+│   │ ConvergenceRateEst.  │  LR = schedule.convergence_estimation_lr                  │
+│   │                      │  fixed-LR training to read off the cost trend             │
+│   └──────────┬───────────┘                                                           │
+│              ▼                                                                       │
+│   ┌──────────────────────┐                                                           │
+│   │   AdaptiveTraining   │  LR = adapted by AdaptiveLRController per epoch           │
+│   │                      │  reward / penalty / reset on cost+utilization trends      │
+│   └──────────┬───────────┘                                                           │
+│              ▼                                                                       │
+│   ┌──────────────────────┐                                                           │
+│   │ FrozenArchitecture-  │  LR = schedule.frozen_finetune_lr                         │
+│   │ Finetuning           │  topology locked, weights move                            │
+│   └──────────┬───────────┘                                                           │
+│              ▼                                                                       │
+│   net.compact()  ← only hard erasure of soft-pruned rows / layers                    │
+│                                                                                      │
+└─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Stage roles**
+Every per-epoch loop inside a phase is the standard PyTorch shape:
+`zero_grad` → `forward` → `cross_entropy` → `backward` → `step`. The
+optimizer is `torch::optim::Adam`; the loss is
+`torch::nn::functional::cross_entropy` (classification) or
+`mse_loss` (regression).
 
-| Stage | Role | Modifies weights? | Modifies architecture? |
-|---|---|---|---|
-| 1 Exploration | Aggressively varies architecture; high LR | Yes | Yes (soft) |
-| 2 Estimation | Pure observer — tracks cost trend, retunes config scalars | No | No |
-| 3 Main | Adaptive LR via reward/penalty + emotional state | Yes | Yes (soft, conservative) |
-| 4 Standard | Frozen architecture, fine-tunes weights to a target reduction | Yes | No |
-
-Stage 2 runs **in parallel** with whichever worker currently owns the
-weights — it is a pure observer that publishes trend signals back to the
-controller, which uses them to rewind the pipeline if convergence stalls.
-
-**Soft topology**
-
-Mid-training "remove node" and "remove layer" no longer erase weights —
-they flip an `active_mask_` bit on the `Layer` (or `layer_active_` on the
-`Network`). Forward pass emits zero for inactive nodes, backward pass
-zeroes their grads, `apply_gradients` skips them, and `add_nodes` prefers
-**reactivating** dormant slots before allocating new ones. Hard removal
-runs once at end-of-training via `Network::compact()`, which produces the
-lean inference-ready graph. Bumped `topology_version_` lets workers detect
-that the graph has shifted under them.
-
-**Adaptive configuration**
-
-All previously hardcoded learning constants live in a
-`RuntimeAdaptiveConfig` of `AdaptiveScalar` fields (atomic, clamped to
-`[min, max]`). Stages read `scalar.current()` per epoch; the controller
-calls `scalar.scale()` or `scalar.nudge()` from the feedback loop. Affected:
-LR per stage, patience, batch growth, perturbation fraction, reward/penalty
-window, cancer/alzheimer thresholds, etc.
-
-## Node Efficiency & Dynamic Architecture
+## Data-driven thresholds
 
 ```
-┌────────────────────────────────────────────────────────────────────────────────────┐
-│                          NODE EFFICIENCY SYSTEM                                     │
-├────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                     │
-│     FORWARD PASS                    BACKWARD PASS                                   │
-│     ─────────────                   ─────────────                                   │
-│           │                               │                                         │
-│           ▼                               ▼                                         │
-│    ┌─────────────┐                 ┌─────────────┐                                 │
-│    │  Activation │                 │  Gradients  │                                 │
-│    │   a = σ(z)  │                 │   ∂L/∂W     │                                 │
-│    └─────────────┘                 └──────┬──────┘                                 │
-│                                           │                                         │
-│                                           ▼                                         │
-│                                  ┌────────────────────┐                            │
-│                                  │ EFFICIENCY UPDATE  │                            │
-│                                  │                    │                            │
-│                                  │ eff = 0.9 × eff   │                            │
-│                                  │     + 0.1 × clamp │                            │
-│                                  │       (|∇W| × 10) │                            │
-│                                  └─────────┬──────────┘                            │
-│                                            │                                        │
-│              ┌─────────────────────────────┼─────────────────────────────┐         │
-│              │                             │                             │         │
-│              ▼                             ▼                             ▼         │
-│     ┌────────────────┐          ┌────────────────┐           ┌────────────────┐   │
-│     │  eff > sat_th  │          │  eff < 0.5×th  │           │   All layers   │   │
-│     │   (saturated)  │          │  (inefficient) │           │   saturated?   │   │
-│     └───────┬────────┘          └───────┬────────┘           └───────┬────────┘   │
-│             │                           │                            │             │
-│             ▼                           ▼                            ▼             │
-│     ┌────────────────┐          ┌────────────────┐           ┌────────────────┐   │
-│     │  ADD NODES     │          │ REMOVE NODES   │           │   ADD LAYER    │   │
-│     │  (+12.5%)      │          │ (prune lowest) │           │   (new hidden) │   │
-│     └────────────────┘          └────────────────┘           └────────────────┘   │
-│                                                                                     │
-└────────────────────────────────────────────────────────────────────────────────────┘
+DatasetStatistics
+├── feature_variance_mean        ┐
+├── feature_variance_spread      │
+├── signal_to_noise_ratio        │     derive_*  ─────▶  AdaptiveLRConfig
+├── label_entropy                ├──── functions          StabilityConfig
+├── effective_rank               │                        PruningConfig
+└── fisher_separability          ┘                        PhaseScheduleConfig
+                                                          PlateauConfig
 ```
 
-## Adaptive Saturation Threshold (Sigmoid)
+Every derived threshold is either `mean + k·σ` (k ∈ {1, 2, 3}, σ-
+coverage), a named percentile, `ceil(sqrt(n))` (window-size rule of
+thumb), or `sigmoid(z, k=5)` (maps `z ≈ ±2` to ≈ 0.9). No bare
+multiplicative constants live in code.
+
+## Soft-delete invariant
 
 ```
-┌────────────────────────────────────────────────────────────────────────────────────┐
-│                       ADAPTIVE SATURATION THRESHOLD                                 │
-├────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                     │
-│   sat_threshold = base + range × sigmoid(k × (efficiency - 0.5))                   │
-│                                                                                     │
-│   where: base = 0.3, range = 0.5, k = 5.0                                          │
-│                                                                                     │
-│   Threshold                                                                         │
-│       ▲                                                                             │
-│   0.8 ┤                                    ●●●●●●●●●●●●●●●                          │
-│       │                                ●●●●                                         │
-│   0.7 ┤                             ●●●                                             │
-│       │                           ●●                                                │
-│   0.6 ┤                         ●●       ← High efficiency = conservative           │
-│       │                        ●                                                    │
-│   0.55┤ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─●─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─             │
-│       │                     ●                                                       │
-│   0.5 ┤                   ●●                                                        │
-│       │                  ●                                                          │
-│   0.4 ┤               ●●●        ← Low efficiency = aggressive growth               │
-│       │            ●●●                                                              │
-│   0.3 ┤●●●●●●●●●●●●●                                                                │
-│       └──────┬──────┬──────┬──────┬──────┬──────┬──────┬──────▶ Efficiency          │
-│             0.1    0.2    0.3    0.4    0.5    0.6    0.7    0.8                    │
-│                                                                                     │
-└────────────────────────────────────────────────────────────────────────────────────┘
+   prune_nodes([3, 17])      add_nodes(2)              compact()
+   ──────────────────▶       ──────────────▶           ──────────▶
+   active_mask: [1,1,1,0,1,1,1,1,1,1,1,1,1,1,1,1,1,0]
+                              ▲                       ▲
+                              │                       │
+                              │                       │
+                  reactivates slots                hard removes
+                  3 and 17                         remaining inactive
+                  (weights preserved)              rows; weights gone
 ```
 
-## Health Monitoring System
+`topology_version()` increments on every call, including no-op
+`compact()`.
 
-```
-┌────────────────────────────────────────────────────────────────────────────────────┐
-│                            HEALTH MONITORING                                        │
-├────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                     │
-│   ┌───────────────────────────────┐     ┌───────────────────────────────┐          │
-│   │        CANCER SCORE           │     │      ALZHEIMER SCORE          │          │
-│   │    (Excessive Growth)         │     │    (Excessive Pruning)        │          │
-│   ├───────────────────────────────┤     ├───────────────────────────────┤          │
-│   │                               │     │                               │          │
-│   │  growth_rate =                │     │  removal_rate =               │          │
-│   │    (nodes_added +             │     │    (nodes_removed +           │          │
-│   │     layers_added × 10)        │     │     layers_removed × 10)      │          │
-│   │    ─────────────────────      │     │    ──────────────────────     │          │
-│   │         epoch + 1             │     │          epoch + 1            │          │
-│   │                               │     │                               │          │
-│   │  cancer = min(1, rate/5)      │     │  alzheimer = min(1, rate/5)   │          │
-│   │                               │     │                               │          │
-│   └───────────────┬───────────────┘     └───────────────┬───────────────┘          │
-│                   │                                     │                           │
-│                   ▼                                     ▼                           │
-│   ┌───────────────────────────────────────────────────────────────────┐            │
-│   │                        HEALTH STATE                               │            │
-│   ├───────────────────────────────────────────────────────────────────┤            │
-│   │                                                                   │            │
-│   │   Healthy ◄──────┐                                                │            │
-│   │      │           │                                                │            │
-│   │      ▼           │   (recover)                                    │            │
-│   │   CancerRisk ────┴──────────┐                                     │            │
-│   │      │                      │                                     │            │
-│   │      ▼                      │                                     │            │
-│   │   Cancer ───────────────────┴──► Critical                         │            │
-│   │                             ▲                                     │            │
-│   │   AlzheimerRisk ────────────┘                                     │            │
-│   │      │                                                            │            │
-│   │      ▼                                                            │            │
-│   │   Alzheimer ────────────────────►                                 │            │
-│   │                                                                   │            │
-│   └───────────────────────────────────────────────────────────────────┘            │
-│                                                                                     │
-└────────────────────────────────────────────────────────────────────────────────────┘
-```
+## Where the C++/Python boundary lives
 
-## Emotional State & Reward/Penalty System (NEW)
-
-```
-┌────────────────────────────────────────────────────────────────────────────────────┐
-│                       EMOTIONAL STATE TRACKING                                      │
-├────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                     │
-│   The network maintains an "emotional state" based on training progress:           │
-│                                                                                     │
-│   ┌─────────────────────────────────────────────────────────────────────────┐      │
-│   │                      IMPROVEMENT METRICS                                 │      │
-│   │                                                                          │      │
-│   │   cost_improvement = (cost_old - cost_new) / cost_old                   │      │
-│   │   efficiency_improvement = efficiency_new - efficiency_old               │      │
-│   │   cost_trend = avg change over sliding window (5 epochs)                │      │
-│   │   efficiency_trend = avg change over sliding window                      │      │
-│   │                                                                          │      │
-│   └────────────────────────────────┬────────────────────────────────────────┘      │
-│                                    │                                                │
-│              ┌─────────────────────┼─────────────────────┐                         │
-│              ▼                                           ▼                         │
-│   ┌─────────────────────────┐               ┌─────────────────────────┐            │
-│   │        REWARD           │               │        PENALTY          │            │
-│   │  (Good Progress)        │               │  (Poor Progress)        │            │
-│   ├─────────────────────────┤               ├─────────────────────────┤            │
-│   │ Conditions:             │               │ Conditions:             │            │
-│   │ • Cost decreasing       │               │ • Cost increasing       │            │
-│   │ • Efficiency improving  │               │ • Efficiency declining  │            │
-│   │ • Positive trend        │               │ • Negative trend        │            │
-│   │                         │               │                         │            │
-│   │ Action:                 │               │ Action:                 │            │
-│   │ • Decrease LR           │               │ • Increase LR           │            │
-│   │ • Factor: 0.5 - 1.0     │               │ • Factor: 1.0 - 2.0     │            │
-│   │ • "Fine-tune carefully" │               │ • "Escape local minima" │            │
-│   └────────────┬────────────┘               └────────────┬────────────┘            │
-│                │                                         │                         │
-│                └──────────────────┬──────────────────────┘                         │
-│                                   ▼                                                │
-│   ┌─────────────────────────────────────────────────────────────────────────┐      │
-│   │                      EMOTIONAL STATE                                     │      │
-│   │                                                                          │      │
-│   │   depression_ratio = total_penalties / (rewards + penalties)            │      │
-│   │   excitement_ratio = total_rewards / (rewards + penalties)              │      │
-│   │                                                                          │      │
-│   │   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌─────────────┐ │      │
-│   │   │   NEUTRAL    │  │   EXCITED    │  │  DEPRESSED   │  │  EXTREME    │ │      │
-│   │   │              │  │              │  │              │  │             │ │      │
-│   │   │ Both ratios  │  │ excitement   │  │ depression   │  │ Either >0.8 │ │      │
-│   │   │ balanced     │  │ > 0.5        │  │ > 0.5        │  │ Reset LR to │ │      │
-│   │   │ (<0.5)       │  │              │  │              │  │ baseline!   │ │      │
-│   │   └──────────────┘  └──────────────┘  └──────────────┘  └─────────────┘ │      │
-│   │                                                                          │      │
-│   └─────────────────────────────────────────────────────────────────────────┘      │
-│                                                                                     │
-└────────────────────────────────────────────────────────────────────────────────────┘
-```
-
-## Reward/Penalty System Flow
-
-```
-┌────────────────────────────────────────────────────────────────────────────────────┐
-│                       REWARD/PENALTY SYSTEM FLOW                                    │
-├────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                     │
-│                         ┌────────────────────┐                                     │
-│                         │  Compute Metrics   │                                     │
-│                         │  (cost, efficiency │                                     │
-│                         │   trends)          │                                     │
-│                         └─────────┬──────────┘                                     │
-│                                   │                                                │
-│                                   ▼                                                │
-│                    ┌──────────────────────────────┐                                │
-│                    │   Cost improving AND         │                                │
-│               YES  │   Efficiency good AND        │  NO                            │
-│            ┌───────│   Trend positive?            │───────┐                        │
-│            │       └──────────────────────────────┘       │                        │
-│            ▼                                              ▼                        │
-│   ┌─────────────────┐                        ┌──────────────────────────┐          │
-│   │  APPLY REWARD   │                        │  Cost degrading OR       │          │
-│   │                 │                        │  (Efficiency bad AND     │          │
-│   │  LR = LR × (1   │                   YES  │   Trend negative)?       │  NO      │
-│   │  - mag × 0.5)   │                  ┌─────│                          │─────┐    │
-│   │                 │                  │     └──────────────────────────┘     │    │
-│   │  total_rewards++│                  ▼                                      │    │
-│   └────────┬────────┘         ┌─────────────────┐                             │    │
-│            │                  │  APPLY PENALTY  │                             │    │
-│            │                  │                 │                             │    │
-│            │                  │  LR = LR × (1   │                             │    │
-│            │                  │  + mag × 1.0)   │                             │    │
-│            │                  │                 │              ┌──────────┐   │    │
-│            │                  │  total_penalty++│              │ NEUTRAL  │   │    │
-│            │                  └────────┬────────┘              │ No change│   │    │
-│            │                           │                       └────┬─────┘   │    │
-│            └───────────────────────────┼────────────────────────────┘         │    │
-│                                        │                                      │    │
-│                                        ▼                                      │    │
-│                          ┌──────────────────────────────┐                     │    │
-│                          │   CHECK EXTREME STATES       │◄────────────────────┘    │
-│                          │                              │                          │
-│                          │  IF depression > 0.8:        │                          │
-│                          │     LR = baseline (0.1)      │                          │
-│                          │     state = "extreme_dep"    │                          │
-│                          │                              │                          │
-│                          │  IF excitement > 0.8:        │                          │
-│                          │     LR = baseline (0.1)      │                          │
-│                          │     state = "extreme_exc"    │                          │
-│                          │                              │                          │
-│                          └──────────────────────────────┘                          │
-│                                                                                     │
-└────────────────────────────────────────────────────────────────────────────────────┘
-```
-
-## Complete Data Flow
-
-```
-┌────────────────────────────────────────────────────────────────────────────────────┐
-│                              COMPLETE DATA FLOW                                     │
-├────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                     │
-│   INPUT DATA                                                                        │
-│       │                                                                             │
-│       ▼                                                                             │
-│   ┌───────────────────────────────────────────────────────────────────────────┐    │
-│   │                         FORWARD PASS                                      │    │
-│   │                                                                           │    │
-│   │   X ──▶ [W₁·X + b₁] ──▶ ReLU ──▶ [W₂·a₁ + b₂] ──▶ ... ──▶ Softmax ──▶ ŷ │    │
-│   │              │                        │                                   │    │
-│   │              │      (N hidden layers, dynamic size)                       │    │
-│   │              │                        │                                   │    │
-│   └──────────────┼────────────────────────┼───────────────────────────────────┘    │
-│                  │                        │                                         │
-│                  ▼                        ▼                                         │
-│            ┌──────────┐            ┌──────────┐                                    │
-│            │ z values │            │ a values │                                    │
-│            │ (cached) │            │ (cached) │                                    │
-│            └────┬─────┘            └────┬─────┘                                    │
-│                 │                       │                                           │
-│                 │                       │                                           │
-│   ┌─────────────┼───────────────────────┼─────────────────────────────────────┐    │
-│   │             │    BACKWARD PASS      │                                     │    │
-│   │             │                       │                                     │    │
-│   │   ∂L/∂ŷ ◄──┼── Cross-Entropy Loss ─┘                                     │    │
-│   │      │      │                                                             │    │
-│   │      ▼      │                                                             │    │
-│   │   δₙ = ŷ - y                                                              │    │
-│   │      │                                                                    │    │
-│   │      ▼                                                                    │    │
-│   │   ∂W = δₙᵀ · aₙ₋₁        ◄── For each layer                              │    │
-│   │   ∂b = Σ δₙ                                                               │    │
-│   │      │                                                                    │    │
-│   │      ▼                                                                    │    │
-│   │   δₙ₋₁ = (Wₙᵀ · δₙ) ⊙ ReLU'(zₙ₋₁)                                        │    │
-│   │      │                                                                    │    │
-│   │      └──────────────────▶ Continue backward                               │    │
-│   │                                                                           │    │
-│   └───────────────────────────────────────────────────────────────────────────┘    │
-│                  │                                                                  │
-│                  ▼                                                                  │
-│   ┌───────────────────────────────────────────────────────────────────────────┐    │
-│   │                        WEIGHT UPDATE                                      │    │
-│   │                                                                           │    │
-│   │   W ← W - η · clip(∂W, -5, 5)      (gradient clipping)                   │    │
-│   │   b ← b - η · clip(∂b, -5, 5)                                            │    │
-│   │                                                                           │    │
-│   │   efficiency ← 0.9 × eff + 0.1 × clamp(|∂W| × 10, 0, 1)                  │    │
-│   │                                                                           │    │
-│   └───────────────────────────────────────────────────────────────────────────┘    │
-│                  │                                                                  │
-│                  ▼                                                                  │
-│   ┌───────────────────────────────────────────────────────────────────────────┐    │
-│   │                     ARCHITECTURE ADJUSTMENT                               │    │
-│   │                                                                           │    │
-│   │   ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐      │    │
-│   │   │ Check Saturation│───▶│ Add/Remove Nodes│───▶│ Add/Remove Layer│      │    │
-│   │   └─────────────────┘    └─────────────────┘    └─────────────────┘      │    │
-│   │                                                                           │    │
-│   └───────────────────────────────────────────────────────────────────────────┘    │
-│                  │                                                                  │
-│                  ▼                                                                  │
-│   ┌───────────────────────────────────────────────────────────────────────────┐    │
-│   │                    REWARD/PENALTY ADJUSTMENT (Phase 3)                    │    │
-│   │                                                                           │    │
-│   │   ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐      │    │
-│   │   │ Compute Metrics │───▶│ Reward/Penalty  │───▶│ Update Emotional│      │    │
-│   │   │ (cost, eff)     │    │ Decision        │    │ State & LR      │      │    │
-│   │   └─────────────────┘    └─────────────────┘    └─────────────────┘      │    │
-│   │                                                                           │    │
-│   └───────────────────────────────────────────────────────────────────────────┘    │
-│                  │                                                                  │
-│                  ▼                                                                  │
-│            NEXT EPOCH                                                               │
-│                                                                                     │
-└────────────────────────────────────────────────────────────────────────────────────┘
-```
-
-## Initial Architecture Computation
-
-```
-┌────────────────────────────────────────────────────────────────────────────────────┐
-│                        INITIAL ARCHITECTURE                                         │
-├────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                     │
-│   Given: input_size, output_size                                                    │
-│                                                                                     │
-│   hidden_size = max(16, √(input_size × output_size))                               │
-│                                                                                     │
-│   Example: MNIST (784 inputs, 10 outputs)                                          │
-│            hidden_size = √(784 × 10) = √7840 ≈ 88 nodes                            │
-│                                                                                     │
-│   ┌─────────┐      ┌─────────┐      ┌─────────┐                                    │
-│   │  INPUT  │      │ HIDDEN  │      │ OUTPUT  │                                    │
-│   │   784   │─────▶│   88    │─────▶│   10    │                                    │
-│   │  nodes  │      │  nodes  │      │  nodes  │                                    │
-│   └─────────┘      └─────────┘      └─────────┘                                    │
-│                                                                                     │
-│   Weight Initialization: He Initialization                                          │
-│   W ~ N(0, √(2/fan_in))                                                            │
-│                                                                                     │
-└────────────────────────────────────────────────────────────────────────────────────┘
-```
-
-## Comparison: Dynamic NN vs Classic NN
-
-```
-┌────────────────────────────────────────────────────────────────────────────────────┐
-│                    DYNAMIC NN vs CLASSIC NN                                         │
-├────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                     │
-│   CLASSIC NN                              DYNAMIC NN                                │
-│   ══════════                              ══════════                                │
-│                                                                                     │
-│   ┌───┐ ┌───┐ ┌───┐ ┌───┐               ┌───┐ ┌───┐ ┌───┐ ┌───┐                   │
-│   │ ● │ │ ● │ │ ● │ │ ● │               │ ● │ │ ● │ │ ● │ │ ● │                   │
-│   │ ● │─│ ● │─│ ● │─│ ● │               │ ● │─│ ● │─│ ● │─│ ● │  ← Epoch 1        │
-│   │ ● │ │ ● │ │ ● │ │ ● │               │ ● │ │ ● │ │ ● │ │ ● │                   │
-│   │ ● │ │ ● │ │ ● │ │ ● │               └───┘ └───┘ └───┘ └───┘                   │
-│   └───┘ └───┘ └───┘ └───┘                 │                                        │
-│     │                                     │ Architecture adapts                    │
-│     │ Fixed throughout                    ▼                                        │
-│     │ training                          ┌───┐ ┌───┐ ┌───┐ ┌───┐ ┌───┐             │
-│     ▼                                   │ ● │ │ ● │ │ ● │ │ ● │ │ ● │             │
-│   ┌───┐ ┌───┐ ┌───┐ ┌───┐               │ ● │─│ ● │─│ ● │─│ ● │─│ ● │  ← Epoch N  │
-│   │ ● │ │ ● │ │ ● │ │ ● │               │ ● │ │ ● │ │ ● │ │ ● │ │ ● │             │
-│   │ ● │─│ ● │─│ ● │─│ ● │               │ ● │ │ ● │ │   │ │ ● │ │ ● │             │
-│   │ ● │ │ ● │ │ ● │ │ ● │               │ ● │ │ ● │ │   │ │ ● │ │ ● │             │
-│   │ ● │ │ ● │ │ ● │ │ ● │               │   │ │   │ │   │ │   │ │ ● │             │
-│   └───┘ └───┘ └───┘ └───┘               └───┘ └───┘ └───┘ └───┘ └───┘             │
-│                                           │     │     │     │     │                │
-│                                           └─────┴─────┴─────┴─────┘                │
-│                                              New layer added!                       │
-│                                                                                     │
-│   Hyperparameters:                        Hyperparameters:                          │
-│   • num_layers                            • seed                                    │
-│   • nodes_per_layer                       • input_shape                             │
-│   • learning_rate                         • output_size                             │
-│   • batch_size                            • cost_function                           │
-│   • num_epochs                                                                      │
-│   • optimizer                             All others AUTO-DETERMINED!               │
-│   • regularization                                                                  │
-│   • dropout_rate                                                                    │
-│   • etc...                                                                          │
-│                                                                                     │
-└────────────────────────────────────────────────────────────────────────────────────┘
-```
-
-## Configuration System
-
-```
-┌────────────────────────────────────────────────────────────────────────────────────┐
-│                         CONFIGURATION DATACLASSES                                   │
-├────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                     │
-│   ┌─────────────────────────┐    ┌─────────────────────────┐                       │
-│   │  TrainingPhaseConfig    │    │  ArchitectureConfig     │                       │
-│   ├─────────────────────────┤    ├─────────────────────────┤                       │
-│   │ • exploration_epochs=10 │    │ • min_nodes_per_layer=16│                       │
-│   │ • exploration_lr=0.5    │    │ • max_nodes_per_layer=  │                       │
-│   │ • estimation_epochs=10  │    │   2000                  │                       │
-│   │ • main_lr=0.1           │    │ • max_layers=10         │                       │
-│   │ • target_efficiency=0.9 │    │ • exploration_growth=   │                       │
-│   │ • perturbation_cutoff=  │    │   0.25 (25%)            │                       │
-│   │   0.2 (first 20%)       │    │ • main_growth=0.125     │                       │
-│   └─────────────────────────┘    └─────────────────────────┘                       │
-│                                                                                     │
-│   ┌─────────────────────────┐    ┌─────────────────────────┐                       │
-│   │  EfficiencyConfig       │    │  SigmoidThresholdConfig │                       │
-│   ├─────────────────────────┤    ├─────────────────────────┤                       │
-│   │ • default_sat_th=0.7    │    │ • k=5.0                 │                       │
-│   │ • exploration_sat_th=0.3│    │ • base=0.3              │                       │
-│   │ • efficiency_decay=0.9  │    │ • range_val=0.5         │                       │
-│   │ • eff_update_scale=0.1  │    │ • center=0.5            │                       │
-│   │ • eff_grad_mult=10.0    │    │                         │                       │
-│   └─────────────────────────┘    └─────────────────────────┘                       │
-│                                                                                     │
-│   ┌─────────────────────────┐    ┌─────────────────────────┐                       │
-│   │  HealthScoreConfig      │    │  RewardPenaltyConfig    │  ◄── NEW              │
-│   ├─────────────────────────┤    ├─────────────────────────┤                       │
-│   │ • cancer_denominator=5  │    │ • cost_improve_th=0.001 │                       │
-│   │ • alzheimer_denom=5     │    │ • eff_improve_th=0.01   │                       │
-│   │ • layer_weight=10       │    │ • min_lr=1e-6           │                       │
-│   │ • healthy_threshold=0.3 │    │ • max_lr=1.0            │                       │
-│   │ • at_risk_threshold=0.7 │    │ • baseline_lr=0.1       │                       │
-│   └─────────────────────────┘    │ • max_adjust_factor=2.0 │                       │
-│                                  │ • min_adjust_factor=0.5 │                       │
-│   ┌─────────────────────────┐    │ • extreme_threshold=0.8 │                       │
-│   │  GradientConfig         │    │ • window_size=10        │                       │
-│   ├─────────────────────────┤    └─────────────────────────┘                       │
-│   │ • gradient_clip=5.0     │                                                      │
-│   │ • momentum=0.9          │    ┌─────────────────────────┐                       │
-│   └─────────────────────────┘    │  EarlyStoppingConfig    │                       │
-│                                  ├─────────────────────────┤                       │
-│   ┌─────────────────────────┐    │ • window_size=20        │                       │
-│   │  PerturbationConfig     │    │ • improvement_th=1e-6   │                       │
-│   ├─────────────────────────┤    │ • max_consec_increase=5 │                       │
-│   │ • fraction=0.005        │    └─────────────────────────┘                       │
-│   │ • scale=0.01            │                                                      │
-│   └─────────────────────────┘                                                      │
-│                                                                                     │
-└────────────────────────────────────────────────────────────────────────────────────┘
-```
-
-## Training Result & Reports
-
-```
-┌────────────────────────────────────────────────────────────────────────────────────┐
-│                         TRAINING RESULT DATACLASS                                   │
-├────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                     │
-│   TrainingResult                                                                    │
-│   ├── success: bool                                                                │
-│   ├── epochs_completed: int                                                        │
-│   ├── final_cost: float                                                            │
-│   ├── final_efficiency: float                                                      │
-│   ├── best_cost: float                                                             │
-│   ├── best_efficiency: float                                                       │
-│   ├── stopping_reason: str                                                         │
-│   ├── cost_history: List[float]                                                    │
-│   ├── efficiency_history: List[float]                                              │
-│   ├── training_time_ms: int                                                        │
-│   │                                                                                │
-│   │   Architecture Tracking                                                        │
-│   ├── nodes_added: int                                                             │
-│   ├── nodes_removed: int                                                           │
-│   ├── layers_added: int                                                            │
-│   ├── layers_removed: int                                                          │
-│   ├── architecture_history: List[Tuple[layers, nodes]]                             │
-│   ├── perturbations_applied: int                                                   │
-│   │                                                                                │
-│   │   Health Tracking                                                              │
-│   ├── cancer_score_history: List[float]                                            │
-│   ├── alzheimer_score_history: List[float]                                         │
-│   │                                                                                │
-│   │   Emotional State Tracking  ◄── NEW                                            │
-│   ├── total_rewards: int                                                           │
-│   ├── total_penalties: int                                                         │
-│   ├── depression_history: List[float]                                              │
-│   ├── excitement_history: List[float]                                              │
-│   ├── lr_reset_count: int                                                          │
-│   ├── learning_rate_history: List[float]                                           │
-│   └── emotional_state_history: List[str]                                           │
-│                                                                                     │
-└────────────────────────────────────────────────────────────────────────────────────┘
-
-┌────────────────────────────────────────────────────────────────────────────────────┐
-│                           HEALTH REPORT                                             │
-├────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                     │
-│   HealthReport                                                                      │
-│   ├── state: str ("Healthy", "CancerRisk", "Cancer", etc.)                         │
-│   ├── cancer_score: float (0.0 - 1.0)                                              │
-│   ├── alzheimer_score: float (0.0 - 1.0)                                           │
-│   ├── overall_health: float (0.0 - 1.0)                                            │
-│   ├── diagnosis: str                                                               │
-│   ├── recommendations: List[str]                                                   │
-│   ├── current_layers: int                                                          │
-│   ├── current_nodes: int                                                           │
-│   │                                                                                │
-│   │   Emotional State  ◄── NEW                                                     │
-│   ├── depression_ratio: float (0.0 - 1.0)                                          │
-│   ├── excitement_ratio: float (0.0 - 1.0)                                          │
-│   └── emotional_state: str ("neutral", "excited", "depressed", "extreme_*")        │
-│                                                                                     │
-└────────────────────────────────────────────────────────────────────────────────────┘
-```
-
-## Key Formulas Summary
-
-```
-┌────────────────────────────────────────────────────────────────────────────────────┐
-│                            KEY FORMULAS                                             │
-├────────────────────────────────────────────────────────────────────────────────────┤
-│                                                                                     │
-│   1. INITIAL HIDDEN SIZE                                                            │
-│      h = max(16, √(input_size × output_size))                                      │
-│                                                                                     │
-│   2. HE INITIALIZATION                                                              │
-│      W ~ N(0, √(2/fan_in))                                                         │
-│                                                                                     │
-│   3. EFFICIENCY UPDATE                                                              │
-│      efficiency = 0.9 × eff_old + 0.1 × clamp(mean(|∂W|) × 10, 0, 1)              │
-│                                                                                     │
-│   4. ADAPTIVE SATURATION THRESHOLD                                                  │
-│      σ(x) = 1 / (1 + e^(-5(x-0.5)))                                                │
-│      threshold = 0.3 + 0.5 × σ(efficiency)                                         │
-│                                                                                     │
-│   5. CANCER SCORE                                                                   │
-│      cancer = min(1, (nodes_added + layers_added × 10) / (5 × epoch))              │
-│                                                                                     │
-│   6. ALZHEIMER SCORE                                                                │
-│      alzheimer = min(1, (nodes_removed + layers_removed × 10) / (5 × epoch))       │
-│                                                                                     │
-│   7. LEARNING RATE ADJUSTMENT (Reward/Penalty)  ◄── NEW (replaces fixed decay)     │
-│      Reward:  LR = LR × (1 - magnitude × 0.5)    [0.5 - 1.0 factor]               │
-│      Penalty: LR = LR × (1 + magnitude × 1.0)    [1.0 - 2.0 factor]               │
-│                                                                                     │
-│   8. EMOTIONAL STATE RATIOS  ◄── NEW                                                │
-│      depression_ratio = total_penalties / (total_rewards + total_penalties)        │
-│      excitement_ratio = total_rewards / (total_rewards + total_penalties)          │
-│                                                                                     │
-│   9. BATCH SIZE GROWTH                                                              │
-│      batch = min(batch × 2, 256)    (every 25 epochs in Phase 3)                   │
-│                                                                                     │
-│  10. EPOCHS ESTIMATION (Phase 2)                                                    │
-│      avg_improvement = (cost_start - cost_end) / 10                                │
-│      efficiency_gap = 0.9 - current_efficiency                                     │
-│      estimated_epochs = clamp(gap / (improvement × 0.1), 10, 500)                  │
-│                                                                                     │
-│  11. IMPROVEMENT METRICS (for Reward/Penalty)  ◄── NEW                              │
-│      cost_improvement = (cost_old - cost_new) / cost_old                           │
-│      efficiency_improvement = efficiency_new - efficiency_old                       │
-│      Reward if: cost_improving AND efficiency_good AND trend_positive              │
-│      Penalty if: cost_degrading OR (efficiency_bad AND trend_negative)             │
-│                                                                                     │
-└────────────────────────────────────────────────────────────────────────────────────┘
-```
-
-## Usage Example
-
-```python
-from pydnn import DynamicNetwork
-
-# Minimal configuration - everything else is auto-determined
-network = DynamicNetwork(
-    input_shape=(784,),
-    output_size=10,
-    seed=42,
-    cost_function="CrossEntropy"
-)
-
-# Train with the controller-driven concurrent stage workers
-# (Exploration / Estimation / Main / Standard with feedback rewinds).
-# Network::compact() is called automatically after fit() to hard-remove
-# any nodes/layers that were soft-pruned during training.
-result = network.fit(X_train, y_train, verbose=True)
-
-# Check health including emotional state
-health = network.health_status()
-print(f"Cancer: {health.cancer_score:.1%}")
-print(f"Alzheimer: {health.alzheimer_score:.1%}")
-print(f"Emotional: {health.emotional_state}")
-print(f"Depression: {health.depression_ratio:.1%}")
-print(f"Excitement: {health.excitement_ratio:.1%}")
-
-# View training emotional history
-print(f"Total Rewards: {result.total_rewards}")
-print(f"Total Penalties: {result.total_penalties}")
-print(f"LR Resets: {result.lr_reset_count}")
-
-# Make predictions
-predictions = network.predict(X_test)
-
-# Save model
-network.save("./models/", "my_model")
-```
+| Side | Lives in | Knows about |
+|---|---|---|
+| Python | `elasticneuralnetwork/*.py` | `torch.nn.Module`, `torch.optim`, `DataLoader`, numpy. Composes the bindings; provides `ElasticNetwork` convenience wrapper. |
+| Bindings | `csrc/bindings/*.cpp` | pybind11. Exposes C++ classes as Python types preserving the `torch.nn.Module` shape (`m.parameters()`, `m.buffers()` work). Releases the GIL around `PhaseController::fit`. |
+| C++ | `csrc/{modules,controllers,training}/*.cpp` | libtorch (`torch::Tensor`, `torch::nn::Module`, `torch::optim`, `torch::nn::functional::*`). Implements the reversible-topology semantics. |

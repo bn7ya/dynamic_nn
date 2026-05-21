@@ -8,6 +8,16 @@ ReversibleNetwork directly (LayerManager is the only one with a
 mutating `execute(decision)` method, and it goes through the public
 network surface).
 
+These controllers do not touch torch parameters or call into autograd
+themselves — they take `std::vector<double>` histories and POD
+config structs and return decisions. The configs are pybind11-bound,
+so they are importable from Python as plain dataclass-like objects
+(set fields, pass to constructors) and interoperate freely with the
+rest of a PyTorch training loop. The actual parameter mutations
+happen through `ReversibleNetworkImpl::insert_layer` /
+`remove_layer` / `ReversibleLinearImpl::prune_nodes` / `compact`,
+which use libtorch's `register_parameter` / `set_data` machinery.
+
 ## Files
 
 | File | Role |

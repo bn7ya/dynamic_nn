@@ -5,12 +5,49 @@
 
 ## Project overview
 
-`elasticneuralnetwork` (`enn`) is a dynamic neural network library built
-on top of libtorch (PyTorch C++ API). It grows and prunes itself during
-training: a `ReversibleNetwork` of `ReversibleLinear` layers holds an
-`active_mask` buffer per layer, and topology mutations (add/prune nodes,
-insert/remove layers, expand kernels) are reversible until end-of-training
-`compact()` performs the only hard erasure.
+`elasticneuralnetwork` (`enn`) is a **PyTorch C++ extension**: a
+libtorch-based shared library (`_enn_core.so`) built via
+`torch.utils.cpp_extension.CUDAExtension` (CPU fallback
+`CppExtension`) that registers a small set of `torch::nn::Module`
+subclasses for dynamic neural networks. On the Python side the modules
+appear as ordinary `torch.nn.Module` instances: compose them in
+`torch.nn.Sequential`, train them with `torch.optim.*`, save them with
+`state_dict()`, transfer them with `.to(device)`. We do not reimplement
+autograd, optimizers, or tensor ops — everything routes through
+libtorch.
+
+The networks grow and prune themselves during training: a
+`ReversibleNetwork` of `ReversibleLinear` layers holds an
+`active_mask` buffer per layer, and topology mutations (add/prune
+nodes, insert/remove layers, expand kernels) are reversible until
+end-of-training `compact()` performs the only hard erasure.
+
+## PyTorch extension design
+
+- **C++ classes derive from `torch::nn::Module`.**
+  `ReversibleLinearImpl`, `ReversibleNetworkImpl`,
+  `AdaptiveConv2dImpl` register their tensors via
+  `register_parameter` (autograd-tracked) and `register_buffer`
+  (no gradient, e.g. `active_mask`).
+- **Forward passes route through `torch::nn::functional::*`.** No
+  custom matmul, conv, softmax, or cross-entropy. The custom CUDA
+  kernel slot in `csrc/ops/` is reserved for ops genuinely novel to
+  this project (currently empty — libtorch covers everything we
+  need so far).
+- **Optimizers come from `torch::optim::*`.** `PhaseController`
+  constructs `torch::optim::Adam` per phase and runs the standard
+  zero_grad / loss.backward() / step() loop.
+- **Python bindings via pybind11** in `csrc/bindings/`. The bindings
+  expose `forward`, `parameters`, and `buffers` so the modules slot
+  into `torch.optim.*` and `torch.utils.data.DataLoader` directly.
+  Full `torch.nn.Module` Python API parity (`state_dict()`,
+  `.to(device)`, `eval()`, `train()`) is recorded as future work —
+  on the Python side the modules are pybind11 classes, not
+  `torch.nn.Module` subclasses.
+- **Build is the standard PyTorch extension recipe.** `setup.py`
+  globs `csrc/**/*.cpp` (and `*.cu` when CUDA is available), passes
+  them to `CUDAExtension` / `CppExtension`, and lets
+  `torch.utils.cpp_extension.BuildExtension` invoke ninja.
 
 Training runs four phases driven by a `PhaseController`:
 
@@ -95,11 +132,26 @@ CLAUDE.md sub-file refers back here.
 pip install torch
 pip install -e .
 
-python -c "from elasticneuralnetwork import ElasticNetwork; import torch
-X = torch.randn(64, 16); y = torch.eye(4)[torch.randint(0, 4, (64,))]
-model = ElasticNetwork(input_shape=(16,), output_size=4, seed=42)
-r = model.fit(X, y); print('OK', r.epochs_completed)"
+# Drop-in torch.nn.Module form — exercises the extension directly.
+python -c "
+import torch
+from elasticneuralnetwork import ReversibleNetwork, ReversibleNetworkConfig
+cfg = ReversibleNetworkConfig()
+cfg.input_features = 16; cfg.output_features = 4; cfg.hidden_sizes = [8]
+net = ReversibleNetwork(cfg)
+opt = torch.optim.Adam(net.parameters(), lr=1e-3)
+X = torch.randn(64, 16); y = torch.randint(0, 4, (64,))
+for _ in range(20):
+    opt.zero_grad()
+    loss = torch.nn.functional.cross_entropy(net.forward(X), y)
+    loss.backward(); opt.step()
+net.layer(0).prune_nodes([0]); net.compact()
+print('OK', sum(p.numel() for p in net.parameters()))
+"
 ```
+
+`ElasticNetwork.fit(X, y)` is an optional convenience wrapper that
+runs the four phases for you; see [`elasticneuralnetwork/CLAUDE.md`](elasticneuralnetwork/CLAUDE.md).
 
 For C++ tests:
 ```bash

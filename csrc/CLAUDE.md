@@ -2,10 +2,18 @@
 
 ## Purpose
 
-C++17 sources for the `_enn_core` torch extension. Every numeric op
+C++17 sources for the `_enn_core` PyTorch extension. Every numeric op
 routes through libtorch (`torch::Tensor`, `torch::nn::functional`,
 `torch::optim::*`); we do not reinvent matmul, autograd, or
 optimizers.
+
+These translation units build into a single libtorch extension
+(`_enn_core.so`) via `torch.utils.cpp_extension.CUDAExtension` — or
+`CppExtension` when nvcc is absent — driven by `setup.py` at the repo
+root. The pybind11 layer in `bindings/` exposes the
+`torch::nn::Module` subclasses so Python sees them as ordinary
+`torch.nn.Module` instances usable with `torch.optim.*`,
+`torch.utils.data.DataLoader`, `state_dict()`, and `.to(device)`.
 
 ## Layout
 

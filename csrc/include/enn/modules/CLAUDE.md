@@ -6,6 +6,19 @@
 them rely on libtorch's autograd and parameter machinery — we do not
 implement backward passes.
 
+**Python view.** Each `*Impl` class here is exposed through pybind11
+under its `TORCH_MODULE` wrapper name (`ReversibleLinear`,
+`ReversibleNetwork`, `AdaptiveConv2d`). On the Python side the
+classes expose `forward`, `parameters`, and `buffers` — enough for
+`torch.optim.Adam(net.parameters(), …)` and a standard
+`for x, y in DataLoader: …` training loop. Full `torch.nn.Module`
+Python API parity (`state_dict()`, `.to(device)`, `eval()`,
+`train()`) is recorded as future work; today these are pybind11
+classes, not `torch.nn.Module` subclasses on the Python side.
+The soft-prune / compact / topology_version contracts described
+below hold regardless of who is driving the training loop —
+`PhaseController` or a user's own `for` loop.
+
 ## Files
 
 | File | Role |

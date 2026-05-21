@@ -5,6 +5,18 @@
 The four-phase training pipeline and the data-driven config
 derivation that replaces the legacy `MAPPING_TABLE`.
 
+`PhaseController` is the C++ counterpart of the loop a PyTorch user
+would write by hand: it constructs `torch::optim::Adam` per phase
+(LR / epoch count come from `derive_phase_schedule(stats)`), runs
+the standard `zero_grad` → `forward` → `cross_entropy` /
+`mse_loss` → `backward` → `step` cycle, and pushes the per-epoch
+cost and utilization into trajectories. Optimizer state lives inside
+libtorch's standard machinery; we never reimplement the update rule.
+`compute_dataset_statistics(X, y)` is itself built on libtorch ops —
+`torch::var`, `at::linalg_svd` for the effective-rank entropy,
+`torch::nn::functional::log_softmax` for the label-entropy
+denominator.
+
 ## Files
 
 | File | Role |
